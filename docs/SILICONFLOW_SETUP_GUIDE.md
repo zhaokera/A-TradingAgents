@@ -107,7 +107,7 @@ SILICONFLOW_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 **示例**（使用您提供的百炼 Key 格式）：
 ```bash
-SILICONFLOW_API_KEY=valid-openai-api-key-for-tests
+SILICONFLOW_API_KEY=sk-990547695d6046cf9be4e8d095235d91
 ```
 
 #### 步骤 2：重启后端服务

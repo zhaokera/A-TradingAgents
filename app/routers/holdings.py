@@ -9,7 +9,7 @@ from app.core.database import get_mongo_db
 from app.core.response import ok
 from app.routers.auth_db import get_current_user
 from app.routers.paper import _detect_market_and_code, _get_last_price
-from app.services.holding_ai_advice import build_holding_ai_advice
+from app.services.holding_ai_advice import build_holding_ai_advice, build_holding_report_advice
 from app.services.portfolio_target_analysis import build_target_analysis
 
 
@@ -25,8 +25,13 @@ class HoldingCreateRequest(BaseModel):
     target_monthly_return_pct: float = Field(default=10.0, gt=0)
     stop_loss_pct: float = Field(default=8.0, gt=0)
     take_profit_pct: Optional[float] = Field(default=None, gt=0)
+    manual_stop_loss_price: Optional[float] = Field(default=None, gt=0)
+    manual_target_price: Optional[float] = Field(default=None, gt=0)
+    manual_sell_price: Optional[float] = Field(default=None, gt=0)
+    manual_buy_price: Optional[float] = Field(default=None, gt=0)
     strategy: str = "swing"
     notes: str = ""
+    price_plan_notes: str = ""
 
 
 class HoldingUpdateRequest(BaseModel):
@@ -36,12 +41,26 @@ class HoldingUpdateRequest(BaseModel):
     target_monthly_return_pct: Optional[float] = Field(default=None, gt=0)
     stop_loss_pct: Optional[float] = Field(default=None, gt=0)
     take_profit_pct: Optional[float] = Field(default=None, gt=0)
+    manual_stop_loss_price: Optional[float] = Field(default=None, gt=0)
+    manual_target_price: Optional[float] = Field(default=None, gt=0)
+    manual_sell_price: Optional[float] = Field(default=None, gt=0)
+    manual_buy_price: Optional[float] = Field(default=None, gt=0)
     strategy: Optional[str] = None
     notes: Optional[str] = None
+    price_plan_notes: Optional[str] = None
 
 
 class HoldingSettingsUpdateRequest(BaseModel):
     total_assets: Optional[float] = Field(default=None, ge=0, description="账户总资产")
+
+
+PRICE_PLAN_FIELDS = {
+    "manual_stop_loss_price",
+    "manual_target_price",
+    "manual_sell_price",
+    "manual_buy_price",
+    "price_plan_notes",
+}
 
 
 def _clean_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -57,6 +76,9 @@ async def _enrich_holding(doc: Dict[str, Any]) -> Dict[str, Any]:
     current_price = await _get_last_price(item["code"], item.get("market", "CN"))
     item["current_price"] = current_price
     item["analysis"] = build_target_analysis(item, current_price=current_price, as_of=date.today())
+    report_advice = await build_holding_report_advice(item)
+    if report_advice:
+        item["ai_advice"] = report_advice
     return item
 
 
@@ -153,6 +175,16 @@ async def create_holding(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该持仓已存在")
 
     now = datetime.utcnow().isoformat()
+    price_plan_updated_at = now if any(
+        value not in (None, "")
+        for value in (
+            payload.manual_stop_loss_price,
+            payload.manual_target_price,
+            payload.manual_sell_price,
+            payload.manual_buy_price,
+            payload.price_plan_notes,
+        )
+    ) else None
     doc = {
         "user_id": current_user["id"],
         "code": normalized_code,
@@ -163,8 +195,14 @@ async def create_holding(
         "target_monthly_return_pct": payload.target_monthly_return_pct,
         "stop_loss_pct": payload.stop_loss_pct,
         "take_profit_pct": payload.take_profit_pct,
+        "manual_stop_loss_price": payload.manual_stop_loss_price,
+        "manual_target_price": payload.manual_target_price,
+        "manual_sell_price": payload.manual_sell_price,
+        "manual_buy_price": payload.manual_buy_price,
         "strategy": payload.strategy,
         "notes": payload.notes,
+        "price_plan_notes": payload.price_plan_notes,
+        "price_plan_updated_at": price_plan_updated_at,
         "created_at": now,
         "updated_at": now,
     }
@@ -189,6 +227,8 @@ async def update_holding(
     if not updates:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="没有可更新字段")
     updates["updated_at"] = datetime.utcnow().isoformat()
+    if PRICE_PLAN_FIELDS.intersection(updates.keys()):
+        updates["price_plan_updated_at"] = updates["updated_at"]
 
     result = await db["user_holdings"].update_one(
         {"_id": oid, "user_id": current_user["id"]},

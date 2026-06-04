@@ -35,7 +35,7 @@ TradingAgents-CN 现已支持聚合渠道（如 302.AI、OpenRouter、One API �
 AI302_API_KEY=sk-xxxxx
 
 # OpenRouter（可选，国际平台）
-OPENROUTER_API_KEY=valid-openrouter-api-key-for-tests
+OPENROUTER_API_KEY=sk-or-v1-xxxxx
 
 # One API（可选，自部署）
 ONEAPI_API_KEY=sk-xxxxx
@@ -162,7 +162,7 @@ curl -X POST http://localhost:8000/api/config/llm/providers/init-aggregators \
 AI302_API_KEY=sk-xxxxx
 
 # OpenRouter（可选）
-OPENROUTER_API_KEY=valid-openrouter-api-key-for-tests
+OPENROUTER_API_KEY=sk-or-v1-xxxxx
 
 # One API（可选）
 ONEAPI_API_KEY=sk-xxxxx

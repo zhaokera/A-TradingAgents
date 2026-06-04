@@ -48,8 +48,14 @@ export interface HoldingItem {
   target_monthly_return_pct: number
   stop_loss_pct: number
   take_profit_pct?: number | null
+  manual_stop_loss_price?: number | null
+  manual_target_price?: number | null
+  manual_sell_price?: number | null
+  manual_buy_price?: number | null
   strategy: string
   notes?: string
+  price_plan_notes?: string
+  price_plan_updated_at?: string | null
   current_price?: number | null
   created_at?: string
   updated_at?: string
@@ -73,8 +79,13 @@ export interface HoldingPayload {
   target_monthly_return_pct: number
   stop_loss_pct: number
   take_profit_pct?: number | null
+  manual_stop_loss_price?: number | null
+  manual_target_price?: number | null
+  manual_sell_price?: number | null
+  manual_buy_price?: number | null
   strategy?: string
   notes?: string
+  price_plan_notes?: string
 }
 
 export const holdingsApi = {

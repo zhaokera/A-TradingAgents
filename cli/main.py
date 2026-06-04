@@ -27,6 +27,7 @@ from rich.table import Table
 from rich.text import Text
 
 # 项目内部导入
+from cli.holdings import holdings_app
 from cli.models import AnalystType
 from cli.utils import (
     normalize_ticker_symbol,
@@ -147,6 +148,7 @@ app = typer.Typer(
     rich_markup_mode="rich",  # Enable rich markup
     no_args_is_help=False,  # 不显示帮助，直接进入分析模式
 )
+app.add_typer(holdings_app, name="holdings", help="持仓数据 JSON CLI | Holdings JSON CLI")
 
 
 # Create a deque to store recent messages with a maximum length
@@ -1973,6 +1975,7 @@ def help_chinese():
     logger.info(f"2. [cyan]python -m cli.main examples[/cyan]   # 查看示例程序")
     logger.info(f"3. [cyan]python -m cli.main test[/cyan]       # 运行测试")
     logger.info(f"4. [cyan]python -m cli.main analyze[/cyan]    # 开始股票分析")
+    logger.info(f"5. [cyan]python -m cli.main holdings list[/cyan]  # 输出持仓 JSON")
 
     logger.info(f"\n[bold yellow]📋 主要命令 | Main Commands:[/bold yellow]")
 
@@ -2006,6 +2009,11 @@ def help_chinese():
         "版本信息 | Version",
         "显示软件版本和功能特性信息"
     )
+    commands_table.add_row(
+        "holdings",
+        "持仓数据 | Holdings",
+        "输出本地持仓 JSON，供 Hermes/Agent 调用"
+    )
 
     console.print(commands_table)
 
@@ -2036,7 +2044,7 @@ def main():
             # 只在退出码为2（typer的未知命令错误）时提供智能建议
             if e.code == 2 and len(sys.argv) > 1:
                 unknown_command = sys.argv[1]
-                available_commands = ['analyze', 'config', 'version', 'data-config', 'examples', 'test', 'help']
+                available_commands = ['analyze', 'config', 'version', 'data-config', 'examples', 'test', 'help', 'holdings']
                 
                 # 使用difflib找到最相似的命令
                 suggestions = get_close_matches(unknown_command, available_commands, n=3, cutoff=0.6)

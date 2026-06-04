@@ -1,110 +1,10 @@
 <template>
   <div class="dashboard">
-    <!-- 欢迎区域 -->
-    <div class="welcome-section">
-      <div class="welcome-content">
-        <h1 class="welcome-title">
-          欢迎使用 TradingAgents-CN
-          <span class="version-badge">v1.0.1</span>
-        </h1>
-        <p class="welcome-subtitle">
-          现代化的多智能体股票分析学习平台，辅助你掌握更全面的市场视角分析股票
-        </p>
-      </div>
-      <div class="welcome-actions">
-        <el-button type="primary" size="large" @click="quickAnalysis">
-          <el-icon><TrendCharts /></el-icon>
-          快速分析
-        </el-button>
-        <el-button size="large" @click="goToScreening">
-          <el-icon><Search /></el-icon>
-          股票筛选
-        </el-button>
-      </div>
-    </div>
-
-
-    <!-- 学习中心推荐卡片 -->
-    <el-card class="learning-highlight-card">
-      <div class="learning-highlight">
-        <div class="learning-icon">
-          <el-icon size="48"><Reading /></el-icon>
-        </div>
-        <div class="learning-content">
-          <h2>📚 AI股票分析学习中心</h2>
-          <p>从零开始学习AI、大语言模型和智能股票分析。了解多智能体系统如何协作分析股票，掌握提示词工程技巧，选择合适的大模型，理解AI的能力与局限性。</p>
-          <div class="learning-features">
-            <span class="feature-tag">🤖 AI基础知识</span>
-            <span class="feature-tag">✍️ 提示词工程</span>
-            <span class="feature-tag">🎯 模型选择</span>
-            <span class="feature-tag">📊 分析原理</span>
-            <span class="feature-tag">⚠️ 风险认知</span>
-            <span class="feature-tag">🎓 实战教程</span>
-          </div>
-        </div>
-        <div class="learning-action">
-          <el-button type="primary" size="large" @click="goToLearning">
-            <el-icon><Reading /></el-icon>
-            开始学习
-          </el-button>
-        </div>
-      </div>
-    </el-card>
-
     <!-- 主要功能区域 -->
     <el-row :gutter="24" class="main-content">
-      <!-- 左侧：快速操作 -->
+      <!-- 左侧：最近分析 -->
       <el-col :span="16">
-        <el-card class="quick-actions-card" header="快速操作">
-          <div class="quick-actions">
-            <div class="action-item" @click="goToSingleAnalysis">
-              <div class="action-icon">
-                <el-icon><Document /></el-icon>
-              </div>
-              <div class="action-content">
-                <h3>单股分析</h3>
-                <p>深度分析单只股票的投资价值</p>
-              </div>
-              <el-icon class="action-arrow"><ArrowRight /></el-icon>
-            </div>
-
-            <div class="action-item" @click="goToBatchAnalysis">
-              <div class="action-icon">
-                <el-icon><Files /></el-icon>
-              </div>
-              <div class="action-content">
-                <h3>批量分析</h3>
-                <p>同时分析多只股票，提高效率</p>
-              </div>
-              <el-icon class="action-arrow"><ArrowRight /></el-icon>
-            </div>
-
-            <div class="action-item" @click="goToScreening">
-              <div class="action-icon">
-                <el-icon><Search /></el-icon>
-              </div>
-              <div class="action-content">
-                <h3>股票筛选</h3>
-                <p>通过多维度条件筛选优质股票</p>
-              </div>
-              <el-icon class="action-arrow"><ArrowRight /></el-icon>
-            </div>
-
-            <div class="action-item" @click="goToQueue">
-              <div class="action-icon">
-                <el-icon><List /></el-icon>
-              </div>
-              <div class="action-content">
-                <h3>任务中心</h3>
-                <p>查看和管理分析任务列表</p>
-              </div>
-              <el-icon class="action-arrow"><ArrowRight /></el-icon>
-            </div>
-          </div>
-        </el-card>
-
-        <!-- 最近分析 -->
-        <el-card class="recent-analyses-card" header="最近分析" style="margin-top: 24px;">
+        <el-card class="recent-analyses-card" header="最近分析">
           <el-table :data="recentAnalyses" style="width: 100%">
             <el-table-column prop="stock_code" label="股票代码" width="120" />
             <el-table-column prop="stock_name" label="股票名称" width="150" />
@@ -302,16 +202,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import {
-  TrendCharts,
-  Search,
-  Document,
-  Files,
-  List,
-  ArrowRight,
-  InfoFilled,
-  Reading
-} from '@element-plus/icons-vue'
+import { ArrowRight, InfoFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import type { AnalysisTask, AnalysisStatus } from '@/types/analysis'
 import MultiSourceSyncCard from '@/components/Dashboard/MultiSourceSyncCard.vue'
@@ -354,33 +245,8 @@ const getCurrencyAmount = (
 
 
 
-// 方法
-const quickAnalysis = () => {
-  router.push('/analysis/single')
-}
-
-const goToSingleAnalysis = () => {
-  router.push('/analysis/single')
-}
-
-const goToBatchAnalysis = () => {
-  router.push('/analysis/batch')
-}
-
-const goToScreening = () => {
-  router.push('/screening')
-}
-
-const goToQueue = () => {
-  router.push('/queue')
-}
-
 const goToHistory = () => {
   router.push('/tasks?tab=completed')
-}
-
-const goToLearning = () => {
-  router.push('/learning')
 }
 
 const viewAnalysis = (analysis: AnalysisTask) => {
@@ -584,170 +450,6 @@ onMounted(async () => {
 
 <style lang="scss" scoped>
 .dashboard {
-  .welcome-section {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border-radius: 12px;
-    padding: 40px;
-    color: white;
-    margin-bottom: 24px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-
-    .welcome-content {
-      .welcome-title {
-        font-size: 32px;
-        font-weight: 600;
-        margin: 0 0 12px 0;
-        display: flex;
-        align-items: center;
-        gap: 16px;
-
-        .version-badge {
-          background: rgba(255, 255, 255, 0.2);
-          padding: 4px 12px;
-          border-radius: 20px;
-          font-size: 14px;
-          font-weight: 400;
-        }
-      }
-
-      .welcome-subtitle {
-        font-size: 16px;
-        opacity: 0.9;
-        margin: 0;
-      }
-    }
-
-    .welcome-actions {
-      display: flex;
-      gap: 16px;
-    }
-  }
-
-  .learning-highlight-card {
-    margin-bottom: 24px;
-    border: 2px solid var(--el-color-primary);
-    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15);
-
-    .learning-highlight {
-      display: flex;
-      align-items: center;
-      gap: 24px;
-      padding: 8px;
-
-      .learning-icon {
-        flex-shrink: 0;
-        width: 80px;
-        height: 80px;
-        border-radius: 12px;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: white;
-      }
-
-      .learning-content {
-        flex: 1;
-
-        h2 {
-          font-size: 20px;
-          font-weight: 600;
-          margin: 0 0 12px 0;
-          color: var(--el-text-color-primary);
-        }
-
-        p {
-          font-size: 14px;
-          color: var(--el-text-color-regular);
-          line-height: 1.6;
-          margin: 0 0 16px 0;
-        }
-
-        .learning-features {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 8px;
-
-          .feature-tag {
-            padding: 4px 12px;
-            background: var(--el-color-primary-light-9);
-            color: var(--el-color-primary);
-            border-radius: 16px;
-            font-size: 13px;
-            font-weight: 500;
-          }
-        }
-      }
-
-      .learning-action {
-        flex-shrink: 0;
-      }
-    }
-  }
-
-  .quick-actions-card {
-    .quick-actions {
-      display: grid;
-      gap: 16px;
-
-      .action-item {
-        display: flex;
-        align-items: center;
-        gap: 16px;
-        padding: 20px;
-        border: 1px solid var(--el-border-color-lighter);
-        border-radius: 8px;
-        cursor: pointer;
-        transition: all 0.3s ease;
-
-        &:hover {
-          border-color: var(--el-color-primary);
-          background-color: var(--el-color-primary-light-9);
-        }
-
-        .action-icon {
-          width: 40px;
-          height: 40px;
-          border-radius: 8px;
-          background: var(--el-color-primary-light-8);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: var(--el-color-primary);
-          font-size: 20px;
-        }
-
-        .action-content {
-          flex: 1;
-
-          h3 {
-            margin: 0 0 4px 0;
-            font-size: 16px;
-            font-weight: 600;
-            color: var(--el-text-color-primary);
-          }
-
-          p {
-            margin: 0;
-            font-size: 14px;
-            color: var(--el-text-color-regular);
-          }
-        }
-
-        .action-arrow {
-          color: var(--el-text-color-placeholder);
-          transition: transform 0.3s ease;
-        }
-
-        &:hover .action-arrow {
-          transform: translateX(4px);
-        }
-      }
-    }
-  }
-
   .recent-analyses-card {
     .table-footer {
       text-align: center;
@@ -999,29 +701,6 @@ onMounted(async () => {
 // 响应式设计
 @media (max-width: 768px) {
   .dashboard {
-    .welcome-section {
-      flex-direction: column;
-      text-align: center;
-      gap: 24px;
-
-      .welcome-actions {
-        justify-content: center;
-      }
-    }
-
-    .learning-highlight-card {
-      .learning-highlight {
-        flex-direction: column;
-        text-align: center;
-
-        .learning-content {
-          .learning-features {
-            justify-content: center;
-          }
-        }
-      }
-    }
-
     .main-content {
       .el-col {
         margin-bottom: 24px;

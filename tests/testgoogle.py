@@ -2,7 +2,7 @@ import requests
 import json
 
 # 配置
-API_KEY = "valid-google-api-key-for-tests"  # 请替换为您的真实API密钥
+API_KEY = "replace_with_google_api_key"  # 请替换为您的真实API密钥
 MODEL_NAME = "gemini-2.0-flash"  # 指定使用的模型
 url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 

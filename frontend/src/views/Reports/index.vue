@@ -184,8 +184,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Document,
@@ -213,6 +213,7 @@ type ReportListItem = {
 
 // 使用路由和认证store
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 
 // 响应式数据
@@ -226,6 +227,11 @@ const pageSize = ref(20)
 const totalReports = ref(0)
 
 const reports = ref<ReportListItem[]>([])
+
+const applyRouteSearch = () => {
+  const keyword = route.query.search_keyword
+  searchKeyword.value = typeof keyword === 'string' ? keyword.trim() : ''
+}
 
 // 计算属性
 const filteredReports = computed(() => {
@@ -485,8 +491,18 @@ const handleCurrentChange = (page: number) => {
 
 // 生命周期
 onMounted(() => {
+  applyRouteSearch()
   fetchReports()
 })
+
+watch(
+  () => route.query.search_keyword,
+  () => {
+    applyRouteSearch()
+    currentPage.value = 1
+    fetchReports()
+  }
+)
 </script>
 
 <style lang="scss" scoped>

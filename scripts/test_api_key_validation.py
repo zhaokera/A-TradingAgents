@@ -33,13 +33,13 @@ def test_api_key_validation():
         ("your-test-key", False, "占位符 - your- 前缀"),
         ("some_key_here", False, "占位符 - _here 后缀"),
         ("some-key-here", False, "占位符 - -here 后缀"),
-        ("valid-openai-api-key-for-tests", True, "有效的 API Key"),
-        ("valid-openai-api-key-for-tests", True, "有效的 API Key"),
-        ("valid-google-api-key-for-tests", True, "有效的 Google API Key"),
-        ("valid-qianfan-api-key-for-tests", True, "有效的千帆 API Key"),
-        ("valid-openrouter-api-key-for-tests", True, "有效的 OpenRouter API Key"),
-        ('"valid-openai-api-key-for-tests"', True, "带引号的有效 API Key"),
-        ("'valid-openai-api-key-for-tests'", True, "带单引号的有效 API Key"),
+        ("valid_api_key_value_12345", True, "有效的 API Key"),
+        ("valid_api_key_value_67890", True, "有效的 API Key"),
+        ("valid_google_api_key_value", True, "有效的 Google API Key"),
+        ("valid_qianfan_api_key_value", True, "有效的千帆 API Key"),
+        ("valid_openrouter_api_key_value", True, "有效的 OpenRouter API Key"),
+        ('"valid_api_key_value_12345"', True, "带引号的有效 API Key"),
+        ("'valid_api_key_value_12345'", True, "带单引号的有效 API Key"),
     ]
     
     print("\n" + "=" * 80)
@@ -73,4 +73,3 @@ def test_api_key_validation():
 if __name__ == "__main__":
     success = test_api_key_validation()
     sys.exit(0 if success else 1)
-

@@ -46,6 +46,16 @@ const defaultPreferences: AppPreferences = {
   showWelcome: true
 }
 
+export const SIDEBAR_MIN_WIDTH = 180
+export const SIDEBAR_DEFAULT_WIDTH = 200
+export const SIDEBAR_MAX_WIDTH = 200
+
+export const clampSidebarWidth = (width: unknown): number => {
+  const parsed = Number(width)
+  const normalized = Number.isFinite(parsed) ? parsed : SIDEBAR_DEFAULT_WIDTH
+  return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, normalized))
+}
+
 export const useAppStore = defineStore('app', {
   state: (): AppState => ({
     loading: false,
@@ -58,7 +68,7 @@ export const useAppStore = defineStore('app', {
     lastApiCheck: 0,
 
     sidebarCollapsed: window.innerWidth < 768,
-    sidebarWidth: useStorage('sidebar-width', 240).value || 240,
+    sidebarWidth: clampSidebarWidth(useStorage('sidebar-width', SIDEBAR_DEFAULT_WIDTH).value),
 
     currentRoute: null,
 
@@ -162,7 +172,7 @@ export const useAppStore = defineStore('app', {
 
     // 设置侧边栏宽度
     setSidebarWidth(width: number) {
-      this.sidebarWidth = Math.max(200, Math.min(400, width))
+      this.sidebarWidth = clampSidebarWidth(width)
       // 同步到 localStorage
       localStorage.setItem('sidebar-width', String(this.sidebarWidth))
     },

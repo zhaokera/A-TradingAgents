@@ -131,10 +131,137 @@ def _extract_reason(text: str) -> str:
     return text.strip()
 
 
+def _clean_price_label(value: str) -> str:
+    return re.sub(r"[\s*`#：:]+", "", value or "")
+
+
+def _parse_price_cell(value: str) -> Optional[Dict[str, Any]]:
+    numbers = re.findall(r"\d+(?:\.\d+)?", value or "")
+    if not numbers:
+        return None
+    values = [float(item) for item in numbers]
+    return {
+        "raw": (value or "").strip(),
+        "price": round(values[0], 4),
+        "low": round(min(values), 4),
+        "high": round(max(values), 4),
+    }
+
+
+_PRICE_LEVEL_ALIASES = {
+    "strong_support": ("强支撑位", "强支撑"),
+    "secondary_support": ("次支撑位", "第二支撑位", "近支撑位"),
+    "first_resistance": ("第一压力位", "第一阻力位", "一压力位", "一阻力位"),
+    "second_resistance": ("第二压力位", "第二阻力位", "二压力位", "二阻力位"),
+    "strong_resistance": ("强压力位", "强阻力位"),
+    "breakout_buy": ("突破买入价", "突破买入位", "突破价"),
+    "breakdown_sell": ("跌破卖出价", "跌破卖出位", "止损位", "止损价"),
+}
+
+
+def _extract_key_price_levels_from_text(text: str) -> Dict[str, Dict[str, Any]]:
+    levels: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(text, str) or not text.strip():
+        return levels
+
+    in_price_zone = False
+    for line in text.splitlines():
+        if "关键价格区间" in line:
+            in_price_zone = True
+            continue
+        if not in_price_zone or "|" not in line:
+            continue
+
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+
+        label = _clean_price_label(cells[0])
+        if not label or "价格类型" in label or set(label) <= {"-", " "}:
+            continue
+
+        parsed_price = _parse_price_cell(cells[1])
+        if not parsed_price:
+            continue
+
+        for key, aliases in _PRICE_LEVEL_ALIASES.items():
+            if any(alias in label for alias in aliases):
+                parsed_price.update({
+                    "label": label,
+                    "description": cells[2].strip() if len(cells) > 2 else "",
+                })
+                levels.setdefault(key, parsed_price)
+                break
+
+    return levels
+
+
+def _level_price(levels: Dict[str, Dict[str, Any]], key: str, prefer: str = "price") -> Optional[float]:
+    level = levels.get(key)
+    if not level:
+        return None
+    if prefer == "high":
+        return _coerce_float(level.get("high"))
+    if prefer == "low":
+        return _coerce_float(level.get("low"))
+    return _coerce_float(level.get("price"))
+
+
+def extract_report_price_plan(reports: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract execution-oriented price references from report body tables."""
+    if not isinstance(reports, dict) or not reports:
+        return {}
+
+    priority = [
+        "market_report",
+        "technical_report",
+        "trader_investment_plan",
+        "final_trade_decision",
+        "risk_management_decision",
+    ]
+    ordered_keys = [key for key in priority if key in reports]
+    ordered_keys.extend(key for key in reports.keys() if key not in ordered_keys)
+
+    levels: Dict[str, Dict[str, Any]] = {}
+    for key in ordered_keys:
+        content = reports.get(key)
+        parsed = _extract_key_price_levels_from_text(content) if isinstance(content, str) else {}
+        for level_key, value in parsed.items():
+            levels.setdefault(level_key, {**value, "module": key})
+
+    if not levels:
+        return {}
+
+    stop_loss_price = (
+        _level_price(levels, "breakdown_sell")
+        or _level_price(levels, "strong_support", "low")
+    )
+    suggested_buy_price = _level_price(levels, "breakout_buy")
+    suggested_sell_price = (
+        _level_price(levels, "second_resistance")
+        or _level_price(levels, "first_resistance", "high")
+    )
+    target_price = (
+        _level_price(levels, "strong_resistance", "high")
+        or _level_price(levels, "second_resistance", "high")
+        or _level_price(levels, "first_resistance", "high")
+    )
+
+    return {
+        "stop_loss_price": stop_loss_price,
+        "suggested_buy_price": suggested_buy_price,
+        "suggested_sell_price": suggested_sell_price,
+        "target_price": target_price,
+        "levels": levels,
+    }
+
+
 def parse_report_recommendation(
     recommendation: str,
     current_price: Optional[float] = None,
     decision: Optional[Dict[str, Any]] = None,
+    reports: Optional[Dict[str, Any]] = None,
+    price_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Parse the saved report's investment recommendation into holding advice."""
     decision = decision or {}
@@ -156,9 +283,19 @@ def parse_report_recommendation(
         ],
     )
     current = _coerce_float(current_price)
+    report_price_plan = price_plan if isinstance(price_plan, dict) and price_plan else extract_report_price_plan(reports)
 
-    suggested_buy_price = current if action == "buy" else None
-    suggested_sell_price = current if action == "sell" else None
+    if report_price_plan:
+        target_price = report_price_plan.get("target_price") or target_price
+        stop_loss_price = report_price_plan.get("stop_loss_price") or stop_loss_price
+        suggested_buy_price = report_price_plan.get("suggested_buy_price")
+        suggested_sell_price = report_price_plan.get("suggested_sell_price")
+        source = "analysis_report_price_levels"
+    else:
+        suggested_buy_price = current if action == "buy" else None
+        suggested_sell_price = current if action == "sell" else None
+        source = "analysis_report_recommendation"
+
     reason = _extract_reason(text)
 
     return {
@@ -172,7 +309,7 @@ def parse_report_recommendation(
         "reason": reason,
         "risks": [],
         "raw_response": text,
-        "source": "analysis_report_recommendation",
+        "source": source,
         "is_reference_only": True,
     }
 
@@ -290,6 +427,7 @@ async def _latest_report_context(code: str) -> Dict[str, Any]:
         parts.append("已有决策字段:\n" + _clip_text(doc.get("decision"), 1200))
 
     reports = doc.get("reports") or {}
+    price_plan = extract_report_price_plan(reports)
     if reports:
         for name, content in list(reports.items())[:5]:
             parts.append(f"{name}:\n{_clip_text(content, 1600)}")
@@ -303,6 +441,7 @@ async def _latest_report_context(code: str) -> Dict[str, Any]:
             "model_info": doc.get("model_info"),
             "recommendation": doc.get("recommendation") or "",
             "decision": doc.get("decision") if isinstance(doc.get("decision"), dict) else {},
+            "price_plan": price_plan,
         },
         "text": "\n\n".join(parts) if parts else "最近报告没有可用正文。",
     }
@@ -346,18 +485,19 @@ def _build_prompt(holding: Dict[str, Any], report_context: Dict[str, Any]) -> st
     )
 
 
-async def build_holding_ai_advice(holding: Dict[str, Any]) -> Dict[str, Any]:
-    from openai import AsyncOpenAI
-
+async def build_holding_report_advice(holding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build holding advice from the latest saved analysis report only."""
     report_context = await _latest_report_context(str(holding.get("code", "")))
     report_meta = report_context.get("report") or {}
     report_recommendation = report_meta.get("recommendation") or ""
     report_decision = report_meta.get("decision") or {}
+    report_price_plan = report_meta.get("price_plan") if isinstance(report_meta.get("price_plan"), dict) else {}
     if report_recommendation or report_decision:
         advice = parse_report_recommendation(
             report_recommendation,
             current_price=holding.get("current_price"),
             decision=report_decision,
+            price_plan=report_price_plan,
         )
         model_info = str(report_meta.get("model_info") or "analysis_report")
         advice.update(
@@ -370,6 +510,17 @@ async def build_holding_ai_advice(holding: Dict[str, Any]) -> Dict[str, Any]:
         )
         return advice
 
+    return None
+
+
+async def build_holding_ai_advice(holding: Dict[str, Any]) -> Dict[str, Any]:
+    from openai import AsyncOpenAI
+
+    report_advice = await build_holding_report_advice(holding)
+    if report_advice:
+        return report_advice
+
+    report_context = await _latest_report_context(str(holding.get("code", "")))
     llm_config = await _select_llm_config()
     prompt = _build_prompt(holding, report_context)
 

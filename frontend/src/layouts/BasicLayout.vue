@@ -8,9 +8,9 @@
     >
       <div class="sidebar-header">
         <div class="logo">
-          <img src="/logo.svg" alt="TradingAgents-CN" />
+          <img src="/logo.svg" alt="Agent管理平台" />
           <span v-show="!appStore.sidebarCollapsed" class="logo-text">
-            TradingAgents-CN
+            Agent管理平台
           </span>
         </div>
       </div>
@@ -53,7 +53,7 @@
       </header>
 
       <!-- 页面内容 -->
-      <main class="main-content">
+      <main class="main-content" :class="{ 'main-content--fluid': route.meta.fluidContent }">
         <div class="content-wrapper" :class="{ 'content-wrapper--fluid': route.meta.fluidContent }">
           <router-view v-slot="{ Component, route }">
             <transition
@@ -160,21 +160,26 @@ watch(() => route.fullPath, () => {
     height: 60px;
     display: flex;
     align-items: center;
-    padding: 0 16px;
+    padding: 0 12px;
     border-bottom: 1px solid var(--el-border-color-lighter);
 
     .logo {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 8px;
+      min-width: 0;
 
       img {
         width: 32px;
         height: 32px;
+        flex-shrink: 0;
       }
 
       .logo-text {
-        font-size: 18px;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 14px;
         font-weight: 600;
         color: var(--el-text-color-primary);
         white-space: nowrap;
@@ -238,6 +243,10 @@ watch(() => route.fullPath, () => {
   flex: 1;
   padding: 24px;
   min-height: calc(100vh - 60px - 60px); // 减去header和footer高度
+
+  &--fluid {
+    padding: 16px;
+  }
 
   .content-wrapper {
     width: 100%;

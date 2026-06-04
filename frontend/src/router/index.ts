@@ -21,11 +21,11 @@ const routes: RouteRecordRaw[] = [
     path: '/',
     redirect: '/dashboard'
   },
-  // 兼容文档链接：将 /paper/<name>.md 重定向到学习中心文章路由
+  // 兼容旧文档链接：学习中心已下线，统一回到仪表板
   {
     path: '/paper/:name.md',
     name: 'PaperMdRedirect',
-    redirect: (to) => `/learning/article/${to.params.name as string}`,
+    redirect: '/dashboard',
     meta: { title: '文档跳转', hideInMenu: true, requiresAuth: false }
   },
   {
@@ -126,43 +126,15 @@ const routes: RouteRecordRaw[] = [
   },
   {
     path: '/learning',
-    name: 'Learning',
-    component: () => import('@/layouts/BasicLayout.vue'),
-    meta: {
-      title: '学习中心',
-      icon: 'Reading',
-      requiresAuth: false,
-      transition: 'fade'
-    },
-    children: [
-      {
-        path: '',
-        name: 'LearningHome',
-        component: () => import('@/views/Learning/index.vue'),
-        meta: {
-          title: '学习中心',
-          requiresAuth: false
-        }
-      },
-      {
-        path: ':category',
-        name: 'LearningCategory',
-        component: () => import('@/views/Learning/Category.vue'),
-        meta: {
-          title: '学习分类',
-          requiresAuth: false
-        }
-      },
-      {
-        path: 'article/:id',
-        name: 'LearningArticle',
-        component: () => import('@/views/Learning/Article.vue'),
-        meta: {
-          title: '文章详情',
-          requiresAuth: false
-        }
-      }
-    ]
+    name: 'LearningRedirect',
+    redirect: '/dashboard',
+    meta: { title: '仪表板', hideInMenu: true, requiresAuth: true }
+  },
+  {
+    path: '/learning/:pathMatch(.*)*',
+    name: 'LearningLegacyRedirect',
+    redirect: '/dashboard',
+    meta: { title: '仪表板', hideInMenu: true, requiresAuth: true }
   },
   {
     path: '/stocks',

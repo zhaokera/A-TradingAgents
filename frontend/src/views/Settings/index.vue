@@ -137,9 +137,9 @@
             <el-form-item label="侧边栏宽度">
               <el-slider
                 v-model="appearanceSettings.sidebarWidth"
-                :min="200"
-                :max="400"
-                :step="20"
+                :min="SIDEBAR_MIN_WIDTH"
+                :max="SIDEBAR_MAX_WIDTH"
+                :step="10"
                 show-input
               />
             </el-form-item>
@@ -436,7 +436,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { useAppStore } from '@/stores/app'
+import { SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, clampSidebarWidth, useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
 import type { UserPreferences } from '@/types/auth'
 import {
@@ -540,7 +540,7 @@ const generalSettings = ref({
 
 const appearanceSettings = ref({
   theme: authStore.user?.preferences?.ui_theme || 'light',
-  sidebarWidth: authStore.user?.preferences?.sidebar_width || 240
+  sidebarWidth: clampSidebarWidth(authStore.user?.preferences?.sidebar_width || SIDEBAR_DEFAULT_WIDTH)
 })
 
 const analysisSettings = ref({
@@ -568,7 +568,7 @@ const buildPreferencesPayload = (
     auto_refresh: current?.auto_refresh ?? true,
     refresh_interval: current?.refresh_interval || 30,
     ui_theme: current?.ui_theme || 'light',
-    sidebar_width: current?.sidebar_width || 240,
+    sidebar_width: clampSidebarWidth(current?.sidebar_width || SIDEBAR_DEFAULT_WIDTH),
     language: current?.language || 'zh-CN',
     notifications_enabled: current?.notifications_enabled ?? true,
     email_notifications: current?.email_notifications ?? false,
@@ -589,7 +589,7 @@ watch(() => authStore.user, (newUser) => {
 
     // 更新外观设置
     appearanceSettings.value.theme = newUser.preferences?.ui_theme || 'light'
-    appearanceSettings.value.sidebarWidth = newUser.preferences?.sidebar_width || 240
+    appearanceSettings.value.sidebarWidth = clampSidebarWidth(newUser.preferences?.sidebar_width || SIDEBAR_DEFAULT_WIDTH)
 
     // 更新分析偏好
     analysisSettings.value.defaultMarket = newUser.preferences?.default_market || 'A股'
@@ -637,15 +637,18 @@ const saveGeneralSettings = async () => {
 
 const saveAppearanceSettings = async () => {
   try {
+    const sidebarWidth = clampSidebarWidth(appearanceSettings.value.sidebarWidth)
+    appearanceSettings.value.sidebarWidth = sidebarWidth
+
     // 更新本地 store（立即生效）
-    appStore.setSidebarWidth(appearanceSettings.value.sidebarWidth)
+    appStore.setSidebarWidth(sidebarWidth)
     appStore.setTheme(appearanceSettings.value.theme as any)
 
     // 保存到后端
     const success = await authStore.updateUserInfo({
       preferences: buildPreferencesPayload({
         ui_theme: appearanceSettings.value.theme,
-        sidebar_width: appearanceSettings.value.sidebarWidth
+        sidebar_width: sidebarWidth
       })
     })
 
