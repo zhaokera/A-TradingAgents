@@ -466,7 +466,7 @@ const exportData = () => {
   ElMessage.info('导出功能开发中...')
 }
 
-const viewDetails = (_row: TokenRecord) => {
+const viewDetails = (_row: any) => {
   ElMessage.info('详情功能开发中...')
 }
 

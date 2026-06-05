@@ -151,43 +151,52 @@ const handleLogin = async () => {
 <style lang="scss" scoped>
 .login-page {
   min-height: 100vh;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 20px;
+  background:
+    linear-gradient(180deg, #f8fafc 0%, #eef3fa 100%);
 }
 
 .login-container {
   width: 100%;
-  max-width: 400px;
+  max-width: 420px;
 }
 
 .login-header {
   text-align: center;
-  margin-bottom: 32px;
-  color: white;
+  margin-bottom: 20px;
+  color: #111827;
 
   .logo {
-    width: 64px;
-    height: 64px;
-    margin-bottom: 16px;
+    width: 48px;
+    height: 48px;
+    margin-bottom: 12px;
   }
 
   .title {
-    font-size: 32px;
-    font-weight: 600;
-    margin: 0 0 8px 0;
+    font-size: 24px;
+    font-weight: 700;
+    margin: 0 0 6px 0;
   }
 
   .subtitle {
-    font-size: 16px;
-    opacity: 0.9;
+    color: #526072;
+    font-size: 14px;
     margin: 0;
   }
 }
 
 .login-card {
+  border: 1px solid #e4eaf3;
+  border-radius: 8px;
+  box-shadow: 0 18px 45px rgba(18, 38, 63, 0.08);
+
+  :deep(.el-card__body) {
+    padding: 24px;
+  }
+
   .form-options {
     display: flex;
     justify-content: space-between;
@@ -204,13 +213,12 @@ const handleLogin = async () => {
 
 .login-footer {
   text-align: center;
-  margin-top: 32px;
-  color: white;
-  opacity: 0.9;
+  margin-top: 20px;
+  color: #526072;
 
   p {
     margin: 0;
-    font-size: 14px;
+    font-size: 12px;
   }
 
   .disclaimer {
@@ -220,8 +228,7 @@ const handleLogin = async () => {
     max-width: 800px;
     margin-left: auto;
     margin-right: auto;
-    color: white;
-    opacity: 0.85;
+    color: #6b7280;
   }
 }
 </style>

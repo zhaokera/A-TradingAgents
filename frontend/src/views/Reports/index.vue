@@ -306,12 +306,12 @@ const handleSelectionChange = (selection: ReportListItem[]) => {
   selectedReports.value = selection
 }
 
-const viewReport = (report: ReportListItem) => {
+const viewReport = (report: any) => {
   // 跳转到报告详情页面
   router.push(`/reports/view/${report.id}`)
 }
 
-const downloadReport = async (report: ReportListItem, format: string = 'markdown') => {
+const downloadReport = async (report: any, format: string = 'markdown') => {
   try {
     // 显示加载提示
     const loadingMsg = ElMessage({
@@ -386,7 +386,7 @@ const getFileExtension = (format: string): string => {
   return extensions[format] || 'txt'
 }
 
-const deleteReport = async (report: ReportListItem) => {
+const deleteReport = async (report: any) => {
   try {
     await ElMessageBox.confirm(
       `确定要删除报告 "${report.title}" 吗？`,

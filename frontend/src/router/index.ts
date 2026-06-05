@@ -119,7 +119,8 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/Favorites/index.vue'),
         meta: {
           title: '我的自选股',
-          requiresAuth: true
+          requiresAuth: true,
+          fluidContent: true
         }
       }
     ]

@@ -1,9 +1,12 @@
 <template>
   <div class="paper-trading">
-    <div class="header">
-      <div class="title">
-        <el-icon style="margin-right:8px"><CreditCard /></el-icon>
-        <span>模拟交易</span>
+    <div class="page-header paper-page-header">
+      <div>
+        <h1 class="page-title">
+          <el-icon><CreditCard /></el-icon>
+          模拟交易
+        </h1>
+        <p class="page-description">使用虚拟资金验证交易想法，统一查看账户、持仓、订单和成交。</p>
       </div>
       <div class="actions">
         <el-button :icon="Refresh" text size="small" @click="refreshAll">刷新</el-button>
@@ -20,7 +23,7 @@
       style="margin-bottom: 16px;"
     >
       <template #title>
-        <div style="font-weight: 600; font-size: 14px;">⚠️ 模拟交易风险提示</div>
+        <div style="font-weight: 600; font-size: 14px;">模拟交易风险提示</div>
       </template>
       <div style="font-size: 13px; line-height: 1.8;">
         <p style="margin: 0 0 8px 0;">
@@ -589,8 +592,12 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.paper-trading { padding: 16px; }
-.header { display:flex; align-items:center; justify-content:space-between; margin-bottom: 12px; }
-.title { display:flex; align-items:center; font-weight: 600; font-size: 16px; }
+.paper-trading { padding: 0; }
+.paper-page-header .actions {
+  display:flex;
+  align-items:center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .card-hd { font-weight: 600; }
 </style>

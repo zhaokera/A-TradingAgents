@@ -85,7 +85,7 @@ const goBack = () => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  background: linear-gradient(180deg, #f8fafc 0%, #eef3fa 100%);
   padding: 20px;
 }
 
@@ -146,9 +146,10 @@ const goBack = () => {
 
 .suggestions {
   background: white;
-  border-radius: 12px;
-  padding: 32px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  border: 1px solid #e4eaf3;
+  border-radius: 8px;
+  padding: 24px;
+  box-shadow: 0 12px 30px rgba(18, 38, 63, 0.06);
 
   h3 {
     font-size: 20px;

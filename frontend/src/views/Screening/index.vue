@@ -605,7 +605,7 @@ const batchAnalyze = async () => {
 }
 
 
-const analyzeSingle = (stock: StockInfo) => {
+const analyzeSingle = (stock: any) => {
   const stockCode = stock.code || stock.symbol || ''
   if (!stockCode) return
   router.push({
@@ -617,7 +617,7 @@ const analyzeSingle = (stock: StockInfo) => {
   })
 }
 
-const viewStockDetail = (stock: StockInfo) => {
+const viewStockDetail = (stock: any) => {
   const stockCode = stock.code || stock.symbol || ''
   if (!stockCode) return
   // 跳转到股票详情页面
@@ -629,7 +629,7 @@ const viewStockDetail = (stock: StockInfo) => {
 
 const isFavorited = (code: string) => favoriteSet.value.has(code)
 
-const toggleFavorite = async (stock: StockInfo) => {
+const toggleFavorite = async (stock: any) => {
   try {
     const code = stock.code || stock.symbol || ''
     if (!code) {

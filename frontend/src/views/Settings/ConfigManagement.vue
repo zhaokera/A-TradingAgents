@@ -838,7 +838,7 @@
               </el-col>
 
               <el-col :span="12">
-                <h4>📊 配置统计</h4>
+                <h4>配置统计</h4>
                 <div class="stats-grid">
                   <div class="stat-item">
                     <div class="stat-number">{{ providers.length }}</div>
@@ -1536,13 +1536,13 @@ const showAddProviderDialog = () => {
 }
 
 // 编辑厂家
-const editProvider = (provider: LLMProvider) => {
+const editProvider = (provider: any) => {
   currentProvider.value = { ...provider }
   providerDialogVisible.value = true
 }
 
 // 切换厂家状态
-const toggleProvider = async (provider: LLMProvider) => {
+const toggleProvider = async (provider: any) => {
   try {
     await configApi.toggleLLMProvider(provider.id, !provider.is_active)
     await loadProviders()
@@ -1553,7 +1553,7 @@ const toggleProvider = async (provider: LLMProvider) => {
 }
 
 // 删除厂家
-const deleteProvider = async (provider: LLMProvider) => {
+const deleteProvider = async (provider: any) => {
   try {
     await ElMessageBox.confirm(
       `确定要删除厂家 ${provider.display_name} 吗？删除后该厂家下的所有模型配置也将被删除。`,
@@ -1711,7 +1711,7 @@ const toggleProviderStatus = async (providerRow: LLMConfigGroup) => {
 }
 
 // 测试厂家API
-const testProviderAPI = async (provider: LLMProvider) => {
+const testProviderAPI = async (provider: any) => {
   try {
     console.log('🔍 测试厂家API:', provider)
     console.log('📋 厂家ID:', provider.id)
@@ -1814,7 +1814,7 @@ const showAddLLMDialog = () => {
   llmDialogVisible.value = true
 }
 
-const editLLMConfig = (config: LLMConfig) => {
+const editLLMConfig = (config: any) => {
   currentLLMConfig.value = config
   isEditingLLM.value = true
   llmDialogVisible.value = true
@@ -1825,7 +1825,7 @@ const handleLLMConfigSuccess = () => {
 }
 
 // 测试LLM配置
-const testLLMConfig = async (config: LLMConfig) => {
+const testLLMConfig = async (config: any) => {
   try {
     console.log('🧪 测试LLM配置:', config)
     console.log('📋 厂家:', config.provider)
@@ -1853,7 +1853,7 @@ const testLLMConfig = async (config: LLMConfig) => {
 }
 
 // 切换LLM配置启用状态
-const toggleLLMConfig = async (config: LLMConfig) => {
+const toggleLLMConfig = async (config: any) => {
   try {
     const newStatus = !config.enabled
     const action = newStatus ? '启用' : '禁用'
@@ -1873,7 +1873,7 @@ const toggleLLMConfig = async (config: LLMConfig) => {
 }
 
 // 删除LLM配置
-const deleteLLMConfig = async (config: LLMConfig) => {
+const deleteLLMConfig = async (config: any) => {
   try {
     await ElMessageBox.confirm(
       `确定要删除大模型配置 ${config.provider}/${config.model_name} 吗？`,
@@ -1991,7 +1991,7 @@ const deleteDataSourceConfig = async (config: DataSourceConfig) => {
 }
 
 // 数据库相关操作
-const editDatabaseConfig = (config: DatabaseConfig) => {
+const editDatabaseConfig = (config: any) => {
   databaseDialogMode.value = 'edit'
   currentDatabaseConfig.value = { ...config }
   databaseDialogVisible.value = true
@@ -2011,7 +2011,7 @@ const saveDatabaseConfig = async () => {
   }
 }
 
-const testDatabase = async (config: DatabaseConfig) => {
+const testDatabase = async (config: any) => {
   try {
     console.log('🧪 测试数据库配置:', config)
     console.log('📋 配置名称:', config.name)

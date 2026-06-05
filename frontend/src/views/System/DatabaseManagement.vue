@@ -111,7 +111,7 @@
     <!-- 数据管理操作 -->
     <el-card class="operations-card" shadow="never" style="margin-top: 24px">
       <template #header>
-        <h3>🛠️ 数据管理操作</h3>
+        <h3>数据管理操作</h3>
       </template>
       
       <!-- 第一行：数据导入和导出 -->
@@ -180,7 +180,7 @@
                 覆盖现有数据
               </el-checkbox>
               <div style="font-size: 12px; color: #909399; margin-top: 4px;">
-                ⚠️ 勾选后将删除现有数据再导入
+                勾选后将删除现有数据再导入
               </div>
             </el-form-item>
 

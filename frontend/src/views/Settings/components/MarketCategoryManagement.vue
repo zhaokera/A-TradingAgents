@@ -135,13 +135,13 @@ const showAddDialog = () => {
 }
 
 // 编辑分类
-const editCategory = (category: MarketCategory) => {
+const editCategory = (category: any) => {
   currentCategory.value = category
   dialogVisible.value = true
 }
 
 // 切换分类状态
-const toggleCategory = async (category: MarketCategory) => {
+const toggleCategory = async (category: any) => {
   try {
     await configApi.updateMarketCategory(category.id, {
       enabled: !category.enabled
@@ -156,7 +156,7 @@ const toggleCategory = async (category: MarketCategory) => {
 }
 
 // 删除分类
-const deleteCategory = async (category: MarketCategory) => {
+const deleteCategory = async (category: any) => {
   const dataSourceCount = getDataSourceCount.value(category.id)
   
   if (dataSourceCount > 0) {

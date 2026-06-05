@@ -1,19 +1,31 @@
 <template>
   <div class="favorites">
-    <div class="page-header">
-      <h1 class="page-title">
-        <el-icon><Star /></el-icon>
-        我的自选股
-      </h1>
-      <p class="page-description">
-        管理您关注的股票
-      </p>
+    <div class="page-header favorites-header">
+      <div>
+        <h1 class="page-title">
+          <el-icon><Star /></el-icon>
+          我的自选股
+        </h1>
+        <p class="page-description">
+          管理您关注的股票
+        </p>
+      </div>
+      <div class="header-actions">
+        <el-button @click="refreshData">
+          <el-icon><Refresh /></el-icon>
+          刷新
+        </el-button>
+        <el-button type="primary" @click="showAddDialog">
+          <el-icon><Plus /></el-icon>
+          添加自选股
+        </el-button>
+      </div>
     </div>
 
     <!-- 操作栏 -->
     <el-card class="action-card" shadow="never">
-      <el-row :gutter="16" align="middle" style="margin-bottom: 16px;">
-        <el-col :span="8">
+      <el-row :gutter="10" align="middle" class="filter-row">
+        <el-col :xs="24" :sm="12" :md="8" :lg="7" :xl="6">
           <el-input
             v-model="searchKeyword"
             placeholder="搜索股票代码或名称"
@@ -25,7 +37,7 @@
           </el-input>
         </el-col>
 
-        <el-col :span="4">
+        <el-col :xs="12" :sm="6" :md="4" :lg="4" :xl="3">
           <el-select v-model="selectedMarket" placeholder="市场" clearable>
             <el-option label="A股" value="A股" />
             <el-option label="港股" value="港股" />
@@ -33,7 +45,7 @@
           </el-select>
         </el-col>
 
-        <el-col :span="4">
+        <el-col :xs="12" :sm="6" :md="4" :lg="4" :xl="3">
           <el-select v-model="selectedBoard" placeholder="板块" clearable>
             <el-option label="主板" value="主板" />
             <el-option label="创业板" value="创业板" />
@@ -42,7 +54,7 @@
           </el-select>
         </el-col>
 
-        <el-col :span="4">
+        <el-col :xs="12" :sm="6" :md="4" :lg="4" :xl="4">
           <el-select v-model="selectedExchange" placeholder="交易所" clearable>
             <el-option label="上海证券交易所" value="上海证券交易所" />
             <el-option label="深圳证券交易所" value="深圳证券交易所" />
@@ -50,7 +62,7 @@
           </el-select>
         </el-col>
 
-        <el-col :span="4">
+        <el-col :xs="12" :sm="6" :md="4" :lg="4" :xl="3">
           <el-select v-model="selectedTag" placeholder="标签" clearable>
             <el-option
               v-for="tag in userTags"
@@ -60,15 +72,8 @@
             />
           </el-select>
         </el-col>
-      </el-row>
-
-      <el-row :gutter="16" align="middle">
-        <el-col :span="24">
+        <el-col :xs="24" :md="24" :lg="24" :xl="5">
           <div class="action-buttons">
-            <el-button @click="refreshData">
-              <el-icon><Refresh /></el-icon>
-              刷新
-            </el-button>
             <!-- 只有有A股自选股时才显示同步实时行情按钮 -->
             <el-button
               v-if="hasAStocks"
@@ -90,10 +95,6 @@
             </el-button>
             <el-button @click="openTagManager">
               标签管理
-            </el-button>
-            <el-button type="primary" @click="showAddDialog">
-              <el-icon><Plus /></el-icon>
-              添加自选股
             </el-button>
           </div>
         </el-col>
@@ -1023,7 +1024,7 @@ const handleSelectionChange = (selection: FavoriteItem[]) => {
 }
 
 // 显示单个股票同步对话框
-const showSingleSyncDialog = (row: FavoriteItem) => {
+const showSingleSyncDialog = (row: any) => {
   currentSyncStock.value = {
     stock_code: row.stock_code || '',
     stock_name: row.stock_name || ''
@@ -1198,8 +1199,10 @@ onMounted(() => {
 
 <style lang="scss" scoped>
 .favorites {
+  min-height: calc(100vh - 104px);
+
   .page-header {
-    margin-bottom: 24px;
+    margin-bottom: 12px;
 
     .page-title {
       display: flex;
@@ -1217,13 +1220,39 @@ onMounted(() => {
     }
   }
 
+  .favorites-header {
+    min-height: 64px;
+    padding: 14px 18px;
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+  }
+
   .action-card {
-    margin-bottom: 24px;
+    margin-bottom: 12px;
+
+    :deep(.el-card__body) {
+      padding: 12px 14px;
+    }
+
+    .filter-row {
+      row-gap: 10px;
+    }
+
+    :deep(.el-select),
+    :deep(.el-input) {
+      width: 100%;
+    }
 
     .action-buttons {
       display: flex;
       gap: 8px;
       justify-content: flex-end;
+      flex-wrap: wrap;
     }
   }
 
@@ -1254,6 +1283,19 @@ onMounted(() => {
   }
 
   .favorites-list-card {
+    :deep(.el-card__body) {
+      padding: 0;
+    }
+
+    :deep(.el-table__header th.el-table__cell) {
+      height: 42px;
+      background: #f8fafc;
+    }
+
+    :deep(.el-table__body td.el-table__cell) {
+      padding: 9px 0;
+    }
+
     .empty-state {
       padding: 40px;
       text-align: center;

@@ -1,5 +1,50 @@
 <template>
   <div class="dashboard">
+    <div class="page-header dashboard-header">
+      <div>
+        <h1 class="page-title">
+          <el-icon><Odometer /></el-icon>
+          仪表板
+        </h1>
+        <p class="page-description">关注最近任务、账户概览和自选股状态。</p>
+      </div>
+      <el-button @click="reloadDashboard" :loading="dashboardLoading">
+        <el-icon><Refresh /></el-icon>
+        刷新
+      </el-button>
+    </div>
+
+    <el-row :gutter="16" class="dashboard-metrics">
+      <el-col :xs="24" :sm="12" :lg="6">
+        <div class="metric-card">
+          <div class="metric-label">分析任务</div>
+          <div class="metric-value">{{ userStats.totalAnalyses }}</div>
+          <div class="metric-meta">最近任务总数</div>
+        </div>
+      </el-col>
+      <el-col :xs="24" :sm="12" :lg="6">
+        <div class="metric-card">
+          <div class="metric-label">已完成</div>
+          <div class="metric-value">{{ userStats.successfulAnalyses }}</div>
+          <div class="metric-meta">可查看报告</div>
+        </div>
+      </el-col>
+      <el-col :xs="24" :sm="12" :lg="6">
+        <div class="metric-card">
+          <div class="metric-label">自选股</div>
+          <div class="metric-value">{{ favoriteStocks.length }}</div>
+          <div class="metric-meta">当前关注</div>
+        </div>
+      </el-col>
+      <el-col :xs="24" :sm="12" :lg="6">
+        <div class="metric-card">
+          <div class="metric-label">模拟账户</div>
+          <div class="metric-value">¥{{ formatMoney(paperEquityCny) }}</div>
+          <div class="metric-meta">A股账户总资产</div>
+        </div>
+      </el-col>
+    </el-row>
+
     <!-- 主要功能区域 -->
     <el-row :gutter="24" class="main-content">
       <!-- 左侧：最近分析 -->
@@ -199,10 +244,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { ArrowRight, InfoFilled } from '@element-plus/icons-vue'
+import { ArrowRight, InfoFilled, Odometer, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import type { AnalysisTask, AnalysisStatus } from '@/types/analysis'
 import MultiSourceSyncCard from '@/components/Dashboard/MultiSourceSyncCard.vue'
@@ -233,6 +278,7 @@ const marketNews = ref<any[]>([])
 
 // 模拟交易账户数据
 const paperAccount = ref<PaperAccountSummary | null>(null)
+const dashboardLoading = ref(false)
 
 const getCurrencyAmount = (
   amount: number | { CNY: number; HKD: number; USD: number } | undefined,
@@ -243,13 +289,15 @@ const getCurrencyAmount = (
   return amount?.[currency] ?? fallback
 }
 
+const paperEquityCny = computed(() => getCurrencyAmount(paperAccount.value?.equity, 'CNY'))
+
 
 
 const goToHistory = () => {
   router.push('/tasks?tab=completed')
 }
 
-const viewAnalysis = (analysis: AnalysisTask) => {
+const viewAnalysis = (analysis: any) => {
   const status = (analysis as any)?.status
   if (status === 'completed') {
     router.push({ name: 'ReportDetail', params: { id: analysis.task_id } })
@@ -259,7 +307,7 @@ const viewAnalysis = (analysis: AnalysisTask) => {
   }
 }
 
-const downloadReport = async (analysis: AnalysisTask) => {
+const downloadReport = async (analysis: any) => {
   try {
     const reportId = analysis.task_id
     const res = await fetch(`/api/reports/${reportId}/download?format=markdown`, {
@@ -425,6 +473,20 @@ const loadPaperAccount = async () => {
   }
 }
 
+const reloadDashboard = async () => {
+  dashboardLoading.value = true
+  try {
+    await Promise.all([
+      loadFavoriteStocks(),
+      loadRecentAnalyses(),
+      loadMarketNews(),
+      loadPaperAccount()
+    ])
+  } finally {
+    dashboardLoading.value = false
+  }
+}
+
 // 跳转到模拟交易页面
 const goToPaperTrading = () => {
   router.push('/paper')
@@ -437,19 +499,45 @@ const formatMoney = (value: number) => {
 
 // 生命周期
 onMounted(async () => {
-  // 加载自选股数据
-  await loadFavoriteStocks()
-  // 加载最近分析
-  await loadRecentAnalyses()
-  // 加载市场快讯
-  await loadMarketNews()
-  // 加载模拟交易账户
-  await loadPaperAccount()
+  await reloadDashboard()
 })
 </script>
 
 <style lang="scss" scoped>
 .dashboard {
+  .dashboard-header {
+    .el-button {
+      flex-shrink: 0;
+    }
+  }
+
+  .dashboard-metrics {
+    margin-bottom: 16px;
+
+    .el-col {
+      margin-bottom: 12px;
+    }
+
+    .metric-card {
+      .metric-label {
+        color: var(--ta-text-secondary, var(--el-text-color-regular));
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .metric-value {
+        margin-top: 8px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .metric-meta {
+        margin-top: 6px;
+        color: var(--ta-text-muted, var(--el-text-color-secondary));
+        font-size: 12px;
+      }
+    }
+  }
+
   .recent-analyses-card {
     .table-footer {
       text-align: center;

@@ -31,7 +31,7 @@
             <el-form :model="analysisForm" label-width="100px" class="analysis-form">
               <!-- 股票信息 -->
               <div class="form-section">
-                <h4 class="section-title">📊 股票信息</h4>
+                <h4 class="section-title">股票信息</h4>
                 <el-row :gutter="16">
                   <el-col :span="12">
                     <el-form-item label="股票代码" required>
@@ -180,7 +180,7 @@
 
               <!-- 分析深度 -->
               <div class="form-section">
-                <h4 class="section-title">🎯 分析深度</h4>
+                <h4 class="section-title">分析深度</h4>
                 <div class="depth-selector">
                   <div
                     v-for="(depth, index) in depthOptions"
@@ -201,7 +201,7 @@
 
               <!-- 分析师团队 -->
               <div class="form-section">
-                <h4 class="section-title">👥 分析师团队</h4>
+                <h4 class="section-title">分析师团队</h4>
                 <div class="analysts-grid">
                   <div
                     v-for="analyst in ANALYSTS"
@@ -388,7 +388,7 @@
                     <!-- 分析步骤显示 - 已隐藏 -->
                     <!--
                     <div v-if="analysisSteps.length > 0" class="analysis-steps">
-                      <h5 class="steps-title">📋 分析步骤</h5>
+                      <h5 class="steps-title">分析步骤</h5>
                       <div class="steps-container">
                         <div
                           v-for="(step, index) in analysisSteps"
@@ -439,7 +439,7 @@
             <div class="config-content">
               <!-- AI模型配置 -->
               <div class="config-section">
-                <h4 class="config-title">🤖 AI模型配置</h4>
+                <h4 class="config-title">AI 模型配置</h4>
                 <div class="model-config">
                   <div class="model-item">
                     <div class="model-label">
@@ -523,7 +523,7 @@
 
               <!-- 分析选项 -->
               <div class="config-section">
-                <h4 class="config-title">⚙️ 分析选项</h4>
+                <h4 class="config-title">分析选项</h4>
                 <div class="option-list">
                   <div class="option-item">
                     <div class="option-info">
@@ -565,7 +565,7 @@
             <el-card class="results-card" shadow="hover">
               <template #header>
                 <div class="results-header">
-                  <h3>📊 分析结果</h3>
+                  <h3>分析结果</h3>
                   <div class="result-meta">
                     <el-tag type="success">{{ analysisResults.symbol || analysisResults.stock_symbol || analysisForm.symbol || analysisForm.stockCode }}</el-tag>
                     <el-tag>{{ analysisResults.analysis_date }}</el-tag>
@@ -607,7 +607,7 @@
 
                 <!-- 最终决策 -->
                 <div v-if="analysisResults.decision" class="decision-section">
-                  <h4>🎯 分析参考</h4>
+                  <h4>分析参考</h4>
                   <div class="decision-card">
                     <div class="decision-main">
                       <div class="decision-action">
@@ -714,7 +714,7 @@
 
                 <!-- 分析概览 -->
                 <div v-if="analysisResults" class="overview-section">
-                  <h4>📊 分析概览</h4>
+                  <h4>分析概览</h4>
                   <div class="overview-card">
   
                     <div v-if="analysisResults.summary" class="overview-summary">
@@ -731,7 +731,7 @@
 
                 <!-- 详细分析报告 -->
                 <div v-if="analysisResults.state || analysisResults.reports" class="reports-section">
-                  <h4>📋 详细分析报告</h4>
+                  <h4>详细分析报告</h4>
 
                   <!-- 美观的标签页展示 -->
                   <div class="analysis-tabs-container">

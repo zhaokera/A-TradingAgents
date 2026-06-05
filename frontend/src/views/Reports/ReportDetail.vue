@@ -8,10 +8,10 @@
     <!-- 报告内容 -->
     <div v-else-if="report" class="report-content">
       <!-- 报告头部 -->
-      <el-card class="report-header" shadow="never">
+      <el-card class="page-header report-header" shadow="never">
         <div class="header-content">
           <div class="title-section">
-            <h1 class="report-title">
+            <h1 class="page-title report-title">
               <el-icon><Document /></el-icon>
               {{ report.stock_name || report.stock_symbol }} 分析报告
             </h1>
@@ -953,8 +953,8 @@ watch(
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 24px;
-            font-weight: 600;
+            font-size: 22px;
+            font-weight: 700;
             color: var(--el-text-color-primary);
             margin: 0 0 12px 0;
           }
@@ -989,11 +989,11 @@ watch(
     }
 
     .risk-disclaimer :deep(.el-alert) {
-      background: linear-gradient(135deg, #fff3cd 0%, #ffe69c 100%);
-      border: 2px solid #ffc107;
-      border-radius: 12px;
+      background: #fff8e8;
+      border: 1px solid #f3c969;
+      border-radius: 8px;
       padding: 16px 20px;
-      box-shadow: 0 4px 12px rgba(255, 193, 7, 0.2);
+      box-shadow: none;
     }
 
     .risk-disclaimer :deep(.el-alert__icon) {

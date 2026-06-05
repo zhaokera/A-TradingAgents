@@ -118,7 +118,7 @@
       <el-col :span="12">
         <el-card class="chart-card" shadow="never">
           <template #header>
-            <h3>📊 操作类型分布</h3>
+            <h3>操作类型分布</h3>
           </template>
           <div ref="actionTypeChart" class="chart-container"></div>
         </el-card>
@@ -137,7 +137,7 @@
     <el-card class="logs-table" shadow="never" style="margin-top: 24px">
       <template #header>
         <div class="table-header">
-          <h3>📋 操作日志列表</h3>
+          <h3>操作日志列表</h3>
           <div class="table-actions">
             <el-button size="small" @click="loadLogs">
               <el-icon><Refresh /></el-icon>

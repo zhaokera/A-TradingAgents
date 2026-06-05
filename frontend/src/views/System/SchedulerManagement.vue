@@ -721,7 +721,7 @@ const loadJobs = async () => {
   }
 }
 
-const showEditDialog = (job: Job) => {
+const showEditDialog = (job: any) => {
   editingJob.value = job
   editForm.display_name = job.display_name || ''
   editForm.description = job.description || ''
@@ -747,7 +747,7 @@ const handleSaveMetadata = async () => {
   }
 }
 
-const showJobDetail = async (job: Job) => {
+const showJobDetail = async (job: any) => {
   try {
     const res = await getJobDetail(job.id)
     // request.get 已经返回了 response.data
@@ -758,7 +758,7 @@ const showJobDetail = async (job: Job) => {
   }
 }
 
-const handlePause = async (job: Job) => {
+const handlePause = async (job: any) => {
   try {
     await ElMessageBox.confirm(`确定要暂停任务"${job.name}"吗？`, '确认暂停', {
       type: 'warning'
@@ -777,7 +777,7 @@ const handlePause = async (job: Job) => {
   }
 }
 
-const handleResume = async (job: Job) => {
+const handleResume = async (job: any) => {
   try {
     actionLoading[job.id] = true
     await resumeJob(job.id)
@@ -790,7 +790,7 @@ const handleResume = async (job: Job) => {
   }
 }
 
-const handleTrigger = async (job: Job) => {
+const handleTrigger = async (job: any) => {
   try {
     await ElMessageBox.confirm(
       `确定要立即执行任务"${job.name}"吗？任务将在后台执行。`,
@@ -950,7 +950,7 @@ const handleExecutionPageChange = (page: number) => {
   loadExecutions()
 }
 
-const showExecutionDetail = (execution: JobExecution) => {
+const showExecutionDetail = (execution: any) => {
   currentExecution.value = execution
   executionDetailDialogVisible.value = true
 }
@@ -1184,4 +1184,3 @@ onMounted(() => {
   }
 }
 </style>
-

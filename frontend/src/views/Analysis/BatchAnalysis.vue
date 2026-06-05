@@ -23,7 +23,7 @@
         >
           <template #title>
             <span style="font-size: 14px;">
-              <strong>⚠️ 重要提示：</strong>本工具为股票分析辅助工具，所有分析结果仅供参考，不构成投资建议。投资有风险，决策需谨慎。
+                <strong>重要提示：</strong>本工具为股票分析辅助工具，所有分析结果仅供参考，不构成投资建议。投资有风险，决策需谨慎。
             </span>
           </template>
         </el-alert>
@@ -37,7 +37,7 @@
           <el-card class="stock-list-card" shadow="hover">
             <template #header>
               <div class="card-header">
-                <h3>📋 股票列表</h3>
+                <h3>股票列表</h3>
                 <el-tag :type="stockCodes.length > 0 ? 'success' : 'info'" size="small">
                   {{ stockCodes.length }} 只股票
                 </el-tag>
@@ -107,7 +107,7 @@
           <el-card class="config-card" shadow="hover">
             <template #header>
               <div class="card-header">
-                <h3>⚙️ 分析配置</h3>
+                <h3>分析配置</h3>
                 <el-tag type="primary" size="small">批量设置</el-tag>
               </div>
             </template>
@@ -115,7 +115,7 @@
             <el-form :model="batchForm" label-width="100px" class="batch-form">
               <!-- 基础信息 -->
               <div class="form-section">
-                <h4 class="section-title">📋 基础信息</h4>
+                <h4 class="section-title">基础信息</h4>
                 <el-form-item label="批次标题" required>
                   <el-input
                     v-model="batchForm.title"
@@ -136,12 +136,12 @@
 
               <!-- 分析参数 -->
               <div class="form-section">
-                <h4 class="section-title">⚙️ 分析参数</h4>
+                <h4 class="section-title">分析参数</h4>
                 <el-form-item label="分析深度">
                   <el-select v-model="batchForm.depth" placeholder="选择深度" size="large" style="width: 100%">
                     <el-option label="⚡ 1级 - 快速分析 (2-4分钟/只)" value="1" />
                     <el-option label="📈 2级 - 基础分析 (4-6分钟/只)" value="2" />
-                    <el-option label="🎯 3级 - 标准分析 (6-10分钟/只，推荐)" value="3" />
+                    <el-option label="3级 - 标准分析 (6-10分钟/只，推荐)" value="3" />
                     <el-option label="🔍 4级 - 深度分析 (10-15分钟/只)" value="4" />
                     <el-option label="🏆 5级 - 全面分析 (15-25分钟/只)" value="5" />
                   </el-select>
@@ -150,7 +150,7 @@
 
               <!-- 分析师选择 -->
               <div class="form-section">
-                <h4 class="section-title">👥 分析师团队</h4>
+                <h4 class="section-title">分析师团队</h4>
                 <div class="analysts-selection">
                   <el-checkbox-group v-model="batchForm.analysts" class="analysts-group">
                     <div
@@ -195,7 +195,7 @@
           <el-card class="advanced-config-card" shadow="hover">
             <template #header>
               <div class="card-header">
-                <h3>🔧 高级配置</h3>
+                <h3>高级配置</h3>
               </div>
             </template>
 
@@ -210,7 +210,7 @@
 
               <!-- 分析选项 -->
               <div class="config-section">
-                <h4 class="config-title">⚙️ 分析选项</h4>
+                <h4 class="config-title">分析选项</h4>
                 <div class="analysis-options">
                   <div class="option-item">
                     <el-switch v-model="batchForm.includeSentiment" />

@@ -16,7 +16,7 @@
       <el-col :span="12">
         <el-card class="stats-card" shadow="never">
           <template #header>
-            <h3>📊 缓存统计</h3>
+            <h3>缓存统计</h3>
           </template>
           
           <div v-loading="statsLoading" class="stats-content">
@@ -71,7 +71,7 @@
       <el-col :span="12">
         <el-card class="operations-card" shadow="never">
           <template #header>
-            <h3>🛠️ 缓存操作</h3>
+            <h3>缓存操作</h3>
           </template>
           
           <div class="operations-content">
@@ -118,8 +118,8 @@
             
             <!-- 清空所有缓存 -->
             <div class="operation-item">
-              <h4>🗑️ 清空所有缓存</h4>
-              <p class="warning-text">⚠️ 此操作将删除所有缓存文件，无法恢复</p>
+              <h4>清空所有缓存</h4>
+              <p class="warning-text">此操作将删除所有缓存文件，无法恢复</p>
               
               <el-button 
                 type="danger" 
@@ -139,7 +139,7 @@
     <el-card class="details-card" shadow="never" style="margin-top: 24px">
       <template #header>
         <div class="card-header">
-          <h3>📋 缓存详情</h3>
+          <h3>缓存详情</h3>
           <el-button size="small" @click="loadCacheDetails">
             <el-icon><Refresh /></el-icon>
             刷新

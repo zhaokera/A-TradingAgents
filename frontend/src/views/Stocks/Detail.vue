@@ -1,11 +1,16 @@
 <template>
   <div class="stock-detail">
     <!-- 顶部：代码 / 名称 / 操作 -->
-    <div class="header">
-      <div class="title">
-        <div class="code">{{ code }}</div>
-        <div class="name">{{ stockName || '-' }}</div>
-        <el-tag size="small">{{ market || '-' }}</el-tag>
+    <div class="page-header stock-page-header">
+      <div>
+        <h1 class="page-title">
+          <el-icon><TrendCharts /></el-icon>
+          {{ code }}
+        </h1>
+        <p class="page-description">
+          {{ stockName || '-' }}
+          <el-tag size="small" style="margin-left: 8px;">{{ market || '-' }}</el-tag>
+        </p>
       </div>
       <div class="actions">
         <el-button @click="onToggleFavorite">
@@ -171,7 +176,7 @@
             <div v-if="lastAnalysis?.reports && Object.keys(lastAnalysis.reports).length > 0" class="reports-section">
               <el-divider />
               <div class="reports-header">
-                <span class="reports-title">📊 详细分析报告 ({{ Object.keys(lastAnalysis.reports).length }})</span>
+                <span class="reports-title">详细分析报告 ({{ Object.keys(lastAnalysis.reports).length }})</span>
                 <el-button
                   type="primary"
                   plain
@@ -284,7 +289,7 @@
     <!-- 详细报告对话框 -->
     <el-dialog
       v-model="showReportsDialog"
-      title="📊 详细分析报告"
+      title="详细分析报告"
       width="80%"
       :close-on-click-modal="false"
       class="reports-dialog"
@@ -1229,13 +1234,10 @@ function exportReport() {
   display: flex; flex-direction: column; gap: 16px;
 }
 
-.header { display: flex; justify-content: space-between; align-items: center; }
-.title { display: flex; align-items: center; gap: 12px; }
-.code { font-size: 22px; font-weight: 700; }
-.name { font-size: 18px; color: var(--el-text-color-regular); }
+.stock-page-header { margin-bottom: 0; }
 .actions { display: flex; gap: 8px; }
 
-.quote-card { border-radius: 12px; }
+.quote-card { border-radius: 8px; }
 .quote { display: flex; flex-direction: column; gap: 8px; }
 .price-row { display: flex; align-items: center; gap: 12px; }
 .price { font-size: 32px; font-weight: 800; }

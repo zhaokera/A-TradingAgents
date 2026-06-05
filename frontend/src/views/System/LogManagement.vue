@@ -3,7 +3,7 @@
     <el-card class="header-card">
       <template #header>
         <div class="card-header">
-          <span>📋 日志管理</span>
+          <span>日志管理</span>
           <div class="header-actions">
             <el-button type="primary" :icon="Refresh" @click="loadLogFiles" :loading="loading">
               刷新
@@ -262,7 +262,7 @@ const loadStatistics = async () => {
   }
 }
 
-const viewLog = async (file: LogFileInfo) => {
+const viewLog = async (file: any) => {
   currentLogFile.value = file
   viewDialogVisible.value = true
   await loadLogContent()
@@ -286,7 +286,7 @@ const loadLogContent = async () => {
   }
 }
 
-const downloadLog = async (file: LogFileInfo) => {
+const downloadLog = async (file: any) => {
   try {
     const blob = await LogsApi.exportLogs({
       filenames: [file.name],
@@ -308,7 +308,7 @@ const downloadLog = async (file: LogFileInfo) => {
   }
 }
 
-const deleteLog = async (file: LogFileInfo) => {
+const deleteLog = async (file: any) => {
   try {
     await LogsApi.deleteLogFile(file.name)
     ElMessage.success('日志文件已删除')
@@ -435,4 +435,3 @@ onMounted(() => {
   }
 }
 </style>
-

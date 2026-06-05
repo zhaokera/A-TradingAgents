@@ -1,5 +1,8 @@
 <template>
-  <div class="basic-layout">
+  <div
+    class="basic-layout"
+    :class="{ 'basic-layout--holding': isHoldingPage }"
+  >
     <!-- 侧边栏 -->
     <aside
       class="sidebar"
@@ -53,8 +56,21 @@
       </header>
 
       <!-- 页面内容 -->
-      <main class="main-content" :class="{ 'main-content--fluid': route.meta.fluidContent }">
-        <div class="content-wrapper" :class="{ 'content-wrapper--fluid': route.meta.fluidContent }">
+      <main
+        class="main-content"
+        :class="{
+          'main-content--fluid': route.meta.fluidContent,
+          'main-content--holding': isHoldingPage
+        }"
+      >
+        <div
+          class="content-wrapper"
+          :class="{
+            'content-wrapper--fluid': route.meta.fluidContent,
+            'content-wrapper--holding': isHoldingPage,
+            'content-wrapper--workspace': !isHoldingPage
+          }"
+        >
           <router-view v-slot="{ Component, route }">
             <transition
               :name="route.meta.transition || 'fade'"
@@ -93,6 +109,7 @@ import { Expand, Fold } from '@element-plus/icons-vue'
 const appStore = useAppStore()
 const route = useRoute()
 const { width } = useWindowSize()
+const isHoldingPage = computed(() => route.name === 'HoldingAnalysis' || route.path === '/analysis/holding')
 
 // 需要缓存的组件
 const keepAliveComponents = computed(() => [

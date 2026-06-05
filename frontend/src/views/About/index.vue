@@ -463,33 +463,29 @@ const viewDocumentation = () => {
 .about {
   max-width: 1200px;
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 24px;
+  color: #111827;
 
   // Hero Section
   .hero-section {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border-radius: 16px;
-    padding: 60px 40px;
-    margin-bottom: 48px;
-    color: white;
+    background: #ffffff;
+    border: 1px solid #e4eaf3;
+    border-radius: 8px;
+    padding: 28px;
+    margin-bottom: 24px;
+    color: #111827;
     position: relative;
     overflow: hidden;
+    box-shadow: 0 12px 30px rgba(18, 38, 63, 0.06);
 
     &::before {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><pattern id="grain" width="100" height="100" patternUnits="userSpaceOnUse"><circle cx="25" cy="25" r="1" fill="white" opacity="0.1"/><circle cx="75" cy="75" r="1" fill="white" opacity="0.1"/><circle cx="50" cy="10" r="0.5" fill="white" opacity="0.1"/><circle cx="10" cy="60" r="0.5" fill="white" opacity="0.1"/><circle cx="90" cy="40" r="0.5" fill="white" opacity="0.1"/></pattern></defs><rect width="100" height="100" fill="url(%23grain)"/></svg>');
-      pointer-events: none;
+      display: none;
     }
 
     .hero-content {
       display: flex;
       align-items: center;
-      gap: 60px;
+      gap: 32px;
       position: relative;
       z-index: 1;
     }
@@ -498,35 +494,36 @@ const viewDocumentation = () => {
       flex: 1;
 
       .hero-title {
-        font-size: 48px;
+        font-size: 30px;
         font-weight: 700;
-        margin: 0 0 16px 0;
+        margin: 0 0 12px 0;
         line-height: 1.2;
 
         .version-badge {
           display: inline-block;
-          background: rgba(255, 255, 255, 0.2);
+          background: #edf5ff;
+          color: #2f7df6;
           padding: 4px 12px;
-          border-radius: 20px;
+          border: 1px solid #d7e8ff;
+          border-radius: 6px;
           font-size: 14px;
           font-weight: 500;
           margin-left: 16px;
-          backdrop-filter: blur(10px);
         }
       }
 
       .hero-subtitle {
-        font-size: 24px;
+        color: #526072;
+        font-size: 16px;
         font-weight: 500;
-        margin: 0 0 16px 0;
-        opacity: 0.9;
+        margin: 0 0 12px 0;
       }
 
       .hero-description {
+        color: #526072;
         font-size: 16px;
         line-height: 1.6;
-        margin: 0 0 20px 0;
-        opacity: 0.8;
+        margin: 0 0 16px 0;
         max-width: 600px;
       }
 
@@ -535,29 +532,28 @@ const viewDocumentation = () => {
         align-items: center;
         gap: 8px;
         font-size: 14px;
-        opacity: 0.9;
-        margin-bottom: 32px;
+        color: #526072;
+        margin-bottom: 20px;
         padding: 12px 16px;
-        background: rgba(255, 255, 255, 0.1);
+        background: #f8fafc;
         border-radius: 8px;
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.2);
+        border: 1px solid #e4eaf3;
         max-width: 600px;
 
         .el-icon {
           font-size: 16px;
-          color: #ffd700;
+          color: #2f7df6;
         }
 
         a {
-          color: white;
+          color: #2f7df6;
           text-decoration: none;
           font-weight: 500;
-          border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+          border-bottom: 1px solid #b9d7ff;
           transition: all 0.3s ease;
 
           &:hover {
-            border-bottom-color: white;
+            border-bottom-color: #2f7df6;
           }
         }
       }
@@ -571,27 +567,8 @@ const viewDocumentation = () => {
           font-size: 16px;
           border-radius: 8px;
 
-          &.el-button--primary {
-            background: white;
-            color: #667eea;
-            border: none;
-
-            &:hover {
-              background: rgba(255, 255, 255, 0.9);
-              transform: translateY(-2px);
-            }
-          }
-
-          &:not(.el-button--primary) {
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            backdrop-filter: blur(10px);
-
-            &:hover {
-              background: rgba(255, 255, 255, 0.2);
-              transform: translateY(-2px);
-            }
+          &:hover {
+            transform: none;
           }
         }
       }
@@ -599,11 +576,10 @@ const viewDocumentation = () => {
 
     .hero-visual {
       .hero-card {
-        background: rgba(255, 255, 255, 0.1);
-        backdrop-filter: blur(20px);
-        border-radius: 16px;
-        padding: 32px;
-        border: 1px solid rgba(255, 255, 255, 0.2);
+        background: #f8fafc;
+        border-radius: 8px;
+        padding: 24px;
+        border: 1px solid #e4eaf3;
 
         .hero-stats {
           display: flex;
@@ -1199,6 +1175,100 @@ const viewDocumentation = () => {
         margin: 8px 0;
         font-size: 14px;
       }
+    }
+  }
+
+  .section-header {
+    margin-bottom: 18px;
+    text-align: left;
+
+    .section-title {
+      font-size: 22px;
+      color: #111827;
+    }
+
+    .section-subtitle {
+      margin: 6px 0 0;
+      color: #526072;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+  }
+
+  .features-section,
+  .origin-section,
+  .tech-section,
+  .version-section,
+  .contact-section {
+    margin-bottom: 24px;
+  }
+
+  .features-section .features-grid,
+  .tech-section .tech-stack,
+  .contact-section .contact-grid,
+  .version-section .version-info {
+    gap: 16px;
+  }
+
+  .features-section .features-grid .feature-card,
+  .origin-section .origin-content .origin-card,
+  .tech-section .tech-stack .tech-category,
+  .version-section .version-info .version-card,
+  .version-section .version-info .framework-info,
+  .contact-section .contact-grid .contact-card {
+    padding: 22px;
+    background: #ffffff;
+    color: #111827;
+    border: 1px solid #e4eaf3;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(18, 38, 63, 0.04);
+    transform: none;
+
+    &:hover {
+      transform: none;
+      box-shadow: 0 8px 24px rgba(18, 38, 63, 0.04);
+    }
+
+    &::before {
+      display: none;
+    }
+  }
+
+  .features-section .features-grid .feature-card .feature-header .feature-icon,
+  .origin-section .origin-content .origin-card .origin-header .origin-icon,
+  .tech-section .tech-stack .tech-category .tech-header .tech-icon,
+  .contact-section .contact-grid .contact-card .contact-icon {
+    width: 42px;
+    height: 42px;
+    color: #2f7df6;
+    background: #edf5ff;
+    border: 1px solid #d7e8ff;
+    border-radius: 8px;
+    font-size: 18px;
+  }
+
+  .origin-section .origin-content .origin-card .origin-description .origin-thanks {
+    background: #f8fafc;
+    border: 1px solid #e4eaf3;
+    border-left: 3px solid #2f7df6;
+    border-radius: 8px;
+  }
+
+  .version-section .version-info .version-card {
+    .version-number {
+      color: #111827;
+      font-size: 34px;
+    }
+
+    .version-status {
+      color: #2f7df6;
+      background: #edf5ff;
+      border-radius: 6px;
+      backdrop-filter: none;
+    }
+
+    .version-details .version-item {
+      border-bottom-color: #e4eaf3;
     }
   }
 }
