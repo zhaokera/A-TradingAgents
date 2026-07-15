@@ -84,6 +84,7 @@ dependencies = [
     "streamlit>=1.28.0",
     "toml>=0.10.2",
     "tqdm>=4.67.1",
+    "typer>=0.16.0,<1.0.0",
     "typing-extensions>=4.14.0",
 ]
 
@@ -92,7 +93,15 @@ qianfan = ["qianfan>=0.4.20"]
 
 [project.scripts]
 tradingagents = "main:main"
+holdings = "app.services.holdings_cli:main"
+
+[tool.setuptools]
+py-modules = ["main", "holdings_cli"]
+include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*"]
+include = ["tradingagents*", "app*", "cli*"]
 exclude = ["tests*", "docs*", "scripts*", "data*", "logs*", "reports*", "results*", "eval_results*", "upstream_contribution*"]
+
+[tool.setuptools.package-data]
+app = ["LICENSE"]

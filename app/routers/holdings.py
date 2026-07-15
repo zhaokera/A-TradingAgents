@@ -1,5 +1,7 @@
+import asyncio
 from datetime import date, datetime
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,8 +11,19 @@ from app.core.database import get_mongo_db
 from app.core.response import ok
 from app.routers.auth_db import get_current_user
 from app.routers.paper import _detect_market_and_code, _get_last_price
-from app.services.holding_ai_advice import build_holding_ai_advice, build_holding_report_advice
+from app.services.holding_ai_advice import (
+    apply_holding_price_guardrails,
+    build_holding_ai_advice,
+    build_holding_report_advice,
+)
+from app.services.holding_price_guardrails import build_technical_price_plan
 from app.services.portfolio_target_analysis import build_target_analysis
+from app.services.tencent_quote_service import (
+    assess_cn_quote_freshness,
+    fetch_tencent_daily_bars_sync,
+    get_tencent_quote_service,
+    merge_tencent_quote_into_bars,
+)
 
 
 router = APIRouter(prefix="/holdings", tags=["holdings"])
@@ -69,16 +82,128 @@ def _clean_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-async def _enrich_holding(doc: Dict[str, Any]) -> Dict[str, Any]:
+async def _fetch_benchmark_session_dates() -> list[str]:
+    benchmark_result = await asyncio.to_thread(
+        fetch_tencent_daily_bars_sync,
+        "sh000001",
+        min_rows=2,
+    )
+    if not benchmark_result.get("ok"):
+        return []
+    return sorted(
+        {
+            str(bar.get("date"))
+            for bar in benchmark_result.get("bars", [])
+            if bar.get("date")
+        }
+    )
+
+
+async def _enrich_holding(
+    doc: Dict[str, Any],
+    *,
+    benchmark_session_dates: Optional[list[str]] = None,
+) -> Dict[str, Any]:
     item = _clean_doc(doc)
     if not item.get("name") or item.get("name") == item.get("code"):
         item["name"] = await _resolve_stock_name(item["code"], item.get("market", "CN"))
-    current_price = await _get_last_price(item["code"], item.get("market", "CN"))
+    market = str(item.get("market") or "CN").upper()
+    current_price = None
+    quote_snapshot: Dict[str, Any] = {}
+    technical_price_plan: Dict[str, Any] = {
+        "actionable": False,
+        "status": "unsupported_market",
+    }
+    holding_benchmark_session_dates: list[str] = []
+
+    if market == "CN":
+        quote = await get_tencent_quote_service().get_quote(item["code"])
+        if quote:
+            quote_snapshot = dict(quote)
+            quote_snapshot["freshness"] = assess_cn_quote_freshness(quote)
+            for field_name in ("close", "price", "current_price"):
+                try:
+                    candidate_price = float(quote.get(field_name) or 0)
+                except (TypeError, ValueError):
+                    candidate_price = 0
+                if candidate_price > 0:
+                    current_price = candidate_price
+                    break
+
+        if current_price is None:
+            current_price = await _get_last_price(item["code"], market)
+            quote_snapshot = {
+                "source": "display_fallback",
+                "price": current_price,
+            }
+            quote_snapshot["freshness"] = assess_cn_quote_freshness(quote_snapshot)
+
+        holding_benchmark_session_dates = (
+            list(benchmark_session_dates)
+            if benchmark_session_dates is not None
+            else await _fetch_benchmark_session_dates()
+        )
+        quote_trade_date = quote_snapshot.get("trade_date")
+        if quote_trade_date and quote_trade_date not in holding_benchmark_session_dates:
+            holding_benchmark_session_dates.append(quote_trade_date)
+        holding_benchmark_session_dates.sort()
+
+        if quote_snapshot.get("freshness", {}).get("actionable"):
+            history_result = await asyncio.to_thread(fetch_tencent_daily_bars_sync, item["code"])
+            if history_result.get("ok"):
+                merge_result = merge_tencent_quote_into_bars(history_result.get("bars", []), quote_snapshot)
+                if merge_result.get("ok"):
+                    technical_price_plan = build_technical_price_plan(
+                        merge_result.get("bars", []),
+                        current_price=current_price,
+                    )
+                    technical_price_plan["history_status"] = history_result.get("status")
+                    technical_price_plan["quote_merge_action"] = merge_result.get("merge_action")
+                else:
+                    technical_price_plan = {
+                        "actionable": False,
+                        "status": merge_result.get("status") or "quote_merge_failed",
+                        "history_status": history_result.get("status"),
+                    }
+            else:
+                technical_price_plan = {
+                    "actionable": False,
+                    "status": history_result.get("status") or "history_unavailable",
+                    "history_reason": history_result.get("reason"),
+                }
+        else:
+            technical_price_plan = {
+                "actionable": False,
+                "status": "quote_not_actionable",
+                "quote_status": quote_snapshot.get("freshness", {}).get("status"),
+            }
+    else:
+        current_price = await _get_last_price(item["code"], market)
+        quote_snapshot = {
+            "source": "display_fallback",
+            "price": current_price,
+            "freshness": {
+                "actionable": False,
+                "status": "unsupported_market",
+                "reason": "当前价格计划门禁仅支持A股腾讯行情。",
+            },
+        }
+
     item["current_price"] = current_price
+    item["quote_snapshot"] = quote_snapshot
+    item["technical_price_plan"] = technical_price_plan
+    item["benchmark_session_dates"] = holding_benchmark_session_dates
+    item["guardrail_as_of"] = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
     item["analysis"] = build_target_analysis(item, current_price=current_price, as_of=date.today())
     report_advice = await build_holding_report_advice(item)
     if report_advice:
         item["ai_advice"] = report_advice
+    elif isinstance(item.get("ai_advice"), dict):
+        item["ai_advice"] = apply_holding_price_guardrails(
+            item["ai_advice"],
+            item,
+            historical_price_plan_key="historical_model_price_plan",
+        )
     return item
 
 
@@ -133,7 +258,20 @@ async def list_holdings(current_user: dict = Depends(get_current_user)):
     db = get_mongo_db()
     cursor = db["user_holdings"].find({"user_id": current_user["id"]}).sort("updated_at", -1)
     docs = await cursor.to_list(None)
-    items = [await _enrich_holding(doc) for doc in docs]
+    benchmark_session_dates = (
+        await _fetch_benchmark_session_dates()
+        if any(str(doc.get("market") or "CN").upper() == "CN" for doc in docs)
+        else []
+    )
+    items = await asyncio.gather(
+        *(
+            _enrich_holding(
+                doc,
+                benchmark_session_dates=benchmark_session_dates,
+            )
+            for doc in docs
+        )
+    )
     total_holding_cost = sum(float(item.get("cost_price") or 0) * float(item.get("quantity") or 0) for item in items)
     settings = await db["user_holding_settings"].find_one({"user_id": current_user["id"]})
     return ok({"items": items, "settings": _build_settings_payload(settings, total_holding_cost)})

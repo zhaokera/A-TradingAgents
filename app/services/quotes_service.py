@@ -1,5 +1,5 @@
 """
-QuotesService: 提供A股批量实时快照获取（AKShare东方财富 spot 接口），带内存TTL缓存。
+QuotesService: 提供A股批量实时快照获取，腾讯单股直连优先，AKShare东方财富 spot 兜底。
 - 不使用通达信（TDX）作为兜底数据源。
 - 仅用于筛选返回前对 items 进行行情富集。
 """
@@ -9,6 +9,8 @@ import asyncio
 import time
 import logging
 from typing import Dict, List, Optional
+
+from app.services.tencent_quote_service import get_tencent_quote_service, normalize_cn_code
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +42,26 @@ class QuotesService:
 
     async def get_quotes(self, codes: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
         """获取一批股票的近实时快照（最新价、涨跌幅、成交额）。
-        - 优先使用缓存；缓存超时或为空则刷新一次全市场快照。
+        - 优先使用腾讯单股直连，未命中时回退到 AKShare 全市场快照缓存。
         - 返回仅包含请求的 codes。
         """
-        codes = [c.strip() for c in codes if c]
+        codes = [normalize_cn_code(c) for c in codes if c]
+        tencent_quotes = await get_tencent_quote_service().get_quotes(codes)
+        missing_codes = [c for c in codes if c not in tencent_quotes]
+        if not missing_codes:
+            return tencent_quotes
+
         now = time.time()
         async with self._lock:
             if self._cache and (now - self._cache_ts) < self._ttl:
-                return {c: q for c, q in self._cache.items() if c in codes and q}
+                fallback = {c: q for c, q in self._cache.items() if c in missing_codes and q}
+                return {**fallback, **tencent_quotes}
             # 刷新缓存（阻塞IO放到线程）
             data = await asyncio.to_thread(self._fetch_spot_akshare)
             self._cache = data
             self._cache_ts = time.time()
-            return {c: q for c, q in self._cache.items() if c in codes and q}
+            fallback = {c: q for c, q in self._cache.items() if c in missing_codes and q}
+            return {**fallback, **tencent_quotes}
 
     def _fetch_spot_akshare(self) -> Dict[str, Dict[str, Optional[float]]]:
         """通过 AKShare 东方财富全市场快照接口拉取行情，并标准化为字典。
@@ -108,4 +117,3 @@ def get_quotes_service() -> QuotesService:
     if _quotes_service is None:
         _quotes_service = QuotesService(ttl_seconds=30)
     return _quotes_service
-
