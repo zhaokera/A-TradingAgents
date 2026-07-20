@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -26,6 +28,20 @@ TENCENT_HEADERS = {
 CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 QUOTE_MAX_AGE_SECONDS = 300
 QUOTE_MAX_FUTURE_SKEW_SECONDS = 60
+TENCENT_QUOTE_BATCH_SIZE = 40
+MAX_TENCENT_BATCHED_CODES = 160
+_TENCENT_ASSIGNMENT_PATTERN = re.compile(
+    r'(?m)(?:^|;)[ \t]*v_(?P<provider_symbol>(?:sh|sz|bj)[0-9]{6})'
+    r'[ \t]*=[ \t]*"(?P<payload>[^"\r\n]*)"[ \t]*(?=;|$)',
+    flags=re.IGNORECASE,
+)
+_TENCENT_MAJOR_INDEX_SYMBOLS = frozenset(
+    {"sh000001", "sz399001", "sz399006", "sh000688"}
+)
+
+
+class TencentQuoteInputError(ValueError):
+    """Raised when a batch quote request cannot be materialized."""
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -246,6 +262,126 @@ def assess_cn_quote_freshness(
         "actionable": True,
         "status": "fresh",
         "reason": "腾讯提供方成交时间在允许时效内。",
+    }
+
+
+def assess_tencent_research_quote_freshness(
+    quote: Dict[str, Any],
+    *,
+    benchmark_trade_date: str,
+    now: datetime,
+    max_age_seconds: int = QUOTE_MAX_AGE_SECONDS,
+    max_future_skew_seconds: int = 120,
+) -> Dict[str, Any]:
+    """Evaluate Tencent quote completeness for public research coverage."""
+    local_now = _as_market_datetime(now)
+    trade_dt = _as_market_datetime(quote.get("trade_at"))
+    benchmark_dt = _as_market_datetime(benchmark_trade_date)
+    source = str(quote.get("source") or "unknown").strip().lower()
+    age_seconds_raw = (
+        (local_now - trade_dt).total_seconds()
+        if local_now is not None and trade_dt is not None
+        else None
+    )
+    base = {
+        "data_complete": False,
+        "status": "missing_trade_at",
+        "reason": "腾讯行情缺少可解析的提供方成交时间。",
+        "source": source,
+        "trade_at": trade_dt.isoformat(timespec="seconds") if trade_dt else None,
+        "trade_date": trade_dt.date().isoformat() if trade_dt else None,
+        "benchmark_trade_date": benchmark_dt.date().isoformat() if benchmark_dt else None,
+        "age_seconds": int(age_seconds_raw) if age_seconds_raw is not None else None,
+        "session": _cn_session(local_now) if local_now else "unknown",
+    }
+    if local_now is None:
+        return {
+            **base,
+            "status": "invalid_now",
+            "reason": "当前时间无法解析，不能验证腾讯研究行情。",
+        }
+    if source != "tencent":
+        return {
+            **base,
+            "status": "invalid_source",
+            "reason": "公开研究时效门禁只接受腾讯行情。",
+        }
+    if trade_dt is None:
+        return base
+    if benchmark_dt is None:
+        return {
+            **base,
+            "status": "invalid_benchmark_trade_date",
+            "reason": "基准交易日无法解析，不能验证腾讯研究行情。",
+        }
+
+    benchmark_date = benchmark_dt.date()
+    if benchmark_date > local_now.date():
+        return {
+            **base,
+            "status": "future_benchmark_trade_date",
+            "reason": "基准交易日晚于当前日期，不能验证腾讯研究行情。",
+        }
+    if trade_dt.date() != benchmark_date:
+        return {
+            **base,
+            "status": "trade_date_mismatch",
+            "reason": "腾讯行情交易日与基准交易日不一致。",
+        }
+
+    close_floor = datetime.combine(
+        benchmark_date,
+        datetime.strptime("14:55", "%H:%M").time(),
+        tzinfo=CN_MARKET_TIMEZONE,
+    )
+    same_day_closed = (
+        benchmark_date == local_now.date()
+        and local_now.time() >= datetime.strptime("15:00", "%H:%M").time()
+    )
+    completed_trade_date = benchmark_date < local_now.date() or same_day_closed
+    if completed_trade_date:
+        if trade_dt < close_floor:
+            return {
+                **base,
+                "status": "stale_trade_at",
+                "reason": "腾讯收盘行情时间早于14:55，研究数据不完整。",
+            }
+        if age_seconds_raw is not None and age_seconds_raw < -max_future_skew_seconds:
+            return {
+                **base,
+                "status": "future_trade_at",
+                "reason": "腾讯成交时间超出允许的时钟偏差。",
+            }
+        return {
+            **base,
+            "data_complete": True,
+            "status": "fresh",
+            "reason": "腾讯行情满足已完成交易日研究时效要求。",
+        }
+
+    if base["session"] not in {"morning", "afternoon"}:
+        return {
+            **base,
+            "status": "off_session",
+            "reason": "当前不在连续交易时段，且基准交易日尚未收盘。",
+        }
+    if age_seconds_raw is not None and age_seconds_raw < -max_future_skew_seconds:
+        return {
+            **base,
+            "status": "future_trade_at",
+            "reason": "腾讯成交时间超出允许的时钟偏差。",
+        }
+    if age_seconds_raw is not None and age_seconds_raw > max_age_seconds:
+        return {
+            **base,
+            "status": "stale_trade_at",
+            "reason": "腾讯行情超过公开研究允许的五分钟时效。",
+        }
+    return {
+        **base,
+        "data_complete": True,
+        "status": "fresh",
+        "reason": "腾讯行情满足盘中研究时效要求。",
     }
 
 
@@ -478,6 +614,8 @@ def parse_tencent_quote_payload(code: str, payload: str) -> Optional[Dict[str, A
         "pre_close": _safe_float(fields[4]) if len(fields) > 4 else None,
         "turnover_rate": _safe_float(fields[38]) if len(fields) > 38 else None,
         "amplitude": _safe_float(fields[43]) if len(fields) > 43 else None,
+        "limit_up": _safe_float(fields[47]) if len(fields) > 47 else None,
+        "limit_down": _safe_float(fields[48]) if len(fields) > 48 else None,
         "volume_ratio": _safe_float(fields[49]) if len(fields) > 49 else None,
         "pe_ratio": _safe_float(fields[39]) if len(fields) > 39 else None,
         "pb_ratio": _safe_float(fields[46]) if len(fields) > 46 else None,
@@ -490,6 +628,291 @@ def parse_tencent_quote_payload(code: str, payload: str) -> Optional[Dict[str, A
         "updated_at": received_at,
     }
     return {key: value for key, value in quote.items() if value is not None}
+
+
+def _parse_tencent_assignment(assignment: re.Match[str]) -> Dict[str, Any]:
+    provider_symbol = assignment.group("provider_symbol").lower()
+    envelope_code = provider_symbol[2:]
+    payload = assignment.group("payload")
+    fields = payload.split("~") if payload else []
+    payload_code = (
+        fields[2].strip()
+        if len(fields) > 2 and fields[2].strip()
+        else None
+    )
+    identity = {
+        "provider_symbol": provider_symbol,
+        "envelope_code": envelope_code,
+        "payload_code": payload_code,
+        "source": "tencent",
+    }
+
+    if not payload:
+        parse_status = "empty_payload"
+    elif len(fields) < 45 or payload_code is None:
+        parse_status = "malformed_payload"
+    else:
+        price = _safe_float(fields[3])
+        parse_status = (
+            "invalid_price"
+            if price is None or price <= 0
+            else "ok"
+        )
+
+    if parse_status == "ok":
+        quote = parse_tencent_quote_payload(envelope_code, assignment.group(0))
+        if quote is not None:
+            quote.update(identity)
+            quote["parse_status"] = "ok"
+            return quote
+        parse_status = "malformed_payload"
+
+    row: Dict[str, Any] = {
+        "code": envelope_code,
+        **identity,
+        "parse_status": parse_status,
+        "close": None,
+    }
+    amount = _parse_amount(fields)
+    if amount is not None:
+        row["amount"] = amount
+    return row
+
+
+def parse_tencent_quote_batch_payload(payload: str) -> List[Dict[str, Any]]:
+    """Parse Tencent assignments in response order without deduplication."""
+    content = payload or ""
+    return [
+        _parse_tencent_assignment(assignment)
+        for assignment in _TENCENT_ASSIGNMENT_PATTERN.finditer(content)
+    ]
+
+
+def _normalize_tencent_request_code(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized_value = value.strip().lower()
+    if normalized_value in _TENCENT_MAJOR_INDEX_SYMBOLS:
+        return normalized_value
+    match = re.fullmatch(
+        r"(?:(sh|sz|bj))?([0-9]{6})(?:\.(sh|sz|bj))?",
+        normalized_value,
+    )
+    if match is None:
+        return None
+
+    prefix, code, suffix = match.groups()
+    if prefix and suffix:
+        return None
+    if code.startswith("6"):
+        exchange = "sh"
+    elif code.startswith(("0", "3")):
+        exchange = "sz"
+    elif code.startswith(("43", "83", "87", "88", "92")):
+        exchange = "bj"
+    else:
+        return None
+    explicit_exchange = prefix or suffix
+    provider_symbol = f"{explicit_exchange or exchange}{code}"
+    if provider_symbol in _TENCENT_MAJOR_INDEX_SYMBOLS:
+        return provider_symbol
+    return code if explicit_exchange in (None, exchange) else None
+
+
+def _collect_tencent_request_codes(
+    codes: Iterable[str],
+    *,
+    max_codes: int = TENCENT_QUOTE_BATCH_SIZE,
+) -> List[str]:
+    if codes is None or isinstance(codes, (str, bytes, bytearray)):
+        raise TencentQuoteInputError("invalid_codes")
+    try:
+        values = list(codes)
+    except Exception as exc:
+        raise TencentQuoteInputError("invalid_codes") from exc
+
+    requested_codes: List[str] = []
+    seen = set()
+    for value in values:
+        normalized = _normalize_tencent_request_code(value)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested_codes.append(normalized)
+        if len(requested_codes) == max_codes:
+            break
+    return requested_codes
+
+
+def fetch_tencent_quotes_sync(
+    codes: Iterable[str],
+    *,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Fetch up to 40 unique A-share quotes in one Tencent request."""
+    try:
+        requested_codes = _collect_tencent_request_codes(codes)
+    except TencentQuoteInputError:
+        return {
+            "status": "invalid_request",
+            "requested_codes": [],
+            "rows": [],
+            "error_type": "invalid_codes",
+        }
+
+    base = {
+        "requested_codes": requested_codes,
+        "rows": [],
+        "error_type": None,
+    }
+    if not requested_codes:
+        return {"status": "empty", **base}
+
+    symbols = [to_tencent_symbol(code) for code in requested_codes]
+    url = f"{TENCENT_REALTIME_URL}={','.join(symbols)}"
+    try:
+        response = requests.get(url, headers=TENCENT_HEADERS, timeout=timeout)
+        response.encoding = "gbk"
+    except requests.Timeout as exc:
+        logger.info("Tencent batch quote timed out: codes=%s error=%s", requested_codes, exc)
+        return {
+            "status": "fetch_error",
+            **base,
+            "error_type": "request_timeout",
+        }
+    except requests.RequestException as exc:
+        logger.info("Tencent batch quote failed: codes=%s error=%s", requested_codes, exc)
+        return {
+            "status": "fetch_error",
+            **base,
+            "error_type": "request_failed",
+        }
+    except Exception:
+        logger.exception("Tencent batch quote request failed internally: codes=%s", requested_codes)
+        return {
+            "status": "internal_error",
+            **base,
+            "error_type": "request_error",
+        }
+
+    if response.status_code != 200:
+        logger.info(
+            "Tencent batch quote failed: codes=%s status=%s",
+            requested_codes,
+            response.status_code,
+        )
+        return {
+            "status": "fetch_error",
+            **base,
+            "error_type": "HTTPError",
+            "http_status": response.status_code,
+        }
+    try:
+        rows = parse_tencent_quote_batch_payload(response.text)
+    except Exception:
+        logger.exception("Tencent batch quote parser failed: codes=%s", requested_codes)
+        return {
+            "status": "internal_error",
+            **base,
+            "error_type": "parser_error",
+        }
+    return {
+        "status": "ok",
+        **base,
+        "rows": rows,
+    }
+
+
+def fetch_tencent_quotes_batched_sync(
+    codes: Iterable[str],
+    *,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Fetch up to 160 quotes in ordered 40-code batches under one deadline."""
+    try:
+        requested_codes = _collect_tencent_request_codes(
+            codes,
+            max_codes=MAX_TENCENT_BATCHED_CODES,
+        )
+    except TencentQuoteInputError:
+        return {
+            "status": "invalid_request",
+            "requested_codes": [],
+            "rows": [],
+            "error_type": "invalid_codes",
+            "batch_count": 0,
+            "completed_batch_count": 0,
+        }
+
+    batch_count = math.ceil(len(requested_codes) / TENCENT_QUOTE_BATCH_SIZE)
+    base = {
+        "requested_codes": requested_codes,
+        "rows": [],
+        "error_type": None,
+        "batch_count": batch_count,
+        "completed_batch_count": 0,
+    }
+    if not requested_codes:
+        return {"status": "empty", **base}
+
+    try:
+        timeout_seconds = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        timeout_seconds = 0.0
+    if not math.isfinite(timeout_seconds):
+        timeout_seconds = 0.0
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    rows: List[Dict[str, Any]] = []
+
+    for batch_index, offset in enumerate(
+        range(0, len(requested_codes), TENCENT_QUOTE_BATCH_SIZE)
+    ):
+        batch = requested_codes[offset:offset + TENCENT_QUOTE_BATCH_SIZE]
+        remaining_seconds = max(0.0, deadline - time.monotonic())
+        if remaining_seconds <= 0:
+            return {
+                "status": "fetch_error",
+                **base,
+                "error_type": "request_timeout",
+                "completed_batch_count": batch_index,
+                "failed_batch_index": batch_index,
+            }
+
+        result = fetch_tencent_quotes_sync(batch, timeout=remaining_seconds)
+        if (
+            not isinstance(result, Mapping)
+            or result.get("status") != "ok"
+            or result.get("requested_codes") != batch
+            or result.get("error_type") is not None
+            or not isinstance(result.get("rows"), list)
+        ):
+            raw_status = result.get("status") if isinstance(result, Mapping) else None
+            error_type = (
+                result.get("error_type") if isinstance(result, Mapping) else None
+            )
+            return {
+                "status": (
+                    raw_status
+                    if isinstance(raw_status, str) and raw_status
+                    else "internal_error"
+                ),
+                **base,
+                "error_type": (
+                    error_type
+                    if isinstance(error_type, str) and error_type
+                    else "invalid_batch_response"
+                ),
+                "completed_batch_count": batch_index,
+                "failed_batch_index": batch_index,
+            }
+        rows.extend(deepcopy(result["rows"]))
+
+    return {
+        "status": "ok",
+        **base,
+        "rows": rows,
+        "completed_batch_count": batch_count,
+    }
 
 
 def fetch_tencent_quote_sync(code: str, *, timeout: float = 6.0) -> Optional[Dict[str, Any]]:

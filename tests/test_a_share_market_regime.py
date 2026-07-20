@@ -156,6 +156,38 @@ def test_market_breadth_detects_deep_declines_and_board_specific_limit_downs():
     assert result["level"] == "red"
     assert result["deep_decline_count"] == 63
     assert result["limit_down_like_count"] == 4
+    assert result["risk_triggers"] == ["deep_decline_ratio"]
+
+
+def test_market_breadth_explains_tail_risk_when_advancers_still_dominate():
+    rows = _breadth_rows(advancers=800, decliners=170)
+    rows.extend(
+        {
+            "code": f"002{index:03d}",
+            "name": f"近跌停{index}",
+            "pct_chg": -9.8,
+            "trade_date": "2026-07-13",
+        }
+        for index in range(30)
+    )
+
+    result = assess_a_share_market_breadth(
+        rows,
+        benchmark_trade_date="2026-07-13",
+    )
+
+    assert result["level"] == "yellow"
+    assert result["advancer_count"] == 800
+    assert result["decliner_ratio_pct"] == 20.0
+    assert result["limit_down_like_count"] == 30
+    assert result["limit_down_like_ratio_pct"] == 3.0
+    assert result["risk_triggers"] == [
+        "deep_decline_ratio",
+        "limit_down_like_count",
+    ]
+    assert result["reason"] == (
+        "整体下跌比例未触发门槛，但个股深跌尾部风险偏高，新仓风险预算减半。"
+    )
 
 
 def test_market_breadth_marks_stale_and_small_universes_unavailable():

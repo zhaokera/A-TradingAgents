@@ -14,6 +14,15 @@ from app.services.tencent_quote_service import normalize_tencent_daily_bars
 CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 PRICE_TICK = Decimal("0.01")
 REPORT_PRICE_MAX_DIVERGENCE = 0.10
+DEEP_DRAWDOWN_RECOVERY_THRESHOLD_PCT = -20.0
+PULLBACK_ENTRY_BUFFER_PCT = 0.3
+PULLBACK_STOP_BUFFER_PCT = 0.5
+PULLBACK_MAX_DISTANCE_PCT = 3.0
+PULLBACK_MIN_STOP_DISTANCE_PCT = 2.0
+PULLBACK_MIN_SELL_UPSIDE_PCT = 2.0
+PULLBACK_MIN_TARGET_UPSIDE_PCT = 5.0
+PULLBACK_PROJECTED_TARGET_UPSIDE_PCT = 6.0
+PULLBACK_MAX_PROJECTED_TARGET_UPSIDE_PCT = 15.0
 
 
 def _number(value: Any) -> Optional[float]:
@@ -65,6 +74,44 @@ def _build_research_watch_levels(
     }
 
 
+def _build_trend_context(
+    *,
+    current_price: float,
+    entry_price: float,
+    metrics: Dict[str, float],
+) -> Dict[str, Any]:
+    key_averages = ("ma5", "ma10", "ma20", "ma60")
+    below_key_averages = [
+        key for key in key_averages if current_price < metrics[key]
+    ]
+    recent_high = metrics["recent_20_high"]
+    drawdown_pct = round(
+        (current_price - recent_high) / recent_high * 100,
+        2,
+    )
+    distance_to_entry_pct = round(
+        (entry_price - current_price) / current_price * 100,
+        2,
+    )
+    bearish_short_term_alignment = bool(
+        metrics["ma5"] < metrics["ma10"] < metrics["ma20"]
+    )
+    recovery_required = bool(
+        current_price < metrics["ma5"]
+        and bearish_short_term_alignment
+        and drawdown_pct <= DEEP_DRAWDOWN_RECOVERY_THRESHOLD_PCT
+    )
+    return {
+        "state": "recovery_required" if recovery_required else "normal",
+        "recovery_required": recovery_required,
+        "bearish_short_term_alignment": bearish_short_term_alignment,
+        "below_key_averages": below_key_averages,
+        "drawdown_from_20d_high_pct": drawdown_pct,
+        "distance_to_entry_pct": distance_to_entry_pct,
+        "deep_drawdown_threshold_pct": DEEP_DRAWDOWN_RECOVERY_THRESHOLD_PCT,
+    }
+
+
 def build_technical_price_plan(
     bars: Iterable[Dict[str, Any]],
     *,
@@ -112,7 +159,6 @@ def build_technical_price_plan(
         "recent_20_low": _round_metric(min(lows[-20:])),
         "recent_20_high": _round_metric(max(highs[-20:])),
     }
-
     support_candidates = _ordered_distinct(
         value
         for value in (
@@ -168,6 +214,11 @@ def build_technical_price_plan(
     breakout = _round_tick(resistance_1 * 1.003, "ceiling")
     sell_price = _round_tick(resistance_2, "half_up")
     target = _round_tick(resistance_3, "half_up")
+    trend_context = _build_trend_context(
+        current_price=current,
+        entry_price=breakout,
+        metrics=metrics,
+    )
     failed_gates = []
     if not stop_loss < breakout:
         failed_gates.append("stop_not_below_entry")
@@ -195,6 +246,7 @@ def build_technical_price_plan(
         "suggested_sell_price": sell_price,
         "target_price": target,
         "failed_gates": failed_gates,
+        "trend_context": trend_context,
         "research_watch_levels": _build_research_watch_levels(
             current_price=current,
             support_candidates=support_candidates,
@@ -208,6 +260,172 @@ def build_technical_price_plan(
             "breakout_mode": "ROUND_CEILING",
             "default_mode": "ROUND_HALF_UP",
         },
+    }
+
+
+def build_pullback_price_plan(
+    bars: Iterable[Dict[str, Any]],
+    *,
+    current_price: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build a support-entry alternative without changing the breakout contract."""
+
+    normalized = normalize_tencent_daily_bars(bars)
+    breakout_plan = build_technical_price_plan(
+        normalized,
+        current_price=current_price,
+    )
+    if len(normalized) < 60:
+        return {
+            "actionable": False,
+            "status": "insufficient_history",
+            "entry_strategy": "pullback",
+            "required_rows": 60,
+            "available_rows": len(normalized),
+            "source": "tencent_qfq_daily",
+            "research_watch_levels": breakout_plan.get("research_watch_levels"),
+        }
+
+    metrics = breakout_plan.get("metrics")
+    watch_levels = breakout_plan.get("research_watch_levels")
+    current = _number(current_price) or _number(normalized[-1].get("close"))
+    supports = (
+        list(watch_levels.get("supports") or [])
+        if isinstance(watch_levels, dict)
+        else []
+    )
+    if not isinstance(metrics, dict) or current is None or not supports:
+        return {
+            "actionable": False,
+            "status": "pullback_levels_unavailable",
+            "entry_strategy": "pullback",
+            "source": "tencent_qfq_daily",
+            "metrics": metrics,
+            "research_watch_levels": watch_levels,
+        }
+
+    entry_basis = max(float(value) for value in supports)
+    buffered_entry = _round_tick(
+        entry_basis * (1 + PULLBACK_ENTRY_BUFFER_PCT / 100),
+        "ceiling",
+    )
+    entry = min(_round_tick(current), buffered_entry)
+    distance_to_entry_pct = round((entry - current) / current * 100, 2)
+
+    stop_threshold = entry * (1 - PULLBACK_MIN_STOP_DISTANCE_PCT / 100)
+    stop_candidates = [
+        float(value) for value in supports if float(value) <= stop_threshold
+    ]
+    if stop_candidates:
+        stop_basis = max(stop_candidates)
+        stop_source = "next_support_below_2pct"
+    else:
+        stop_basis = min(
+            float(metrics["boll_lower"]),
+            float(metrics["recent_20_low"]),
+        )
+        stop_source = "conservative_invalidation_basis"
+    stop_loss = _round_tick(
+        stop_basis * (1 - PULLBACK_STOP_BUFFER_PCT / 100),
+        "floor",
+    )
+
+    observed_levels = _ordered_distinct(
+        float(value)
+        for value in metrics.values()
+        if _number(value) is not None and float(value) > entry
+    )
+    sell_candidates = [
+        value
+        for value in observed_levels
+        if value >= entry * (1 + PULLBACK_MIN_SELL_UPSIDE_PCT / 100)
+    ]
+    sell_basis = sell_candidates[0] if sell_candidates else None
+    sell_price = (
+        _round_tick(sell_basis, "half_up")
+        if sell_basis is not None
+        else None
+    )
+    target_candidates = [
+        value
+        for value in observed_levels
+        if value >= entry * (1 + PULLBACK_MIN_TARGET_UPSIDE_PCT / 100)
+        and (sell_basis is None or value > sell_basis)
+    ]
+    if target_candidates:
+        target = _round_tick(target_candidates[0], "half_up")
+        target_source = "observed_resistance"
+    else:
+        observed_high = max(
+            float(metrics["recent_20_high"]),
+            float(metrics["boll_upper"]),
+            current,
+        )
+        observed_range = max(
+            float(metrics["recent_20_high"])
+            - float(metrics["recent_20_low"]),
+            float(metrics["boll_upper"]) - float(metrics["boll_lower"]),
+            entry * PULLBACK_PROJECTED_TARGET_UPSIDE_PCT / 100,
+        )
+        projected_target = max(
+            entry * (1 + PULLBACK_PROJECTED_TARGET_UPSIDE_PCT / 100),
+            observed_high + observed_range * 0.5,
+        )
+        projected_cap = entry * (
+            1 + PULLBACK_MAX_PROJECTED_TARGET_UPSIDE_PCT / 100
+        )
+        target = _round_tick(min(projected_target, projected_cap), "half_up")
+        target_source = "measured_range_extension"
+    if sell_price is not None and sell_price >= target:
+        sell_price = None
+
+    failed_gates: List[str] = []
+    if distance_to_entry_pct < -PULLBACK_MAX_DISTANCE_PCT:
+        failed_gates.append("pullback_too_far")
+    if not stop_loss < entry:
+        failed_gates.append("stop_not_below_entry")
+    if not entry < target:
+        failed_gates.append("target_not_above_entry")
+    if sell_price is not None and not entry < sell_price < target:
+        failed_gates.append("sell_not_between_entry_and_target")
+
+    status = "ok" if not failed_gates else failed_gates[0]
+    return {
+        "actionable": not failed_gates,
+        "status": status,
+        "entry_strategy": "pullback",
+        "source": "tencent_qfq_daily",
+        "as_of": normalized[-1]["date"],
+        "current_price": _round_tick(current),
+        "metrics": metrics,
+        "suggested_buy_price": entry,
+        "stop_loss_price": stop_loss,
+        "suggested_sell_price": sell_price,
+        "target_price": target,
+        "entry_basis": _round_metric(entry_basis),
+        "entry_source": "nearest_support_with_buffer",
+        "stop_basis": _round_metric(stop_basis),
+        "stop_source": stop_source,
+        "target_source": target_source,
+        "pullback_required": entry < current,
+        "distance_to_entry_pct": distance_to_entry_pct,
+        "max_pullback_distance_pct": PULLBACK_MAX_DISTANCE_PCT,
+        "failed_gates": failed_gates,
+        "trend_context": _build_trend_context(
+            current_price=current,
+            entry_price=entry,
+            metrics=metrics,
+        ),
+        "research_watch_levels": watch_levels,
+        "rounding": {
+            "tick": 0.01,
+            "entry_buffer_pct": PULLBACK_ENTRY_BUFFER_PCT,
+            "stop_buffer_pct": PULLBACK_STOP_BUFFER_PCT,
+            "entry_mode": "ROUND_CEILING",
+            "stop_mode": "ROUND_FLOOR",
+            "default_mode": "ROUND_HALF_UP",
+        },
+        "is_reference_only": True,
     }
 
 

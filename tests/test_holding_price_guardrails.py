@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 
 from app.services.holding_price_guardrails import (
     assess_report_freshness,
+    build_pullback_price_plan,
     build_technical_price_plan,
     calculate_net_reward_risk,
     resolve_guarded_price_plan,
@@ -65,6 +66,155 @@ def test_build_technical_price_plan_uses_exact_indicator_and_rounding_contract()
         "breakout_mode": "ROUND_CEILING",
         "default_mode": "ROUND_HALF_UP",
     }
+
+
+def test_build_pullback_price_plan_uses_support_entry_and_distinct_upside_levels():
+    plan = build_pullback_price_plan(_technical_bars(), current_price=100.0)
+
+    assert plan["status"] == "ok"
+    assert plan["actionable"] is True
+    assert plan["entry_strategy"] == "pullback"
+    assert plan["suggested_buy_price"] == 97.5
+    assert plan["stop_loss_price"] == 93.53
+    assert plan["suggested_sell_price"] == 108.6
+    assert plan["target_price"] == 114.3
+    assert plan["pullback_required"] is True
+    assert plan["distance_to_entry_pct"] == -2.5
+    assert plan["target_source"] == "observed_resistance"
+
+
+def test_pullback_target_uses_next_raw_level_when_sell_level_rounds_down(monkeypatch):
+    bars = [
+        {
+            "date": (
+                f"2026-04-{index + 1:02d}"
+                if index < 30
+                else f"2026-05-{index - 29:02d}"
+            ),
+            "open": 20.0,
+            "close": 20.0,
+            "high": 20.0,
+            "low": 20.0,
+        }
+        for index in range(60)
+    ]
+    metrics = {
+        "ma5": 20.254,
+        "ma10": 20.231,
+        "ma20": 20.6435,
+        "ma60": 19.6208,
+        "boll_mid": 20.6435,
+        "boll_upper": 21.7121,
+        "boll_lower": 19.5749,
+        "recent_5_low": 19.55,
+        "recent_20_low": 19.55,
+        "recent_20_high": 22.01,
+    }
+    monkeypatch.setattr(
+        "app.services.holding_price_guardrails.build_technical_price_plan",
+        lambda normalized, current_price=None: {
+            "metrics": metrics,
+            "research_watch_levels": {
+                "supports": [20.254, 20.231, 19.6208, 19.5749, 19.55],
+                "resistances": [20.6435, 21.7121, 22.01],
+            },
+        },
+    )
+
+    plan = build_pullback_price_plan(bars, current_price=20.33)
+
+    assert plan["suggested_sell_price"] == 21.71
+    assert plan["target_price"] == 22.01
+
+
+def test_build_pullback_price_plan_projects_target_after_clean_breakout():
+    bars = [
+        {
+            "date": (
+                f"2026-04-{index + 1:02d}"
+                if index < 30
+                else f"2026-05-{index - 29:02d}"
+            ),
+            "open": 100.0,
+            "close": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+        }
+        for index in range(60)
+    ]
+
+    plan = build_pullback_price_plan(bars, current_price=101.0)
+
+    assert plan["status"] == "ok"
+    assert plan["actionable"] is True
+    assert plan["suggested_buy_price"] == 100.3
+    assert plan["stop_loss_price"] == 99.5
+    assert plan["suggested_sell_price"] is None
+    assert plan["target_price"] >= 106.31
+    assert plan["target_source"] == "measured_range_extension"
+
+
+def test_build_pullback_price_plan_rejects_entry_far_below_current_price():
+    plan = build_pullback_price_plan(_technical_bars(), current_price=150.0)
+
+    assert plan["status"] == "pullback_too_far"
+    assert plan["actionable"] is False
+    assert plan["distance_to_entry_pct"] < -3.0
+
+
+def test_build_technical_price_plan_marks_deep_bearish_drawdown_for_recovery():
+    closes = [20.0] * 40 + [
+        22.8,
+        22.2,
+        21.7,
+        21.1,
+        20.6,
+        20.0,
+        19.4,
+        18.8,
+        18.2,
+        17.6,
+        17.0,
+        16.5,
+        16.1,
+        15.7,
+        15.3,
+        15.0,
+        14.7,
+        14.4,
+        14.0,
+        13.63,
+    ]
+    bars = [
+        {
+            "date": (
+                f"2026-04-{index + 1:02d}"
+                if index < 30
+                else f"2026-05-{index - 29:02d}"
+            ),
+            "open": close,
+            "close": close,
+            "high": close + 0.5,
+            "low": close - 0.5,
+        }
+        for index, close in enumerate(closes)
+    ]
+
+    plan = build_technical_price_plan(bars, current_price=13.63)
+
+    assert plan["status"] == "ok"
+    assert plan["actionable"] is True
+    assert plan["trend_context"]["state"] == "recovery_required"
+    assert plan["trend_context"]["recovery_required"] is True
+    assert plan["trend_context"]["bearish_short_term_alignment"] is True
+    assert plan["trend_context"]["below_key_averages"] == [
+        "ma5",
+        "ma10",
+        "ma20",
+        "ma60",
+    ]
+    assert plan["trend_context"]["drawdown_from_20d_high_pct"] <= -20.0
+    assert plan["trend_context"]["distance_to_entry_pct"] > 0
 
 
 def test_build_technical_price_plan_returns_structured_failure_for_missing_levels():

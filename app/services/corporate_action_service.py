@@ -148,13 +148,26 @@ def fetch_cn_dividend_calendar_sync(
             "is_reference_only": True,
         }
 
-    try:
-        import akshare as ak
+    last_error: Optional[Exception] = None
+    assessment: Optional[Dict[str, Any]] = None
+    for attempt in range(2):
+        try:
+            import akshare as ak
 
-        frame = ak.stock_dividend_cninfo(symbol=normalized_code)
-        rows = frame.to_dict("records")
-        assessment = assess_cn_dividend_actions(rows, as_of=as_of)
-    except Exception as exc:
+            frame = ak.stock_dividend_cninfo(symbol=normalized_code)
+            rows = frame.to_dict("records")
+            assessment = assess_cn_dividend_actions(rows, as_of=as_of)
+            break
+        except (KeyError, ValueError) as exc:
+            last_error = exc
+            if attempt == 0:
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
+    if assessment is None:
+        assert last_error is not None
         return {
             "ok": False,
             "source": "cninfo_via_akshare",
@@ -164,7 +177,7 @@ def fetch_cn_dividend_calendar_sync(
             "price_plan_adjustment_required": False,
             "sessions_until_ex_date": None,
             "nearest_action": None,
-            "reason": str(exc),
+            "reason": str(last_error),
             "is_reference_only": True,
         }
 

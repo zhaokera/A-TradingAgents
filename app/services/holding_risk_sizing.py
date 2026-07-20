@@ -175,10 +175,22 @@ def size_ashare_candidate(
     remaining_initial_deploy: float,
     remaining_loss_budget: float,
     existing_symbol_market_value: Optional[float],
+    candidate_cash_cap_amount: Optional[float] = None,
+    post_trade_symbol_cap_pct: float = 20.0,
 ) -> Dict[str, Any]:
     equity = float(actionable_equity or 0)
-    candidate_cash_cap = round(float(original_cash) * 0.35, 2)
-    post_trade_symbol_cap = round(equity * 0.20, 2) if equity > 0 else 0.0
+    candidate_cash_cap = round(
+        float(candidate_cash_cap_amount)
+        if candidate_cash_cap_amount is not None
+        else float(original_cash) * 0.35,
+        2,
+    )
+    normalized_symbol_cap_pct = min(max(float(post_trade_symbol_cap_pct), 0.0), 100.0)
+    post_trade_symbol_cap = (
+        round(equity * normalized_symbol_cap_pct / 100, 2)
+        if equity > 0
+        else 0.0
+    )
     constraints = {
         "cash_available": round(float(cash_available), 2),
         "candidate_cash_cap": candidate_cash_cap,
@@ -186,6 +198,7 @@ def size_ashare_candidate(
         "remaining_initial_deploy": round(float(remaining_initial_deploy), 2),
         "remaining_loss_budget": round(float(remaining_loss_budget), 2),
         "post_trade_symbol_cap": post_trade_symbol_cap,
+        "post_trade_symbol_cap_pct": normalized_symbol_cap_pct,
         "existing_symbol_market_value": (
             round(float(existing_symbol_market_value), 2)
             if existing_symbol_market_value is not None

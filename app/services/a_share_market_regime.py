@@ -210,18 +210,49 @@ def assess_a_share_market_breadth(
     limit_down_like_count = sum(1 for item in normalized if is_limit_down_like(item))
     decliner_ratio = round(decliner_count / universe_size * 100, 2)
     deep_decline_ratio = round(deep_decline_count / universe_size * 100, 2)
+    limit_down_like_ratio = round(
+        limit_down_like_count / universe_size * 100,
+        2,
+    )
 
     if decliner_ratio >= 75 or deep_decline_ratio >= 5 or limit_down_like_count >= 80:
         level = "red"
         multiplier = 0.0
-        reason = "市场宽度显著恶化，新仓风险预算归零。"
+        risk_triggers = [
+            key
+            for key, triggered in (
+                ("decliner_ratio", decliner_ratio >= 75),
+                ("deep_decline_ratio", deep_decline_ratio >= 5),
+                ("limit_down_like_count", limit_down_like_count >= 80),
+            )
+            if triggered
+        ]
+        reason = (
+            "整体下跌比例未触发门槛，但个股深跌尾部风险显著，新仓风险预算归零。"
+            if "decliner_ratio" not in risk_triggers
+            else "市场宽度显著恶化，新仓风险预算归零。"
+        )
     elif decliner_ratio >= 60 or deep_decline_ratio >= 2 or limit_down_like_count >= 25:
         level = "yellow"
         multiplier = 0.5
-        reason = "市场宽度偏弱，新仓风险预算减半。"
+        risk_triggers = [
+            key
+            for key, triggered in (
+                ("decliner_ratio", decliner_ratio >= 60),
+                ("deep_decline_ratio", deep_decline_ratio >= 2),
+                ("limit_down_like_count", limit_down_like_count >= 25),
+            )
+            if triggered
+        ]
+        reason = (
+            "整体下跌比例未触发门槛，但个股深跌尾部风险偏高，新仓风险预算减半。"
+            if "decliner_ratio" not in risk_triggers
+            else "市场宽度偏弱，新仓风险预算减半。"
+        )
     else:
         level = "green"
         multiplier = 1.0
+        risk_triggers = []
         reason = "市场宽度未触发系统性风险门槛。"
 
     return {
@@ -240,6 +271,8 @@ def assess_a_share_market_breadth(
         "deep_decline_count": deep_decline_count,
         "deep_decline_ratio_pct": deep_decline_ratio,
         "limit_down_like_count": limit_down_like_count,
+        "limit_down_like_ratio_pct": limit_down_like_ratio,
+        "risk_triggers": risk_triggers,
         "reason": reason,
         "is_reference_only": True,
     }

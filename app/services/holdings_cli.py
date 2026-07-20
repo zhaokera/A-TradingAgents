@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
+import signal
 import sys
-from contextlib import redirect_stderr, redirect_stdout
+import threading
+from collections import Counter
+from copy import deepcopy
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from io import StringIO
@@ -14,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 import typer
+import pymongo
 from click import ClickException as PublicClickException
 from bson import ObjectId
 from dotenv import dotenv_values
@@ -40,6 +47,7 @@ from app.services.candidate_discovery_service import discover_dynamic_candidate_
 from app.services.holding_price_guardrails import (
     assess_recent_sale_cooldown,
     assess_report_freshness,
+    build_pullback_price_plan,
     build_technical_price_plan,
 )
 from app.services.holding_risk_sizing import (
@@ -47,11 +55,54 @@ from app.services.holding_risk_sizing import (
     build_external_risk_gate,
     size_ashare_candidate,
 )
+from app.services.opportunity_market_context import (
+    OpportunityMarketContext,
+    build_opportunity_market_context,
+)
 from app.services.portfolio_target_analysis import build_target_analysis
+from app.services.public_candidate_deep_check import (
+    A_SHARE_STOCK_CODE_PATTERN,
+    MAX_PUBLIC_DEEP_CHECK_CANDIDATES,
+    MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES,
+    PUBLIC_TECHNICAL_SCREEN_STATUS_KEYS,
+    run_public_candidate_technical_funnel,
+    validate_public_earnings_screen_metadata,
+    validate_public_technical_screen_metadata,
+)
+from app.services.public_candidate_discovery_service import (
+    discover_public_candidate_universe,
+)
+from app.services.public_candidate_earnings_risk import (
+    EARNINGS_ACTUAL_SOURCE,
+    EARNINGS_FORECAST_SOURCE,
+    EARNINGS_REVIEW_SOURCE,
+    MAX_EARNINGS_SCREEN_CANDIDATES,
+    PUBLIC_ACTUAL_EARNINGS_STATUS_KEYS,
+    PUBLIC_EARNINGS_SCREEN_STATUS_KEYS,
+    latest_completed_reporting_period,
+    latest_mandatory_actual_reporting_period,
+    screen_public_candidate_earnings_risk,
+)
+from app.services.public_candidate_notice_review import (
+    MAX_NOTICE_LOOKBACK_CALENDAR_DAYS,
+    MAX_NOTICE_REVIEW_CANDIDATES,
+    NOTICE_HISTORY_SOURCE,
+    NOTICE_LOOKBACK_CALENDAR_DAYS,
+    NOTICE_REVIEW_SOURCE,
+    review_public_candidate_notice_history,
+    review_public_candidate_notices,
+    validate_public_candidate_notice_review,
+)
+from app.services.public_market_breadth import (
+    MIN_PUBLIC_SNAPSHOT_COVERAGE_RATIO,
+    fetch_sina_public_market_breadth,
+)
+from app.services.research_only_safety import enforce_research_only_safety
 from app.services.tencent_quote_service import (
     assess_cn_quote_freshness,
     fetch_tencent_daily_bars_sync,
     fetch_tencent_quote_sync,
+    fetch_tencent_quotes_batched_sync,
     merge_tencent_quote_into_bars,
     normalize_cn_code,
 )
@@ -60,11 +111,25 @@ from app.services.tencent_quote_service import (
 class CLIError(Exception):
     """Expected CLI error with a stable JSON error code."""
 
-    def __init__(self, message: str, *, code: str = "cli_error", exit_code: int = 2):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "cli_error",
+        exit_code: int = 2,
+        stage: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.message = message
         self.code = code
         self.exit_code = exit_code
+        self.stage = stage
+        self.details = deepcopy(details) if details else None
+
+
+class _OpportunityDeadlineInterrupt(BaseException):
+    """Cross provider Exception handlers before becoming a CLIError."""
 
 
 holdings_app = typer.Typer(
@@ -76,7 +141,11 @@ holdings_app = typer.Typer(
 
 DEFAULT_CLI_USERNAME = "admin"
 DEFAULT_BUY_LOT_SIZE = 100
+MAX_MANUAL_OPPORTUNITY_CANDIDATES = MAX_EARNINGS_SCREEN_CANDIDATES
 CN_MARKET_TIMEZONE = "Asia/Shanghai"
+DEADLINE_EXPOSURE_BUFFER_PCT = 5.0
+DEADLINE_MAX_SINGLE_CANDIDATE_PCT = 25.0
+DEADLINE_TOTAL_LOSS_BUDGET_PCT = 3.5
 A_SHARE_REGIME_INDEX_SYMBOLS = ("sh000001", "sz399001", "sz399006", "sh000688")
 DEFAULT_OPPORTUNITY_CANDIDATES = [
     {
@@ -156,6 +225,21 @@ HOLDING_THEME_BY_CODE = {
     "601857": "defensive_energy",
     "600900": "defensive_yield",
 }
+_PUBLIC_RESEARCH_FALLBACK_DISCOVERY_STATUSES = frozenset(
+    {
+        "candidate_discovery_unavailable",
+        "quote_universe_empty",
+        "stale_quote_universe",
+        "quote_universe_too_small",
+    }
+)
+_PUBLIC_TRADE_AT_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+)
+_PUBLIC_A_SHARE_CODE_INPUT_PATTERN = re.compile(
+    r"(?:\d{1,6}|(?:sh|sz|bj)\d{6}|\d{6}\.(?:sh|sz|bj))",
+    re.IGNORECASE,
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -170,16 +254,26 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
-def _write_json(payload: Dict[str, Any], *, pretty: bool = False, stderr: bool = False) -> None:
-    output = json.dumps(
+def _serialize_json(payload: Dict[str, Any], *, pretty: bool = False) -> str:
+    return json.dumps(
         payload,
         ensure_ascii=False,
         default=_json_default,
         indent=2 if pretty else None,
         sort_keys=pretty,
     )
+
+
+def _write_serialized_json(output: str, *, stderr: bool = False) -> None:
     stream = sys.stderr if stderr else sys.stdout
     stream.write(output + "\n")
+
+
+def _write_json(payload: Dict[str, Any], *, pretty: bool = False, stderr: bool = False) -> None:
+    _write_serialized_json(
+        _serialize_json(payload, pretty=pretty),
+        stderr=stderr,
+    )
 
 
 def _build_settings_payload(settings: Optional[Dict[str, Any]], total_holding_cost: float = 0.0) -> Dict[str, Any]:
@@ -306,7 +400,22 @@ def _mongo_int(values: Mapping[str, str], key: str, default: int) -> int:
     return parsed
 
 
-def _connect_cli_database(configuration: Mapping[str, Optional[str]]) -> Any:
+def _connect_cli_database(
+    configuration: Mapping[str, Optional[str]],
+    *,
+    timeout_cap_ms: Optional[int] = None,
+) -> Any:
+    if timeout_cap_ms is not None and (
+        isinstance(timeout_cap_ms, bool)
+        or not isinstance(timeout_cap_ms, int)
+        or timeout_cap_ms <= 0
+    ):
+        raise CLIError(
+            "MongoDB timeout cap 必须是正整数毫秒值",
+            code="mongo_config_invalid",
+            exit_code=4,
+        )
+    cap = timeout_cap_ms
     values = _mongo_connection_values(configuration)
     expected_database = str(configuration.get("expected_database") or "").strip()
     host = _resolve_cli_mongo_host(
@@ -334,6 +443,18 @@ def _connect_cli_database(configuration: Mapping[str, Optional[str]]) -> Any:
             5000,
         ),
     }
+    if cap is not None:
+        for key in (
+            "connectTimeoutMS",
+            "socketTimeoutMS",
+            "serverSelectionTimeoutMS",
+        ):
+            configured_timeout = client_options[key]
+            client_options[key] = (
+                cap
+                if configured_timeout == 0
+                else min(configured_timeout, cap)
+            )
     username = str(values.get("MONGODB_USERNAME") or "").strip()
     password = str(values.get("MONGODB_PASSWORD") or "").strip()
     if username and password:
@@ -345,14 +466,27 @@ def _connect_cli_database(configuration: Mapping[str, Optional[str]]) -> Any:
             }
         )
     client = MongoClient(**client_options)
+    if cap is not None:
+        try:
+            with pymongo.timeout(cap / 1000):
+                client.admin.command("ping")
+        except Exception:
+            client.close()
+            raise
     return client[expected_database]
 
 
-def _get_database() -> Any:
+def _get_database(*, timeout_cap_ms: Optional[int] = None) -> Any:
     configuration = _validate_cli_mongo_configuration()
     expected_database = str(configuration["expected_database"] or "").strip()
     try:
-        database = _connect_cli_database(configuration)
+        if timeout_cap_ms is None:
+            database = _connect_cli_database(configuration)
+        else:
+            database = _connect_cli_database(
+                configuration,
+                timeout_cap_ms=timeout_cap_ms,
+            )
     except CLIError:
         raise
     except Exception as exc:  # pragma: no cover - covered by command integration in real runtime.
@@ -487,6 +621,74 @@ def _round_number(value: Any, digits: int = 2) -> Optional[float]:
         return round(float(value), digits)
     except (TypeError, ValueError):
         return None
+
+
+def _validate_deployment_objective(
+    target_exposure_pct: Any,
+    deployment_deadline: Any,
+    *,
+    as_of: Optional[date] = None,
+) -> Optional[Dict[str, Any]]:
+    target_missing = target_exposure_pct in (None, "")
+    deadline_missing = deployment_deadline in (None, "")
+    if target_missing and deadline_missing:
+        return None
+    if target_missing or deadline_missing:
+        raise CLIError(
+            "截止日仓位目标必须同时提供 target-exposure-pct 和 deployment-deadline",
+            code="incomplete_deployment_objective",
+        )
+    try:
+        target = float(target_exposure_pct)
+    except (TypeError, ValueError) as exc:
+        raise CLIError(
+            "target-exposure-pct 必须是 0 到 100 之间的数字",
+            code="invalid_target_exposure_pct",
+        ) from exc
+    if not math.isfinite(target) or not 0 < target <= 100:
+        raise CLIError(
+            "target-exposure-pct 必须大于 0 且不超过 100",
+            code="invalid_target_exposure_pct",
+        )
+    try:
+        deadline = date.fromisoformat(str(deployment_deadline).strip())
+    except ValueError as exc:
+        raise CLIError(
+            "deployment-deadline 必须使用 YYYY-MM-DD",
+            code="invalid_deployment_deadline",
+        ) from exc
+    market_date = as_of or datetime.now(ZoneInfo(CN_MARKET_TIMEZONE)).date()
+    if deadline < market_date:
+        raise CLIError(
+            "deployment-deadline 不能早于当前交易日",
+            code="deployment_deadline_expired",
+        )
+
+    maximum_exposure_pct = min(100.0, target + DEADLINE_EXPOSURE_BUFFER_PCT)
+    return {
+        "mode": "deadline_target",
+        "status": "active",
+        "target_exposure_pct": round(target, 2),
+        "maximum_exposure_pct": round(maximum_exposure_pct, 2),
+        "lot_rounding_buffer_pct": round(maximum_exposure_pct - target, 2),
+        "deadline": deadline.isoformat(),
+        "max_single_candidate_pct": DEADLINE_MAX_SINGLE_CANDIDATE_PCT,
+        "total_loss_budget_pct": DEADLINE_TOTAL_LOSS_BUDGET_PCT,
+        "soft_constraints": ["external_risk_gate", "a_share_market_gate"],
+        "hard_constraints": [
+            "account_data",
+            "quote_freshness",
+            "earnings_risk_gate",
+            "earnings_review_unavailable",
+            "corporate_action_price_adjustment",
+            "technical_price_plan",
+            "trend_recovery_required",
+            "limit_up_or_hot_move",
+            "high_divergence",
+            "recent_sale_cooldown",
+        ],
+        "is_reference_only": True,
+    }
 
 
 def _price_distance_pct(active_price: Optional[float], current_price: Optional[float]) -> Optional[float]:
@@ -692,26 +894,59 @@ def _build_a_share_market_gate(
     benchmark_trade_date: Optional[str],
     *,
     db: Any = None,
+    context: Optional[OpportunityMarketContext] = None,
 ) -> Dict[str, Any]:
-    index_quotes: List[Dict[str, Any]] = []
-    for symbol in A_SHARE_REGIME_INDEX_SYMBOLS:
-        quote = fetch_tencent_quote_sync(symbol)
-        if not quote:
-            continue
-        snapshot = dict(quote)
-        snapshot["requested_symbol"] = symbol
-        index_quotes.append(snapshot)
-    resolved_benchmark_trade_date = benchmark_trade_date
-    if not resolved_benchmark_trade_date:
-        provider_trade_dates = sorted(
-            {
-                str(quote.get("trade_date"))
-                for quote in index_quotes
-                if quote.get("trade_date")
+    if context is not None:
+        if context.index_status != "ok":
+            context_status = str(context.index_status or "index_context_unavailable")
+            context_error = dict(context.index_error or {})
+            index_regime = {
+                "status": context_status,
+                "level": "unknown",
+                "new_position_allowed": False,
+                "max_new_exposure_multiplier": 0.0,
+                "benchmark_trade_date": None,
+                "trade_date": None,
+                "indices": [],
+                "reason": "命令级主要指数上下文不可用，失败关闭。",
+                "context_error": context_error,
+                "is_reference_only": True,
             }
-        )
-        if provider_trade_dates:
-            resolved_benchmark_trade_date = provider_trade_dates[-1]
+            breadth_regime = {
+                "status": "not_evaluated",
+                "level": "unknown",
+                "actionable": False,
+                "max_new_exposure_multiplier": None,
+                "benchmark_trade_date": None,
+                "source": "not_evaluated",
+                "reason": "主要指数上下文不可用，未评估市场宽度。",
+                "is_reference_only": True,
+            }
+            combined = combine_a_share_market_regimes(index_regime, breadth_regime)
+            combined["mongo_breadth"] = dict(breadth_regime)
+            return combined
+        index_quotes = [dict(quote) for quote in context.index_quotes]
+        resolved_benchmark_trade_date = context.benchmark_trade_date
+    else:
+        index_quotes = []
+        for symbol in A_SHARE_REGIME_INDEX_SYMBOLS:
+            quote = fetch_tencent_quote_sync(symbol)
+            if not quote:
+                continue
+            snapshot = dict(quote)
+            snapshot["requested_symbol"] = symbol
+            index_quotes.append(snapshot)
+        resolved_benchmark_trade_date = benchmark_trade_date
+        if not resolved_benchmark_trade_date:
+            provider_trade_dates = sorted(
+                {
+                    str(quote.get("trade_date"))
+                    for quote in index_quotes
+                    if quote.get("trade_date")
+                }
+            )
+            if provider_trade_dates:
+                resolved_benchmark_trade_date = provider_trade_dates[-1]
     index_regime = assess_a_share_market_regime(
         index_quotes,
         benchmark_trade_date=resolved_benchmark_trade_date,
@@ -739,7 +974,64 @@ def _build_a_share_market_gate(
     breadth_regime["source"] = "mongo.market_quotes"
     if breadth_load_error:
         breadth_regime["load_error"] = breadth_load_error
-    return combine_a_share_market_regimes(index_regime, breadth_regime)
+    mongo_breadth = dict(breadth_regime)
+    if breadth_load_error:
+        mongo_breadth["assessment_status"] = mongo_breadth.get("status")
+        mongo_breadth["status"] = "load_failed"
+    if breadth_regime.get("status") != "ok":
+        if context is not None:
+            public_result = context.ensure_public_snapshot()
+        else:
+            public_result = fetch_sina_public_market_breadth(
+                benchmark_trade_date=resolved_benchmark_trade_date,
+            )
+        if public_result.get("status") == "ok":
+            public_breadth = assess_a_share_market_breadth(
+                public_result.get("rows", []),
+                benchmark_trade_date=resolved_benchmark_trade_date,
+            )
+            public_breadth.update(
+                {
+                    "source": public_result.get("source"),
+                    "provider_trade_date": public_result.get("provider_trade_date"),
+                    "provider_time": public_result.get("provider_time"),
+                }
+            )
+            for evidence_key in (
+                "provider_expected_count",
+                "provider_expected_exchange_counts",
+                "raw_row_count",
+                "unique_row_count",
+                "exchange_counts",
+                "total_coverage_ratio",
+                "exchange_coverage_ratio",
+                "excluded_stale_count",
+                "excluded_future_time_count",
+                "duplicate_count",
+            ):
+                if evidence_key in public_result:
+                    public_breadth[evidence_key] = deepcopy(
+                        public_result[evidence_key]
+                    )
+            if public_result.get("attempt_count") is not None:
+                public_breadth["public_snapshot_attempt_count"] = public_result.get(
+                    "attempt_count"
+                )
+            if public_result.get("retried_after_status") is not None:
+                public_breadth["retried_after_status"] = public_result.get(
+                    "retried_after_status"
+                )
+            if public_breadth.get("status") == "ok":
+                breadth_regime = public_breadth
+        else:
+            breadth_regime["public_fallback"] = {
+                key: value
+                for key, value in public_result.items()
+                if key != "rows"
+            }
+    combined = combine_a_share_market_regimes(index_regime, breadth_regime)
+    combined["mongo_breadth"] = mongo_breadth
+    return combined
 
 
 def _with_technical_price_plan(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -954,6 +1246,7 @@ def build_holdings_payload(
     code: Optional[str] = None,
     market: Optional[str] = None,
     include_analysis: bool = True,
+    benchmark_session_dates: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     user = select_user(db, username=username, email=email, user_id=user_id)
     items = _query_holdings(db, user_id=user["id"], code=code, market=market)
@@ -961,7 +1254,11 @@ def build_holdings_payload(
     items = [_with_technical_price_plan(item) for item in items]
     if include_analysis:
         items = [_with_analysis(item) for item in items]
-    benchmark_dates = _benchmark_session_dates()
+    benchmark_dates = (
+        _benchmark_session_dates()
+        if benchmark_session_dates is None
+        else list(benchmark_session_dates)
+    )
     for item in items:
         quote_trade_date = item.get("quote_snapshot", {}).get("trade_date")
         if quote_trade_date and quote_trade_date not in benchmark_dates:
@@ -1410,6 +1707,177 @@ def _candidate_definitions(candidate_codes: Optional[List[str]]) -> List[Dict[st
     return definitions
 
 
+def _manual_candidate_earnings_review(
+    definitions: List[Dict[str, Any]],
+    *,
+    benchmark_trade_date: Optional[str],
+) -> Dict[str, Any]:
+    codes = [str(definition.get("code") or "") for definition in definitions]
+    if len(codes) > MAX_MANUAL_OPPORTUNITY_CANDIDATES:
+        raise CLIError(
+            f"手工候选最多支持 {MAX_MANUAL_OPPORTUNITY_CANDIDATES} 只",
+            code="too_many_manual_candidates",
+            stage="earnings_forecast_review",
+        )
+
+    try:
+        report_period = latest_completed_reporting_period(benchmark_trade_date)
+        actual_report_period = latest_mandatory_actual_reporting_period(
+            benchmark_trade_date
+        )
+    except ValueError:
+        return {
+            "status": "earnings_market_context_unavailable",
+            "source": EARNINGS_FORECAST_SOURCE,
+            "actual_source": EARNINGS_ACTUAL_SOURCE,
+            "report_period": None,
+            "actual_report_period": None,
+            "error_type": "BenchmarkTradeDateUnavailable",
+            "screened_count": 0,
+            "blocked_count": 0,
+            "selected_count": 0,
+            "blocked_codes": [],
+            "selected_codes": [],
+            "results": [],
+        }
+
+    raw_review = screen_public_candidate_earnings_risk(
+        codes,
+        benchmark_trade_date=benchmark_trade_date,
+    )
+    raw_status = raw_review.get("status") if isinstance(raw_review, Mapping) else None
+    if raw_status != "ok":
+        return {
+            "status": (
+                raw_status
+                if isinstance(raw_status, str) and raw_status
+                else "earnings_review_unavailable"
+            ),
+            "source": EARNINGS_FORECAST_SOURCE,
+            "actual_source": EARNINGS_ACTUAL_SOURCE,
+            "report_period": report_period,
+            "actual_report_period": actual_report_period,
+            "error_type": (
+                raw_review.get("error_type")
+                if isinstance(raw_review, Mapping)
+                and isinstance(raw_review.get("error_type"), str)
+                else "InvalidProviderResponse"
+            ),
+            "screened_count": 0,
+            "blocked_count": 0,
+            "selected_count": 0,
+            "blocked_codes": [],
+            "selected_codes": [],
+            "results": [],
+        }
+
+    normalized, validation_error = validate_public_earnings_screen_metadata(
+        raw_review,
+        expected_codes=codes,
+        expected_report_period=report_period,
+        expected_actual_report_period=actual_report_period,
+        benchmark_trade_date=str(benchmark_trade_date),
+    )
+    if validation_error or normalized is None:
+        return {
+            "status": "earnings_review_invalid",
+            "source": EARNINGS_FORECAST_SOURCE,
+            "actual_source": EARNINGS_ACTUAL_SOURCE,
+            "report_period": report_period,
+            "actual_report_period": actual_report_period,
+            "error_type": validation_error or "InvalidEarningsReviewMetadata",
+            "screened_count": 0,
+            "blocked_count": 0,
+            "selected_count": 0,
+            "blocked_codes": [],
+            "selected_codes": [],
+            "results": [],
+        }
+    return normalized
+
+
+def _apply_manual_candidate_earnings_gate(
+    candidates: List[Dict[str, Any]],
+    earnings_review: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    review_ok = earnings_review.get("status") == "ok"
+    results_by_code = {
+        str(result.get("code")): deepcopy(dict(result))
+        for result in earnings_review.get("results", [])
+        if isinstance(result, Mapping) and isinstance(result.get("code"), str)
+    }
+    gated_candidates: List[Dict[str, Any]] = []
+    for raw_candidate in candidates:
+        candidate = deepcopy(raw_candidate)
+        code = str(candidate.get("code") or "")
+        result = results_by_code.get(code) if review_ok else None
+        unavailable = result is None
+        blocked = bool(unavailable or result.get("blocks_new_position"))
+        latest_actual = (
+            result.get("latest_actual")
+            if isinstance(result, Mapping)
+            and isinstance(result.get("latest_actual"), Mapping)
+            else {}
+        )
+        actual_risk_flags = [
+            str(flag)
+            for flag in latest_actual.get("risk_flags", [])
+            if isinstance(flag, str) and flag
+        ]
+        blocker = (
+            "earnings_review_unavailable" if unavailable else "earnings_risk_gate"
+        )
+        candidate["earnings_review"] = deepcopy(result) if result is not None else None
+        candidate["earnings_gate"] = {
+            "status": "unavailable" if unavailable else "blocked" if blocked else "passed",
+            "blocks_new_position": blocked,
+            "reason_code": blocker if blocked else "earnings_review_passed",
+            "forecast_status": result.get("status") if result is not None else None,
+            "actual_status": latest_actual.get("status"),
+            "actual_risk_flags": actual_risk_flags,
+        }
+        if blocked:
+            guarded_plan = (
+                deepcopy(candidate.get("guarded_price_plan"))
+                if isinstance(candidate.get("guarded_price_plan"), Mapping)
+                else {}
+            )
+            guarded_plan["reference_actionable"] = bool(
+                guarded_plan.get("reference_actionable")
+                or guarded_plan.get("actionable")
+            )
+            guarded_plan["actionable"] = False
+            guarded_plan["execution_blocked_by"] = list(
+                dict.fromkeys(
+                    list(guarded_plan.get("execution_blocked_by") or [])
+                    + [blocker]
+                )
+            )
+            guarded_plan["is_reference_only"] = True
+            candidate["guarded_price_plan"] = guarded_plan
+            risk_flags = list(candidate.get("risk_flags") or [])
+            risk_flags.append(
+                _risk_flag(
+                    blocker,
+                    "warning",
+                    (
+                        "业绩预告或最新实绩触发新仓门禁，仅保留观察。"
+                        if not unavailable
+                        else "业绩复核不可用，无法证明候选满足新仓条件。"
+                    ),
+                    forecast_status=(
+                        result.get("status") if result is not None else None
+                    ),
+                    actual_status=latest_actual.get("status"),
+                    actual_risk_flags=actual_risk_flags or None,
+                    error_type=earnings_review.get("error_type") if unavailable else None,
+                )
+            )
+            candidate["risk_flags"] = risk_flags
+        gated_candidates.append(candidate)
+    return gated_candidates
+
+
 def _corporate_action_marker(name: Any) -> Optional[str]:
     normalized = str(name or "").strip().upper()
     for marker in ("XD", "XR", "DR"):
@@ -1467,8 +1935,14 @@ def _quote_snapshot(quote: Dict[str, Any], definition: Dict[str, Any]) -> Dict[s
         "low": low,
         "pre_close": _round_number(quote.get("pre_close"), 4),
         "amount": _round_number(quote.get("amount")),
+        "volume": _round_number(quote.get("volume")),
+        "quote_volume": _round_number(quote.get("quote_volume")),
         "turnover_rate": _round_number(quote.get("turnover_rate")),
         "volume_ratio": _round_number(quote.get("volume_ratio")),
+        "pe_ratio": _round_number(quote.get("pe_ratio")),
+        "pb_ratio": _round_number(quote.get("pb_ratio")),
+        "circ_mv": _round_number(quote.get("circ_mv")),
+        "total_mv": _round_number(quote.get("total_mv")),
         "intraday_range_pct": intraday_range_pct,
         "price_plan_adjustment_required": corporate_action_marker is not None,
     }
@@ -1535,11 +2009,22 @@ def _build_opportunity_candidates(
     cash: Optional[float],
     buy_lot_size: int,
     holding_themes: set,
+    allow_reference_price_plan: bool = False,
+    quote_snapshots: Optional[Mapping[str, Dict[str, Any]]] = None,
+    technical_plan_snapshots: Optional[Mapping[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for definition in definitions:
         code = str(definition.get("code") or "").upper()
-        quote = fetch_tencent_quote_sync(code) or {}
+        if quote_snapshots is not None and code in quote_snapshots:
+            injected_quote = quote_snapshots.get(code)
+            quote = (
+                deepcopy(dict(injected_quote))
+                if isinstance(injected_quote, Mapping)
+                else {}
+            )
+        else:
+            quote = fetch_tencent_quote_sync(code) or {}
         snapshot = _quote_snapshot(quote, definition)
         corporate_action = fetch_cn_dividend_calendar_sync(code)
         upcoming_price_adjustment_required = bool(
@@ -1551,7 +2036,16 @@ def _build_opportunity_candidates(
             "status": "quote_not_actionable",
             "quote_status": snapshot.get("freshness", {}).get("status"),
         }
-        if snapshot.get("freshness", {}).get("actionable"):
+        quote_actionable = bool(snapshot.get("freshness", {}).get("actionable"))
+        injected_plan = (
+            technical_plan_snapshots.get(code)
+            if isinstance(technical_plan_snapshots, Mapping)
+            else None
+        )
+        pullback_plan: Optional[Dict[str, Any]] = None
+        if isinstance(injected_plan, Mapping):
+            technical_plan = deepcopy(dict(injected_plan))
+        elif quote_actionable or (allow_reference_price_plan and price is not None):
             history = fetch_tencent_daily_bars_sync(code)
             if history.get("ok"):
                 merged = merge_tencent_quote_into_bars(history.get("bars", []), snapshot)
@@ -1560,8 +2054,14 @@ def _build_opportunity_candidates(
                         merged.get("bars", []),
                         current_price=price,
                     )
+                    pullback_plan = build_pullback_price_plan(
+                        merged.get("bars", []),
+                        current_price=price,
+                    )
                     technical_plan["history_status"] = history.get("status")
                     technical_plan["quote_merge_action"] = merged.get("merge_action")
+                    pullback_plan["history_status"] = history.get("status")
+                    pullback_plan["quote_merge_action"] = merged.get("merge_action")
                 else:
                     technical_plan = {
                         "actionable": False,
@@ -1578,12 +2078,93 @@ def _build_opportunity_candidates(
             technical_plan,
             quantity=buy_lot_size,
         )
+        if pullback_plan is not None:
+            pullback_plan = apply_net_reward_risk_gate(
+                pullback_plan,
+                quantity=buy_lot_size,
+            )
+            pullback_trend = (
+                pullback_plan.get("trend_context")
+                if isinstance(pullback_plan.get("trend_context"), dict)
+                else {}
+            )
+            pullback_ready = bool(
+                pullback_plan.get("status") == "ok"
+                and pullback_plan.get("actionable") is True
+                and pullback_trend.get("recovery_required") is not True
+            )
+            if not technical_plan.get("actionable") and pullback_ready:
+                technical_plan = {
+                    **pullback_plan,
+                    "alternative_breakout_plan": technical_plan,
+                }
+            else:
+                technical_plan = {
+                    **technical_plan,
+                    "entry_strategy": "breakout",
+                    "alternative_pullback_plan": pullback_plan,
+                }
+        trend_context = (
+            technical_plan.get("trend_context")
+            if isinstance(technical_plan.get("trend_context"), dict)
+            else {}
+        )
+        if trend_context.get("recovery_required") is True:
+            technical_plan = {
+                **technical_plan,
+                "actionable": False,
+                "status": "trend_recovery_required",
+                "reference_actionable": False,
+                "failed_gates": list(
+                    dict.fromkeys(
+                        list(technical_plan.get("failed_gates") or [])
+                        + ["trend_recovery_required"]
+                    )
+                ),
+            }
+        if allow_reference_price_plan and not quote_actionable:
+            fee_aware_trade = technical_plan.get("fee_aware_trade")
+            if isinstance(fee_aware_trade, dict):
+                fee_aware_trade = dict(fee_aware_trade)
+                for order_key in ("entry_order", "stop_order", "target_order"):
+                    fee_aware_trade.pop(order_key, None)
+                technical_plan = {
+                    **technical_plan,
+                    "fee_aware_trade": fee_aware_trade,
+                }
+            execution_blocked_by = ["quote_freshness"]
+            if cash is None:
+                execution_blocked_by.append("account_data_unavailable")
+            if trend_context.get("recovery_required") is True:
+                execution_blocked_by.append("trend_recovery_required")
+            technical_plan = {
+                **technical_plan,
+                "reference_actionable": bool(technical_plan.get("actionable")),
+                "actionable": False,
+                "quote_status": snapshot.get("freshness", {}).get("status"),
+                "execution_blocked_by": execution_blocked_by,
+                "is_reference_only": True,
+            }
         one_lot_amount = round(price * buy_lot_size, 2) if price is not None else None
         affordable = bool(cash is not None and one_lot_amount is not None and one_lot_amount <= cash)
         same_theme = bool(definition.get("theme") in holding_themes)
         cash_after_one_lot = round(cash - one_lot_amount, 2) if affordable and cash is not None and one_lot_amount is not None else None
         cash_usage_pct = round(one_lot_amount / cash * 100, 2) if cash and one_lot_amount is not None else None
         candidate_flags: List[Dict[str, Any]] = []
+        if trend_context.get("recovery_required") is True:
+            candidate_flags.append(
+                _risk_flag(
+                    "trend_recovery_required",
+                    "warning",
+                    "股价处于深回撤且短期均线空头排列，重新站上短期均线前仅观察。",
+                    drawdown_from_20d_high_pct=trend_context.get(
+                        "drawdown_from_20d_high_pct"
+                    ),
+                    distance_to_entry_pct=trend_context.get(
+                        "distance_to_entry_pct"
+                    ),
+                )
+            )
         if (
             not technical_plan.get("actionable")
             and not _has_complete_candidate_price_plan(definition)
@@ -1605,7 +2186,10 @@ def _build_opportunity_candidates(
                     quote_status=snapshot.get("freshness", {}).get("status"),
                 )
             )
-        elif not technical_plan.get("actionable"):
+        elif (
+            not technical_plan.get("actionable")
+            and trend_context.get("recovery_required") is not True
+        ):
             candidate_flags.append(
                 _risk_flag(
                     "technical_plan_not_actionable",
@@ -1938,18 +2522,96 @@ def _build_cash_deployment_plan(
     actionable_equity: Optional[Dict[str, Any]] = None,
     recent_sale_policy: Optional[Dict[str, Any]] = None,
     observation_only_codes: Optional[Iterable[str]] = None,
+    deployment_objective: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     cash = _round_number(account.get("cash_or_unallocated"))
     market_session = market_session or {}
     requires_quote_refresh = bool(market_session.get("quote_stale_risk"))
-    initial_deploy_cap_pct = 50.0
-    reserve_cash_pct = 50.0
-    max_single_candidate_pct = 35.0
-    initial_deploy_cap_amount = round(cash * initial_deploy_cap_pct / 100, 2) if cash is not None else None
-    max_single_candidate_amount = round(cash * max_single_candidate_pct / 100, 2) if cash is not None else None
-    remaining_initial_cap = initial_deploy_cap_amount
     actionable_equity = actionable_equity or {"value": None, "actionable": False}
     equity_value = _round_number(actionable_equity.get("value"))
+    current_market_value = _round_number(account.get("known_market_value"))
+    if current_market_value is None and not holdings_risk:
+        current_market_value = 0.0
+    objective = (
+        deepcopy(dict(deployment_objective))
+        if isinstance(deployment_objective, Mapping)
+        and deployment_objective.get("mode") == "deadline_target"
+        else None
+    )
+    deadline_mode = objective is not None
+    objective_account_ready = bool(
+        deadline_mode
+        and cash is not None
+        and equity_value is not None
+        and current_market_value is not None
+    )
+
+    if deadline_mode:
+        target_exposure_pct = float(objective.get("target_exposure_pct") or 0)
+        maximum_exposure_pct = float(objective.get("maximum_exposure_pct") or 0)
+        initial_deploy_cap_pct = maximum_exposure_pct
+        max_single_candidate_pct = float(
+            objective.get("max_single_candidate_pct")
+            or DEADLINE_MAX_SINGLE_CANDIDATE_PCT
+        )
+        reserve_cash_pct = max(0.0, round(100.0 - maximum_exposure_pct, 2))
+        if objective_account_ready:
+            target_exposure_amount = round(
+                float(equity_value) * target_exposure_pct / 100,
+                2,
+            )
+            maximum_exposure_amount = round(
+                float(equity_value) * maximum_exposure_pct / 100,
+                2,
+            )
+            minimum_exposure_gap = max(
+                0.0,
+                round(target_exposure_amount - float(current_market_value), 2),
+            )
+            maximum_exposure_gap = (
+                max(
+                    0.0,
+                    round(
+                        maximum_exposure_amount - float(current_market_value),
+                        2,
+                    ),
+                )
+                if minimum_exposure_gap > 0
+                else 0.0
+            )
+            initial_deploy_cap_amount = min(float(cash), maximum_exposure_gap)
+            max_single_candidate_amount = round(
+                float(equity_value) * max_single_candidate_pct / 100,
+                2,
+            )
+        else:
+            target_exposure_amount = None
+            maximum_exposure_amount = None
+            minimum_exposure_gap = None
+            maximum_exposure_gap = None
+            initial_deploy_cap_amount = 0.0
+            max_single_candidate_amount = 0.0
+    else:
+        target_exposure_pct = None
+        maximum_exposure_pct = None
+        target_exposure_amount = None
+        maximum_exposure_amount = None
+        minimum_exposure_gap = None
+        maximum_exposure_gap = None
+        initial_deploy_cap_pct = 50.0
+        reserve_cash_pct = 50.0
+        max_single_candidate_pct = 35.0
+        initial_deploy_cap_amount = (
+            round(cash * initial_deploy_cap_pct / 100, 2)
+            if cash is not None
+            else None
+        )
+        max_single_candidate_amount = (
+            round(cash * max_single_candidate_pct / 100, 2)
+            if cash is not None
+            else None
+        )
+    remaining_initial_cap = initial_deploy_cap_amount
     external_risk_gate = external_risk_gate or build_external_risk_gate(
         "unknown",
         actionable_equity=equity_value,
@@ -1967,8 +2629,26 @@ def _build_cash_deployment_plan(
     )
     market_multiplier = min(max(market_multiplier or 0.0, 0.0), 1.0)
     external_new_exposure = _round_number(external_risk_gate.get("max_new_exposure_amount")) or 0.0
-    remaining_new_exposure = round(external_new_exposure * market_multiplier, 2)
-    total_loss_budget = round(equity_value * 0.0075, 2) if equity_value is not None else 0.0
+    if deadline_mode:
+        effective_new_exposure_cap = round(float(initial_deploy_cap_amount or 0), 2)
+        effective_market_multiplier = 1.0
+        total_loss_budget_pct = float(
+            objective.get("total_loss_budget_pct")
+            or DEADLINE_TOTAL_LOSS_BUDGET_PCT
+        )
+    else:
+        effective_new_exposure_cap = round(
+            external_new_exposure * market_multiplier,
+            2,
+        )
+        effective_market_multiplier = market_multiplier
+        total_loss_budget_pct = 0.75
+    remaining_new_exposure = effective_new_exposure_cap
+    total_loss_budget = (
+        round(equity_value * total_loss_budget_pct / 100, 2)
+        if equity_value is not None
+        else 0.0
+    )
     remaining_loss_budget = total_loss_budget
     remaining_cash = cash or 0.0
     planned_symbol_market_values: Dict[str, float] = {}
@@ -2009,6 +2689,9 @@ def _build_cash_deployment_plan(
         risk_keys = {flag.get("key") for flag in candidate.get("risk_flags", [])}
         blocked_by_price_plan_adjustment = "corporate_action_price_adjustment" in risk_keys
         blocked_by_missing_price_plan = "missing_candidate_price_plan" in risk_keys
+        blocked_by_earnings_risk = "earnings_risk_gate" in risk_keys
+        blocked_by_earnings_review = "earnings_review_unavailable" in risk_keys
+        blocked_by_trend_recovery = "trend_recovery_required" in risk_keys
         blocked_by_hot_move = "limit_up_or_hot_move" in risk_keys
         blocked_by_divergence = bool({"high_turnover", "wide_intraday_range"} & risk_keys)
         candidate_code_upper = str(candidate.get("code") or "").upper()
@@ -2022,6 +2705,12 @@ def _build_cash_deployment_plan(
             risk_gate = "blocked_by_price_plan_adjustment"
         elif blocked_by_missing_price_plan:
             risk_gate = "blocked_by_missing_price_plan"
+        elif blocked_by_earnings_risk:
+            risk_gate = "blocked_by_earnings_risk"
+        elif blocked_by_earnings_review:
+            risk_gate = "blocked_by_earnings_review"
+        elif blocked_by_trend_recovery:
+            risk_gate = "blocked_by_trend_recovery"
         elif blocked_by_hot_move:
             risk_gate = "blocked_by_hot_move"
         elif blocked_by_divergence:
@@ -2037,19 +2726,33 @@ def _build_cash_deployment_plan(
             base_failed_gates.append("corporate_action_price_adjustment")
         if blocked_by_missing_price_plan:
             base_failed_gates.append("missing_candidate_price_plan")
+        if blocked_by_earnings_risk:
+            base_failed_gates.append("earnings_risk_gate")
+        if blocked_by_earnings_review:
+            base_failed_gates.append("earnings_review_unavailable")
+        if blocked_by_trend_recovery:
+            base_failed_gates.append("trend_recovery_required")
         if blocked_by_hot_move:
             base_failed_gates.append("limit_up_or_hot_move")
         if blocked_by_divergence:
             base_failed_gates.append("high_divergence")
-        if not external_risk_gate.get("actionable"):
+        if not deadline_mode and not external_risk_gate.get("actionable"):
             base_failed_gates.append("external_risk_gate")
-        if not a_share_market_gate.get("new_position_allowed"):
+        if not deadline_mode and not a_share_market_gate.get("new_position_allowed"):
             base_failed_gates.append("a_share_market_gate")
+        if deadline_mode and not objective_account_ready:
+            base_failed_gates.append("deployment_objective_account_data")
         quote_freshness = candidate.get("quote", {}).get("freshness", {})
         if not quote_freshness.get("actionable"):
             base_failed_gates.append("quote_freshness")
+        candidate_requires_quote_refresh = bool(
+            requires_quote_refresh or not quote_freshness.get("actionable")
+        )
         guarded_plan = candidate.get("guarded_price_plan") if isinstance(candidate.get("guarded_price_plan"), dict) else {}
-        if not guarded_plan.get("actionable"):
+        if (
+            not guarded_plan.get("actionable")
+            and not blocked_by_trend_recovery
+        ):
             base_failed_gates.append("technical_price_plan")
 
         existing_holdings = [
@@ -2100,6 +2803,10 @@ def _build_cash_deployment_plan(
                 remaining_initial_deploy=remaining_initial_cap or 0.0,
                 remaining_loss_budget=remaining_loss_budget,
                 existing_symbol_market_value=existing_symbol_market_value,
+                candidate_cash_cap_amount=max_single_candidate_amount,
+                post_trade_symbol_cap_pct=(
+                    max_single_candidate_pct if deadline_mode else 20.0
+                ),
             )
         else:
             risk_sizing = {
@@ -2152,6 +2859,10 @@ def _build_cash_deployment_plan(
                 risk_gate = "blocked_by_market_regime"
             elif "quote_freshness" in failed_gates:
                 risk_gate = "blocked_by_quote_freshness"
+            elif "earnings_risk_gate" in failed_gates:
+                risk_gate = "blocked_by_earnings_risk"
+            elif "earnings_review_unavailable" in failed_gates:
+                risk_gate = "blocked_by_earnings_review"
             elif "technical_price_plan" in failed_gates:
                 risk_gate = "blocked_by_technical_plan"
             else:
@@ -2181,7 +2892,11 @@ def _build_cash_deployment_plan(
                 failed_checks.append("intraday_range_pct")
             if current_price is not None and invalidation_price is not None and current_price <= invalidation_price:
                 failed_checks.append("invalidation_price")
-            evaluation_status = "stale_until_refresh" if requires_quote_refresh else "current"
+            evaluation_status = (
+                "stale_until_refresh"
+                if candidate_requires_quote_refresh
+                else "current"
+            )
             cooldown_evaluation = {
                 "evaluation_status": evaluation_status,
                 "actionable": evaluation_status == "current" and not failed_checks,
@@ -2231,15 +2946,19 @@ def _build_cash_deployment_plan(
                                 "build_candidate_price_plan"
                                 if blocked_by_missing_price_plan
                                 else (
-                                    "cooldown_after_hot_move"
-                                    if blocked_by_hot_move
+                                    "wait_for_trend_recovery"
+                                    if blocked_by_trend_recovery
                                     else (
-                                        "wait_for_divergence_cooldown"
-                                        if blocked_by_divergence
+                                        "cooldown_after_hot_move"
+                                        if blocked_by_hot_move
                                         else (
-                                            "refresh_quote_before_action"
-                                            if requires_quote_refresh
-                                            else "confirm_guarded_technical_entry"
+                                            "wait_for_divergence_cooldown"
+                                            if blocked_by_divergence
+                                            else (
+                                                "refresh_quote_before_action"
+                                                if candidate_requires_quote_refresh
+                                                else "confirm_guarded_technical_entry"
+                                            )
                                         )
                                     )
                                 )
@@ -2260,9 +2979,12 @@ def _build_cash_deployment_plan(
                                 "缺少完整价格计划，先生成观察区、突破价和失效价。"
                                 if blocked_by_missing_price_plan
                                 else (
-                                    "涨幅接近或达到涨停，禁止追高，等待热度降温。"
-                                    if blocked_by_hot_move
+                                    "股价处于深回撤和短期空头排列，重新站上短期均线前仅观察。"
+                                    if blocked_by_trend_recovery
                                     else (
+                                        "涨幅接近或达到涨停，禁止追高，等待热度降温。"
+                                        if blocked_by_hot_move
+                                        else (
                                             "高换手或大振幅说明分歧较强，先等分歧收敛和承接确认。"
                                             if blocked_by_divergence
                                             else (
@@ -2270,6 +2992,7 @@ def _build_cash_deployment_plan(
                                                 if suggested_lots
                                                 else "不满足首批资金、单票上限或现金可达条件，先观察。"
                                             )
+                                        )
                                     )
                                 )
                             )
@@ -2281,7 +3004,73 @@ def _build_cash_deployment_plan(
             }
         )
 
-    mode = "position_risk_first" if holdings_risk else "cash_ready"
+    deployment_objective_result = None
+    if objective is not None:
+        planned_new_exposure = round(
+            effective_new_exposure_cap - remaining_new_exposure,
+            2,
+        )
+        if objective_account_ready:
+            current_exposure_pct = round(
+                float(current_market_value) / float(equity_value) * 100,
+                2,
+            )
+            projected_exposure_amount = round(
+                float(current_market_value) + planned_new_exposure,
+                2,
+            )
+            projected_exposure_pct = round(
+                projected_exposure_amount / float(equity_value) * 100,
+                2,
+            )
+            target_shortfall_amount = max(
+                0.0,
+                round(float(target_exposure_amount) - projected_exposure_amount, 2),
+            )
+            target_met = projected_exposure_pct >= float(target_exposure_pct)
+            if current_exposure_pct >= float(target_exposure_pct):
+                objective_status = "already_met"
+            elif target_met:
+                objective_status = "planned_target_met"
+            else:
+                objective_status = "target_shortfall"
+        else:
+            current_exposure_pct = None
+            projected_exposure_amount = None
+            projected_exposure_pct = None
+            target_shortfall_amount = None
+            target_met = False
+            objective_status = "account_data_unavailable"
+        deployment_objective_result = {
+            **objective,
+            "status": objective_status,
+            "account_data_actionable": objective_account_ready,
+            "current_exposure_amount": current_market_value,
+            "current_exposure_pct": current_exposure_pct,
+            "target_exposure_amount": target_exposure_amount,
+            "maximum_exposure_amount": maximum_exposure_amount,
+            "minimum_exposure_gap": minimum_exposure_gap,
+            "maximum_exposure_gap": maximum_exposure_gap,
+            "effective_new_exposure_cap": effective_new_exposure_cap,
+            "planned_new_exposure": planned_new_exposure,
+            "projected_exposure_amount": projected_exposure_amount,
+            "projected_exposure_pct": projected_exposure_pct,
+            "target_shortfall_amount": target_shortfall_amount,
+            "target_met": target_met,
+            "soft_constraint_assessment": {
+                "external_risk_level": external_risk_gate.get("level"),
+                "external_risk_actionable": external_risk_gate.get("actionable"),
+                "a_share_market_level": a_share_market_gate.get("level"),
+                "a_share_new_position_allowed": a_share_market_gate.get(
+                    "new_position_allowed"
+                ),
+                "effect": "limit_price_and_staging_only",
+            },
+        }
+
+    mode = "deadline_target" if deadline_mode else (
+        "position_risk_first" if holdings_risk else "cash_ready"
+    )
     if requires_quote_refresh:
         plan_status = "pending_quote_refresh"
         execution_window = "next_trading_session"
@@ -2318,6 +3107,9 @@ def _build_cash_deployment_plan(
             external_new_exposure * market_multiplier,
             2,
         ),
+        "effective_market_multiplier": effective_market_multiplier,
+        "effective_new_exposure_cap": effective_new_exposure_cap,
+        "deployment_objective": deployment_objective_result,
         "actionable_equity": actionable_equity,
         "candidate_lot_plan": candidate_lot_plan,
         "note": "仓位计划仅用于研究和资金约束参考，不构成投资建议或交易指令。",
@@ -3016,6 +3808,7 @@ def _build_opportunity_brief(
     a_share_market_gate: Optional[Dict[str, Any]] = None,
     actionable_equity: Optional[Dict[str, Any]] = None,
     benchmark_session_dates: Optional[Iterable[Any]] = None,
+    deployment_objective: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     configured_assets = account.get("configured_total_assets")
     cash = account.get("cash_or_unallocated")
@@ -3082,6 +3875,7 @@ def _build_opportunity_brief(
         actionable_equity=actionable_equity,
         recent_sale_policy=recent_sale_policy,
         observation_only_codes=[candidate.get("code") for candidate in fallback_candidates],
+        deployment_objective=deployment_objective,
     )
     candidate_decision_matrix = _build_candidate_decision_matrix(
         cash_deployment_plan,
@@ -3190,19 +3984,42 @@ def build_opportunities_payload(
     candidate_codes: Optional[List[str]] = None,
     buy_lot_size: int = DEFAULT_BUY_LOT_SIZE,
     external_risk_level: Optional[str] = None,
+    context: Optional[OpportunityMarketContext] = None,
+    precomputed_manual_earnings_review: Optional[Mapping[str, Any]] = None,
+    target_exposure_pct: Optional[float] = None,
+    deployment_deadline: Optional[str] = None,
 ) -> Dict[str, Any]:
     normalized_external_risk_level = _validate_external_risk_level(external_risk_level)
+    deployment_objective = _validate_deployment_objective(
+        target_exposure_pct,
+        deployment_deadline,
+        as_of=(context.now.date() if context is not None else None),
+    )
+    if deployment_objective is not None and not candidate_codes:
+        raise CLIError(
+            "截止日仓位目标必须显式提供 --candidate-code，避免全市场研究结果被直接转成仓位",
+            code="deployment_objective_requires_candidates",
+        )
     if buy_lot_size != DEFAULT_BUY_LOT_SIZE:
         raise CLIError(
             "A股仓位计算固定使用100股一手，不支持自定义 lot-size",
             code="invalid_lot_size",
         )
+    context_benchmark_trade_date = None
+    context_benchmark_dates = None
+    if context is not None:
+        if context.index_status == "ok" and context.benchmark_trade_date:
+            context_benchmark_trade_date = context.benchmark_trade_date
+            context_benchmark_dates = [context_benchmark_trade_date]
+        else:
+            context_benchmark_dates = []
     holdings_payload = build_holdings_payload(
         db,
         username=username,
         email=email,
         user_id=user_id,
         include_analysis=True,
+        benchmark_session_dates=context_benchmark_dates,
     )
     data = holdings_payload["data"]
     account = _build_account_payload(data["summary"], data["settings"], buy_lot_size)
@@ -3212,12 +4029,30 @@ def build_opportunities_payload(
         normalized_external_risk_level,
         actionable_equity=actionable_equity.get("value"),
     )
-    benchmark_dates = _benchmark_session_dates()
-    benchmark_trade_date = max(benchmark_dates) if benchmark_dates else None
-    a_share_market_gate = _build_a_share_market_gate(benchmark_trade_date, db=db)
+    if context is not None:
+        benchmark_trade_date = context_benchmark_trade_date
+        benchmark_dates = context_benchmark_dates or []
+        a_share_market_gate = _build_a_share_market_gate(
+            benchmark_trade_date,
+            db=db,
+            context=context,
+        )
+    else:
+        benchmark_dates = _benchmark_session_dates()
+        benchmark_trade_date = max(benchmark_dates) if benchmark_dates else None
+        a_share_market_gate = _build_a_share_market_gate(benchmark_trade_date, db=db)
     holding_themes = {risk.get("theme") for risk in holdings_risk if risk.get("theme")}
+    manual_earnings_review: Optional[Dict[str, Any]] = None
     if candidate_codes:
         definitions = _candidate_definitions(candidate_codes)
+        manual_earnings_review = (
+            deepcopy(dict(precomputed_manual_earnings_review))
+            if isinstance(precomputed_manual_earnings_review, Mapping)
+            else _manual_candidate_earnings_review(
+                definitions,
+                benchmark_trade_date=benchmark_trade_date,
+            )
+        )
         candidate_discovery = {
             "status": "manual_candidates",
             "source": "cli.candidate_code",
@@ -3236,15 +4071,21 @@ def build_opportunities_payload(
             "definitions_count": len(definitions),
             "selected_codes": [definition.get("code") for definition in definitions],
         }
+    trade_context = _build_trade_context(db, user_id=data["user"]["id"])
     candidates = _build_opportunity_candidates(
         definitions,
         cash=account.get("cash_or_unallocated"),
         buy_lot_size=buy_lot_size,
         holding_themes=holding_themes,
+        allow_reference_price_plan=bool(candidate_codes),
     )
+    if manual_earnings_review is not None:
+        candidates = _apply_manual_candidate_earnings_gate(
+            candidates,
+            manual_earnings_review,
+        )
     risk_flags = _build_opportunity_risk_flags(holdings_risk, candidates, account)
     market_session = _market_session_context()
-    trade_context = _build_trade_context(db, user_id=data["user"]["id"])
     brief = _build_opportunity_brief(
         account,
         holdings_risk,
@@ -3256,6 +4097,15 @@ def build_opportunities_payload(
         a_share_market_gate,
         actionable_equity,
         benchmark_dates,
+        deployment_objective,
+    )
+    breadth_source = str(
+        (a_share_market_gate.get("breadth_regime") or {}).get("source") or ""
+    )
+    breadth_meta_source = (
+        "akshare_sina_public_breadth"
+        if breadth_source == "akshare.sina.stock_zh_a_spot"
+        else "mongo_market_breadth"
     )
 
     return {
@@ -3270,6 +4120,14 @@ def build_opportunities_payload(
             "trade_context": trade_context,
             "holdings_risk": holdings_risk,
             "candidate_discovery": candidate_discovery,
+            "earnings_review": manual_earnings_review,
+            "deployment_objective": (
+                brief.get("cash_deployment_plan", {}).get(
+                    "deployment_objective"
+                )
+                if deployment_objective is not None
+                else None
+            ),
             "candidates": candidates,
             "risk_flags": risk_flags,
             "context": {
@@ -3285,10 +4143,174 @@ def build_opportunities_payload(
             "disclaimer": "仅供研究参考，不构成投资建议或交易指令。",
         },
         "meta": {
-            "schema_version": 6,
+            "schema_version": 7,
             "source": (
                 "mongo.user_holdings+analysis_reports+candidate_discovery+"
-                "mongo_market_breadth+tencent_quotes+tencent_major_indices+"
+                + f"{breadth_meta_source}+tencent_quotes+tencent_major_indices+"
+                + (
+                    f"{EARNINGS_REVIEW_SOURCE}+"
+                    if manual_earnings_review is not None
+                    else ""
+                )
+                + "cninfo_dividend_calendar"
+            ),
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    }
+
+
+def build_research_only_opportunities_payload(
+    *,
+    candidate_codes: List[str],
+    username: Optional[str] = None,
+    email: Optional[str] = None,
+    user_id: Optional[str] = None,
+    external_risk_level: Optional[str] = None,
+    database_status: Optional[Dict[str, Any]] = None,
+    context: Optional[OpportunityMarketContext] = None,
+    precomputed_manual_earnings_review: Optional[Mapping[str, Any]] = None,
+    target_exposure_pct: Optional[float] = None,
+    deployment_deadline: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build manual-candidate research output without account or holdings data."""
+    normalized_external_risk_level = _validate_external_risk_level(external_risk_level)
+    deployment_objective = _validate_deployment_objective(
+        target_exposure_pct,
+        deployment_deadline,
+        as_of=(context.now.date() if context is not None else None),
+    )
+    if deployment_objective is not None:
+        deployment_objective = {
+            **deployment_objective,
+            "status": "account_data_unavailable",
+            "account_data_actionable": False,
+            "target_met": False,
+            "reason": "数据库不可用，无法核验本金、当前仓位和可用现金，禁止生成仓位数量。",
+        }
+    definitions = _candidate_definitions(candidate_codes)
+    if not definitions:
+        raise CLIError(
+            "研究模式至少需要一个有效的 --candidate-code",
+            code="candidate_codes_required",
+        )
+
+    benchmark_trade_date = (
+        context.benchmark_trade_date
+        if context is not None
+        and context.index_status == "ok"
+        and context.benchmark_trade_date
+        else max(_benchmark_session_dates(), default=None)
+    )
+    manual_earnings_review = (
+        deepcopy(dict(precomputed_manual_earnings_review))
+        if isinstance(precomputed_manual_earnings_review, Mapping)
+        else _manual_candidate_earnings_review(
+            definitions,
+            benchmark_trade_date=benchmark_trade_date,
+        )
+    )
+
+    candidates = _build_opportunity_candidates(
+        definitions,
+        cash=None,
+        buy_lot_size=DEFAULT_BUY_LOT_SIZE,
+        holding_themes=set(),
+        allow_reference_price_plan=True,
+    )
+    candidates = _apply_manual_candidate_earnings_gate(
+        candidates,
+        manual_earnings_review,
+    )
+    research_candidates = []
+    for candidate in candidates:
+        research_candidates.append(
+            {
+                **candidate,
+                "affordable_with_cash": None,
+                "cash_after_one_lot": None,
+                "cash_usage_pct": None,
+                "decision": {
+                    "action": "observe",
+                    "actionable": False,
+                    "reason_code": "account_data_unavailable",
+                    "suggested_lots": 0,
+                    "suggested_quantity": 0,
+                },
+            }
+        )
+
+    effective_database_status = dict(
+        database_status or {"status": "unavailable", "error_code": "database_error"}
+    )
+    if context is None:
+        market_status = build_market_status_payload(
+            None,
+            database_status=effective_database_status,
+        )
+    else:
+        market_status = build_market_status_payload(
+            None,
+            database_status=effective_database_status,
+            context=context,
+        )
+    external_risk_gate = build_external_risk_gate(
+        normalized_external_risk_level,
+        actionable_equity=None,
+    )
+    market_status_source = str(
+        (market_status.get("meta") or {}).get("source") or "tencent_major_indices"
+    )
+    return {
+        "ok": True,
+        "data": {
+            "mode": "research_only",
+            "database": effective_database_status,
+            "requested_identity": {
+                "username": username,
+                "email": email,
+                "user_id": user_id,
+                "resolved": False,
+            },
+            "account": {
+                "status": "unavailable",
+                "actionable": False,
+                "reason_code": "database_unavailable",
+                "configured_total_assets": None,
+                "cash_or_unallocated": None,
+                "estimated_equity": None,
+            },
+            "decision": {
+                "action": "observe",
+                "actionable": False,
+                "reason_code": "account_data_unavailable",
+                "suggested_lots": 0,
+                "suggested_quantity": 0,
+                "reason": "数据库不可用，无法核验账户、持仓、现金和近期交易，禁止生成仓位数量。",
+            },
+            "external_risk_gate": external_risk_gate,
+            "market_status": market_status.get("data", {}),
+            "candidate_discovery": {
+                "status": "manual_candidates",
+                "source": "cli.candidate_code",
+                "definitions_count": len(definitions),
+                "selected_codes": [definition.get("code") for definition in definitions],
+            },
+            "earnings_review": manual_earnings_review,
+            "deployment_objective": deployment_objective,
+            "candidates": research_candidates,
+            "context": {
+                "horizon": "未来两个交易日",
+                "quote_source": "tencent",
+                "available_data": ["tencent_quote", "technical_price_plan", "corporate_action"],
+                "unavailable_data": ["account", "holdings", "cash", "recent_trades", "position_sizing"],
+            },
+            "disclaimer": "仅供研究参考，不构成投资建议或交易指令。",
+        },
+        "meta": {
+            "schema_version": 7,
+            "source": (
+                "manual_candidates+tencent_quotes+tencent_daily_bars+"
+                f"{EARNINGS_REVIEW_SOURCE}+{market_status_source}+"
                 "cninfo_dividend_calendar"
             ),
             "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -3296,13 +4318,2347 @@ def build_opportunities_payload(
     }
 
 
+def _public_research_candidate_decision(reason_code: str) -> Dict[str, Any]:
+    return {
+        "action": "observe",
+        "actionable": False,
+        "reason_code": reason_code,
+        "suggested_lots": 0,
+        "suggested_quantity": 0,
+    }
+
+
+_PUBLIC_CANDIDATE_DISCOVERY_SCALAR_FIELDS = (
+    "mode",
+    "status",
+    "source",
+    "benchmark_trade_date",
+    "provider_expected_count",
+    "raw_row_count",
+    "unique_row_count",
+    "universe_count",
+    "total_coverage_ratio",
+    "eligible_count",
+    "public_preselected_count",
+    "tencent_requested_count",
+    "tencent_minimum_verified_count",
+    "tencent_verified_count",
+    "tencent_rank_population_count",
+    "selected_count",
+    "technical_checked_count",
+    "technical_screened_count",
+    "technical_passed_count",
+    "technical_selected_count",
+    "technical_closest_rejection_count",
+    "earnings_screened_count",
+    "earnings_blocked_count",
+    "earnings_selected_count",
+    "earnings_report_period",
+    "earnings_actual_report_period",
+)
+_PUBLIC_DISCOVERY_REJECTION_KEYS = {
+    "amplitude_out_of_range",
+    "below_min_amount",
+    "below_min_circ_mv",
+    "below_min_total_mv",
+    "code_mismatch",
+    "duplicate_code",
+    "exchange_mismatch",
+    "invalid_amount",
+    "invalid_limit_up",
+    "invalid_price",
+    "invalid_quote",
+    "invalid_response",
+    "missing_response",
+    "near_limit_up",
+    "outside_move_window",
+    "special_treatment",
+    "stale_quote",
+    "turnover_rate_out_of_range",
+    "unexpected_code",
+    "unsupported_code",
+}
+_PUBLIC_DISCOVERY_QUALITY_KEYS = {
+    "invalid_volume_ratio",
+    "missing_volume_ratio",
+    "non_ideal_volume_ratio",
+    "reduced_amplitude_quality",
+    "reduced_move_quality",
+    "reduced_turnover_quality",
+}
+_PUBLIC_QUOTE_FIELDS = (
+    "source",
+    "provider_timestamp",
+    "trade_at",
+    "trade_date",
+    "received_at",
+    "code",
+    "name",
+    "price",
+    "pct_chg",
+    "change",
+    "open",
+    "high",
+    "low",
+    "pre_close",
+    "amount",
+    "volume",
+    "quote_volume",
+    "turnover_rate",
+    "volume_ratio",
+    "pe_ratio",
+    "pb_ratio",
+    "circ_mv",
+    "total_mv",
+    "intraday_range_pct",
+    "price_plan_adjustment_required",
+    "corporate_action_marker",
+)
+_PUBLIC_QUOTE_FRESHNESS_FIELDS = (
+    "actionable",
+    "status",
+    "reason",
+    "source",
+    "trade_at",
+    "trade_date",
+    "age_seconds",
+    "session",
+)
+_PUBLIC_DISCOVERY_DEFINITION_SCALAR_FIELDS = (
+    "code",
+    "name",
+    "exchange",
+    "theme",
+    "theme_label",
+    "price",
+    "pct_change",
+    "amount",
+    "one_lot_amount",
+    "bucket",
+    "trade_date",
+    "amount_percentile",
+    "move_quality",
+    "public_score",
+    "tencent_price",
+    "tencent_pct_change",
+    "tencent_amount",
+    "tencent_trade_at",
+    "tencent_source",
+    "tencent_bucket",
+    "turnover_rate",
+    "volume_ratio",
+    "amplitude",
+    "circ_mv",
+    "total_mv",
+    "limit_up",
+    "tencent_move_quality",
+    "turnover_quality",
+    "volume_ratio_quality",
+    "amplitude_quality",
+    "tencent_amount_percentile",
+    "tencent_market_cap_percentile",
+    "tencent_score",
+    "tencent_one_lot_amount",
+    "tencent_quality_rank",
+    "selection_lane",
+    "breakout_price",
+    "invalidation_price",
+    "note",
+)
+
+
+def _public_scalar(value: Any) -> bool:
+    return value is None or isinstance(
+        value,
+        (str, int, float, Decimal, bool),
+    )
+
+
+def _copy_public_scalar_fields(
+    value: Any,
+    fields: Iterable[str],
+) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        field: deepcopy(value[field])
+        for field in fields
+        if field in value and _public_scalar(value[field])
+    }
+
+
+def _copy_public_scalar_list(value: Any) -> List[Any]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [deepcopy(item) for item in value if _public_scalar(item)]
+
+
+def _sanitize_public_count_mapping(
+    value: Any,
+    allowed_keys: set[str],
+) -> Dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): int(count)
+        for key, count in value.items()
+        if key in allowed_keys
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= 0
+    }
+
+
+def _sanitize_public_candidate_discovery(value: Any) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(
+        value,
+        _PUBLIC_CANDIDATE_DISCOVERY_SCALAR_FIELDS,
+    )
+    if not isinstance(value, Mapping):
+        return sanitized
+
+    for field in (
+        "provider_expected_exchange_counts",
+        "exchange_counts",
+        "exchange_coverage_ratio",
+    ):
+        raw_mapping = value.get(field)
+        sanitized[field] = _copy_public_scalar_fields(
+            raw_mapping,
+            ("sh", "sz", "bj"),
+        )
+    sanitized["rejection_counts"] = _sanitize_public_count_mapping(
+        value.get("rejection_counts"),
+        _PUBLIC_DISCOVERY_REJECTION_KEYS,
+    )
+    sanitized["quality_counts"] = _sanitize_public_count_mapping(
+        value.get("quality_counts"),
+        _PUBLIC_DISCOVERY_QUALITY_KEYS,
+    )
+    sanitized["technical_screen_status_counts"] = _sanitize_public_count_mapping(
+        value.get("technical_screen_status_counts"),
+        set(PUBLIC_TECHNICAL_SCREEN_STATUS_KEYS),
+    )
+    raw_closest_rejections = value.get("technical_closest_rejections")
+    sanitized["technical_closest_rejections"] = (
+        [
+            _copy_public_scalar_fields(
+                item,
+                (
+                    "code",
+                    "name",
+                    "status",
+                    "net_reward_risk",
+                    "min_net_reward_risk",
+                    "gap_to_min_net_reward_risk",
+                    "tencent_score",
+                    "earnings_review_status",
+                    "actionable",
+                    "is_reference_only",
+                ),
+            )
+            for item in raw_closest_rejections
+            if isinstance(item, Mapping)
+        ]
+        if isinstance(raw_closest_rejections, list)
+        else []
+    )
+    sanitized["earnings_screen_status_counts"] = _sanitize_public_count_mapping(
+        value.get("earnings_screen_status_counts"),
+        set(PUBLIC_EARNINGS_SCREEN_STATUS_KEYS),
+    )
+    sanitized["earnings_actual_status_counts"] = _sanitize_public_count_mapping(
+        value.get("earnings_actual_status_counts"),
+        set(PUBLIC_ACTUAL_EARNINGS_STATUS_KEYS),
+    )
+
+    earnings_results: List[Dict[str, Any]] = []
+    raw_earnings_results = value.get("earnings_screen_results")
+    if isinstance(raw_earnings_results, list):
+        for raw_result in raw_earnings_results:
+            if not isinstance(raw_result, Mapping):
+                continue
+            result = _copy_public_scalar_fields(
+                raw_result,
+                (
+                    "code",
+                    "status",
+                    "blocks_new_position",
+                    "announcement_date",
+                    "reason_summary",
+                ),
+            )
+            result["forecast_types"] = _copy_public_scalar_list(
+                raw_result.get("forecast_types")
+            )
+            result["loss_metrics"] = _copy_public_scalar_list(
+                raw_result.get("loss_metrics")
+            )
+            latest_actual = raw_result.get("latest_actual")
+            if isinstance(latest_actual, Mapping):
+                result["latest_actual"] = _copy_public_scalar_fields(
+                    latest_actual,
+                    (
+                        "status",
+                        "report_period",
+                        "announcement_date",
+                        "net_profit",
+                        "net_profit_yoy_pct",
+                        "net_profit_qoq_pct",
+                        "revenue",
+                        "revenue_yoy_pct",
+                        "revenue_qoq_pct",
+                        "eps",
+                        "book_value_per_share",
+                        "roe_pct",
+                        "operating_cash_flow_per_share",
+                        "gross_margin_pct",
+                        "industry",
+                    ),
+                )
+                result["latest_actual"]["risk_flags"] = (
+                    _copy_public_scalar_list(
+                        latest_actual.get("risk_flags")
+                    )
+                )
+            evidence = raw_result.get("evidence")
+            result["evidence"] = [
+                _copy_public_scalar_fields(
+                    item,
+                    (
+                        "metric",
+                        "forecast_type",
+                        "forecast_value",
+                        "forecast_change_pct",
+                        "forecast_text",
+                    ),
+                )
+                for item in evidence
+                if isinstance(item, Mapping)
+            ] if isinstance(evidence, list) else []
+            earnings_results.append(result)
+    sanitized["earnings_screen_results"] = earnings_results
+
+    stage_sources: Dict[str, Dict[str, Any]] = {}
+    raw_stage_sources = value.get("stage_sources")
+    if isinstance(raw_stage_sources, Mapping):
+        for stage in ("public_snapshot", "tencent_verification"):
+            if stage in raw_stage_sources:
+                stage_sources[stage] = _copy_public_scalar_fields(
+                    raw_stage_sources.get(stage),
+                    ("provider", "status"),
+                )
+    sanitized["stage_sources"] = stage_sources
+    return sanitized
+
+
+def _sanitize_public_candidate_quote(value: Any) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(value, _PUBLIC_QUOTE_FIELDS)
+    if isinstance(value, Mapping) and isinstance(value.get("freshness"), Mapping):
+        sanitized["freshness"] = _copy_public_scalar_fields(
+            value.get("freshness"),
+            _PUBLIC_QUOTE_FRESHNESS_FIELDS,
+        )
+    return sanitized
+
+
+def _sanitize_public_discovery_definition(value: Any) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(
+        value,
+        _PUBLIC_DISCOVERY_DEFINITION_SCALAR_FIELDS,
+    )
+    if isinstance(value, Mapping) and isinstance(
+        value.get("observation_zone"), Mapping
+    ):
+        sanitized["observation_zone"] = _copy_public_scalar_fields(
+            value.get("observation_zone"),
+            ("low", "high"),
+        )
+    elif isinstance(value, Mapping) and "observation_zone" in value:
+        sanitized["observation_zone"] = None
+    return sanitized
+
+
+def _sanitize_public_research_watch_levels(value: Any) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(
+        value,
+        (
+            "status",
+            "actionable",
+            "is_reference_only",
+            "current_price",
+            "nearest_support",
+            "nearest_resistance",
+        ),
+    )
+    if isinstance(value, Mapping):
+        for field in (
+            "lower_supports",
+            "higher_resistances",
+            "supports",
+            "resistances",
+        ):
+            if field in value:
+                sanitized[field] = _copy_public_scalar_list(value.get(field))
+    return sanitized
+
+
+def _sanitize_public_guarded_price_plan(value: Any) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(
+        value,
+        (
+            "actionable",
+            "status",
+            "quote_status",
+            "required_rows",
+            "available_rows",
+            "source",
+            "as_of",
+            "current_price",
+            "stop_loss_price",
+            "suggested_buy_price",
+            "suggested_sell_price",
+            "target_price",
+            "history_status",
+            "quote_merge_action",
+            "price_ratio",
+            "reason",
+            "min_net_reward_risk",
+            "entry_strategy",
+            "entry_basis",
+            "entry_source",
+            "stop_basis",
+            "stop_source",
+            "target_source",
+            "pullback_required",
+            "distance_to_entry_pct",
+            "max_pullback_distance_pct",
+            "reference_actionable",
+            "is_reference_only",
+        ),
+    )
+    if not isinstance(value, Mapping):
+        return sanitized
+
+    for field in (
+        "support_candidates",
+        "resistance_candidates",
+        "missing_levels",
+        "failed_gates",
+        "execution_blocked_by",
+    ):
+        if field in value:
+            sanitized[field] = _copy_public_scalar_list(value.get(field))
+
+    nested_scalar_fields = {
+        "metrics": (
+            "ma5",
+            "ma10",
+            "ma20",
+            "ma60",
+            "boll_mid",
+            "boll_upper",
+            "boll_lower",
+            "recent_5_low",
+            "recent_20_low",
+            "recent_20_high",
+        ),
+        "levels": (
+            "reference_support",
+            "invalidation_basis",
+            "resistance_1",
+            "resistance_2",
+            "resistance_3",
+        ),
+        "rounding": (
+            "tick",
+            "stop_buffer_pct",
+            "breakout_buffer_pct",
+            "stop_mode",
+            "breakout_mode",
+            "entry_buffer_pct",
+            "entry_mode",
+            "default_mode",
+        ),
+        "fee_aware_trade": (
+            "risk_amount",
+            "reward_amount",
+            "net_reward_risk",
+        ),
+        "trend_context": (
+            "state",
+            "recovery_required",
+            "bearish_short_term_alignment",
+            "drawdown_from_20d_high_pct",
+            "distance_to_entry_pct",
+            "deep_drawdown_threshold_pct",
+        ),
+    }
+    for field, fields in nested_scalar_fields.items():
+        if isinstance(value.get(field), Mapping):
+            sanitized[field] = _copy_public_scalar_fields(value.get(field), fields)
+    if isinstance(value.get("trend_context"), Mapping):
+        allowed_averages = {"ma5", "ma10", "ma20", "ma60"}
+        sanitized.setdefault("trend_context", {})["below_key_averages"] = (
+            [
+                item
+                for item in _copy_public_scalar_list(
+                    value["trend_context"].get("below_key_averages")
+                )
+                if item in allowed_averages
+            ]
+        )
+    if isinstance(value.get("research_watch_levels"), Mapping):
+        sanitized["research_watch_levels"] = _sanitize_public_research_watch_levels(
+            value.get("research_watch_levels")
+        )
+    if isinstance(value.get("history"), Mapping):
+        sanitized["history"] = {
+            "historical_volume": _copy_public_scalar_list(
+                value["history"].get("historical_volume")
+            )
+        }
+    return sanitized
+
+
+def _sanitize_public_corporate_action(value: Any) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(
+        value,
+        (
+            "ok",
+            "source",
+            "code",
+            "status",
+            "blocks_new_position",
+            "price_plan_adjustment_required",
+            "sessions_until_ex_date",
+            "reason",
+            "is_reference_only",
+        ),
+    )
+    if isinstance(value, Mapping) and isinstance(
+        value.get("nearest_action"), Mapping
+    ):
+        sanitized["nearest_action"] = _copy_public_scalar_fields(
+            value.get("nearest_action"),
+            (
+                "announcement_date",
+                "action_type",
+                "record_date",
+                "ex_date",
+                "payment_date",
+                "cash_dividend_per_share",
+                "description",
+                "report_period",
+            ),
+        )
+    elif isinstance(value, Mapping) and "nearest_action" in value:
+        sanitized["nearest_action"] = None
+    return sanitized
+
+
+def _sanitize_public_risk_flags(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    fields = (
+        "key",
+        "level",
+        "message",
+        "quote_status",
+        "plan_status",
+        "marker",
+        "provider_name",
+        "record_date",
+        "ex_date",
+        "sessions_until_ex_date",
+        "reason",
+        "cash_usage_pct",
+        "cash_after_one_lot",
+        "pct_chg",
+        "turnover_rate",
+        "intraday_range_pct",
+        "drawdown_from_20d_high_pct",
+        "distance_to_entry_pct",
+    )
+    return [
+        _copy_public_scalar_fields(flag, fields)
+        for flag in value
+        if isinstance(flag, Mapping)
+    ]
+
+
+def _sanitize_public_triggers(value: Any) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(
+        value,
+        (
+            "source",
+            "breakout_price",
+            "invalidation_price",
+            "note",
+            "is_reference_only",
+        ),
+    )
+    if not isinstance(value, Mapping):
+        return sanitized
+    if isinstance(value.get("observation_zone"), Mapping):
+        sanitized["observation_zone"] = _copy_public_scalar_fields(
+            value.get("observation_zone"),
+            ("low", "high"),
+        )
+    elif "observation_zone" in value:
+        sanitized["observation_zone"] = None
+    if isinstance(value.get("status"), Mapping):
+        sanitized["status"] = _copy_public_scalar_fields(
+            value.get("status"),
+            (
+                "position",
+                "breakout_status",
+                "distance_to_observation_low_pct",
+                "distance_to_observation_high_pct",
+                "distance_to_breakout_pct",
+                "distance_to_invalidation_pct",
+            ),
+        )
+    return sanitized
+
+
+def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str, Any]:
+    sanitized = _copy_public_scalar_fields(
+        value,
+        (
+            "code",
+            "name",
+            "theme",
+            "theme_label",
+            "buy_lot_size",
+            "one_lot_amount",
+            "is_reference_only",
+        ),
+    )
+    if isinstance(value.get("quote"), Mapping):
+        sanitized["quote"] = _sanitize_public_candidate_quote(value.get("quote"))
+    if isinstance(value.get("guarded_price_plan"), Mapping):
+        sanitized["guarded_price_plan"] = _sanitize_public_guarded_price_plan(
+            value.get("guarded_price_plan")
+        )
+    if isinstance(value.get("corporate_action"), Mapping):
+        sanitized["corporate_action"] = _sanitize_public_corporate_action(
+            value.get("corporate_action")
+        )
+    if "risk_flags" in value:
+        sanitized["risk_flags"] = _sanitize_public_risk_flags(
+            value.get("risk_flags")
+        )
+    if isinstance(value.get("triggers"), Mapping):
+        sanitized["triggers"] = _sanitize_public_triggers(value.get("triggers"))
+    return sanitized
+
+
+def _public_discovery_evidence(
+    definition: Mapping[str, Any],
+    *,
+    priority: int,
+) -> Dict[str, Any]:
+    tencent_evidence = {
+        "source": definition.get("tencent_source"),
+        "bucket": definition.get("tencent_bucket"),
+        "score": definition.get("tencent_score"),
+        "price": definition.get("tencent_price"),
+        "pct_change": definition.get("tencent_pct_change"),
+        "amount": definition.get("tencent_amount"),
+        "trade_at": definition.get("tencent_trade_at"),
+        "amount_percentile": definition.get(
+            "tencent_amount_percentile"
+        ),
+        "market_cap_percentile": definition.get(
+            "tencent_market_cap_percentile"
+        ),
+        "move_quality": definition.get("tencent_move_quality"),
+        "turnover_rate": definition.get("turnover_rate"),
+        "turnover_quality": definition.get("turnover_quality"),
+        "volume_ratio": definition.get("volume_ratio"),
+        "volume_ratio_quality": definition.get("volume_ratio_quality"),
+        "amplitude": definition.get("amplitude"),
+        "amplitude_quality": definition.get("amplitude_quality"),
+        "circ_mv": definition.get("circ_mv"),
+        "total_mv": definition.get("total_mv"),
+        "limit_up": definition.get("limit_up"),
+    }
+    optional_selection_fields = {
+        "one_lot_amount": definition.get("tencent_one_lot_amount"),
+        "quality_rank": definition.get("tencent_quality_rank"),
+        "selection_lane": definition.get("selection_lane"),
+    }
+    if all(value is not None for value in optional_selection_fields.values()):
+        tencent_evidence.update(optional_selection_fields)
+
+    return {
+        "source": "public_full_market",
+        "trade_date": definition.get("trade_date"),
+        "public_rank": priority,
+        "public": {
+            "bucket": definition.get("bucket"),
+            "score": definition.get("public_score"),
+            "price": definition.get("price"),
+            "pct_change": definition.get("pct_change"),
+            "amount": definition.get("amount"),
+            "one_lot_amount": definition.get("one_lot_amount"),
+            "amount_percentile": definition.get("amount_percentile"),
+            "move_quality": definition.get("move_quality"),
+        },
+        "tencent": tencent_evidence,
+    }
+
+
+def _normalize_public_discovery_definitions(
+    definitions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized_definitions: List[Dict[str, Any]] = []
+    for priority, raw_definition in enumerate(definitions, start=1):
+        definition = _sanitize_public_discovery_definition(raw_definition)
+        definition["priority"] = priority
+        definition["discovery"] = _public_discovery_evidence(
+            definition,
+            priority=priority,
+        )
+        normalized_definitions.append(definition)
+    return normalized_definitions
+
+
+def _normalize_public_research_candidates(
+    candidates: List[Dict[str, Any]],
+    definitions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    definitions_by_code = {
+        definition["code"]: definition for definition in definitions
+    }
+    normalized_candidates: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        normalized = deepcopy(candidate)
+        definition = definitions_by_code[normalized["code"]]
+        normalized["priority"] = definition["priority"]
+        normalized["discovery"] = deepcopy(definition["discovery"])
+        triggers = normalized.get("triggers")
+        normalized["triggers"] = {
+            **(dict(triggers) if isinstance(triggers, Mapping) else {}),
+            "source": "public_full_market",
+        }
+
+        guarded_price_plan = normalized.get("guarded_price_plan")
+        if isinstance(guarded_price_plan, dict):
+            fee_aware_trade = guarded_price_plan.get("fee_aware_trade")
+            if isinstance(fee_aware_trade, dict):
+                for order_key in ("entry_order", "stop_order", "target_order"):
+                    fee_aware_trade.pop(order_key, None)
+
+        normalized.update(
+            {
+                "affordable_with_cash": None,
+                "cash_after_one_lot": None,
+                "cash_usage_pct": None,
+                "same_theme_with_holdings": None,
+                "is_reference_only": True,
+                "decision": _public_research_candidate_decision(
+                    "public_research_only"
+                ),
+            }
+        )
+        normalized_candidates.append(normalized)
+    return normalized_candidates
+
+
+def _raise_candidate_discovery_consistency_error(message: str) -> None:
+    raise CLIError(
+        message,
+        code="candidate_discovery_unavailable",
+        exit_code=4,
+        stage="candidate_discovery",
+    )
+
+
+def _is_finite_discovery_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _valid_public_nonnegative_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_public_coverage_ratio(value: Any) -> bool:
+    return _is_finite_discovery_number(value) and 0 <= float(value) <= 1
+
+
+def _valid_public_count_mapping(
+    value: Any,
+    *,
+    allowed_keys: set[str],
+) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value).issubset(allowed_keys)
+        and all(_valid_public_nonnegative_count(count) for count in value.values())
+    )
+
+
+def _valid_public_candidate_discovery_metadata(
+    value: Any,
+    *,
+    discovery_status: str,
+    tencent_stage_status: Any,
+    raw_definitions: Any,
+) -> bool:
+    if not isinstance(value, Mapping) or not isinstance(raw_definitions, list):
+        return False
+    if (
+        value.get("mode") != "public_full_market"
+        or value.get("status") != discovery_status
+        or not isinstance(value.get("source"), str)
+        or not str(value.get("source")).strip()
+        or not _valid_opportunity_benchmark_trade_date(
+            value.get("benchmark_trade_date")
+        )
+    ):
+        return False
+
+    count_fields = (
+        "provider_expected_count",
+        "raw_row_count",
+        "unique_row_count",
+        "universe_count",
+        "eligible_count",
+        "public_preselected_count",
+        "tencent_requested_count",
+        "tencent_minimum_verified_count",
+        "tencent_verified_count",
+        "tencent_rank_population_count",
+        "selected_count",
+        "technical_checked_count",
+        "technical_screened_count",
+        "technical_passed_count",
+        "technical_selected_count",
+        "technical_closest_rejection_count",
+        "earnings_screened_count",
+        "earnings_blocked_count",
+        "earnings_selected_count",
+    )
+    if any(
+        field not in value or not _valid_public_nonnegative_count(value.get(field))
+        for field in count_fields
+    ):
+        return False
+    if value["provider_expected_count"] <= 0 or value["universe_count"] <= 0:
+        return False
+
+    exchanges = {"sh", "sz", "bj"}
+    provider_expected_exchange_counts = value.get(
+        "provider_expected_exchange_counts"
+    )
+    exchange_counts = value.get("exchange_counts")
+    exchange_coverage_ratio = value.get("exchange_coverage_ratio")
+    if (
+        not isinstance(provider_expected_exchange_counts, Mapping)
+        or set(provider_expected_exchange_counts) != exchanges
+        or not all(
+            _valid_public_nonnegative_count(count) and count > 0
+            for count in provider_expected_exchange_counts.values()
+        )
+        or not isinstance(exchange_counts, Mapping)
+        or set(exchange_counts) != exchanges
+        or not all(
+            _valid_public_nonnegative_count(count)
+            for count in exchange_counts.values()
+        )
+        or not isinstance(exchange_coverage_ratio, Mapping)
+        or set(exchange_coverage_ratio) != exchanges
+        or not all(
+            _valid_public_coverage_ratio(ratio)
+            for ratio in exchange_coverage_ratio.values()
+        )
+        or not _valid_public_coverage_ratio(value.get("total_coverage_ratio"))
+    ):
+        return False
+
+    if (
+        sum(provider_expected_exchange_counts.values())
+        != value["provider_expected_count"]
+        or sum(exchange_counts.values()) != value["universe_count"]
+        or not math.isclose(
+            float(value["total_coverage_ratio"]),
+            value["universe_count"] / value["provider_expected_count"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or any(
+            not math.isclose(
+                float(exchange_coverage_ratio[exchange]),
+                exchange_counts[exchange]
+                / provider_expected_exchange_counts[exchange],
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            for exchange in exchanges
+        )
+        or float(value["total_coverage_ratio"])
+        < MIN_PUBLIC_SNAPSHOT_COVERAGE_RATIO
+        or any(
+            float(exchange_coverage_ratio[exchange])
+            < MIN_PUBLIC_SNAPSHOT_COVERAGE_RATIO
+            for exchange in exchanges
+        )
+        or value["raw_row_count"] < value["unique_row_count"]
+        or value["unique_row_count"] != value["universe_count"]
+        or value["selected_count"] != len(raw_definitions)
+        or value["technical_checked_count"] != 0
+        or value["technical_screened_count"] != 0
+        or value["technical_passed_count"] != 0
+        or value["technical_selected_count"] != 0
+        or value["technical_closest_rejection_count"] != 0
+        or value["earnings_screened_count"] != 0
+        or value["earnings_blocked_count"] != 0
+        or value["earnings_selected_count"] != 0
+        or value["public_preselected_count"] > value["eligible_count"]
+        or value["tencent_requested_count"]
+        != value["public_preselected_count"]
+        or value["tencent_minimum_verified_count"]
+        != max(
+            math.ceil(0.8 * value["tencent_requested_count"]),
+            min(20, value["tencent_requested_count"]),
+        )
+        or value["tencent_minimum_verified_count"]
+        > value["tencent_requested_count"]
+        or value["tencent_verified_count"] > value["tencent_requested_count"]
+        or value["tencent_verified_count"]
+        < value["tencent_minimum_verified_count"]
+        or value["tencent_rank_population_count"]
+        > value["tencent_verified_count"]
+        or value["selected_count"] > value["tencent_rank_population_count"]
+    ):
+        return False
+    if discovery_status == "ok" and value["selected_count"] <= 0:
+        return False
+    if discovery_status == "no_eligible_candidates" and value["selected_count"] != 0:
+        return False
+
+    if not _valid_public_count_mapping(
+        value.get("rejection_counts"),
+        allowed_keys=_PUBLIC_DISCOVERY_REJECTION_KEYS,
+    ) or not _valid_public_count_mapping(
+        value.get("quality_counts"),
+        allowed_keys=_PUBLIC_DISCOVERY_QUALITY_KEYS,
+    ) or not _valid_public_count_mapping(
+        value.get("technical_screen_status_counts"),
+        allowed_keys=set(PUBLIC_TECHNICAL_SCREEN_STATUS_KEYS),
+    ) or not _valid_public_count_mapping(
+        value.get("earnings_screen_status_counts"),
+        allowed_keys=set(PUBLIC_EARNINGS_SCREEN_STATUS_KEYS),
+    ) or not _valid_public_count_mapping(
+        value.get("earnings_actual_status_counts"),
+        allowed_keys=set(PUBLIC_ACTUAL_EARNINGS_STATUS_KEYS),
+    ):
+        return False
+    if (
+        value.get("technical_screen_status_counts")
+        or value.get("technical_closest_rejections")
+        or value.get("earnings_screen_status_counts")
+        or value.get("earnings_actual_status_counts")
+        or value.get("earnings_screen_results")
+        or value.get("earnings_report_period") is not None
+        or value.get("earnings_actual_report_period") is not None
+    ):
+        return False
+
+    stage_sources = value.get("stage_sources")
+    public_stage = (
+        stage_sources.get("public_snapshot")
+        if isinstance(stage_sources, Mapping)
+        else None
+    )
+    tencent_stage = (
+        stage_sources.get("tencent_verification")
+        if isinstance(stage_sources, Mapping)
+        else None
+    )
+    return bool(
+        isinstance(public_stage, Mapping)
+        and public_stage.get("provider") == "akshare.sina.stock_zh_a_spot"
+        and public_stage.get("status") == "ok"
+        and isinstance(tencent_stage, Mapping)
+        and tencent_stage.get("provider") == "tencent_batch_quotes"
+        and isinstance(tencent_stage.get("status"), str)
+        and tencent_stage.get("status") == tencent_stage_status
+    )
+
+
+def _parse_public_trade_at(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if _PUBLIC_TRADE_AT_PATTERN.fullmatch(text) is None:
+        return None
+    return _parse_trade_datetime(text)
+
+
+def _same_public_quote_number(
+    actual: Any,
+    expected: Any,
+    *,
+    optional: bool = False,
+) -> bool:
+    if optional and expected is None:
+        return actual is None
+    return bool(
+        _is_finite_discovery_number(actual)
+        and _is_finite_discovery_number(expected)
+        and math.isclose(
+            float(actual),
+            float(expected),
+            rel_tol=1e-12,
+            abs_tol=1e-6,
+        )
+    )
+
+
+def _valid_public_discovery_evidence_definition(
+    definition: Mapping[str, Any],
+    quote: Mapping[str, Any],
+    *,
+    benchmark_trade_date: str,
+) -> bool:
+    trade_date = definition.get("trade_date")
+    definition_trade_at = _parse_public_trade_at(
+        definition.get("tencent_trade_at")
+    )
+    quote_trade_at = _parse_public_trade_at(quote.get("trade_at"))
+    if (
+        not _valid_opportunity_benchmark_trade_date(trade_date)
+        or trade_date != benchmark_trade_date
+        or quote.get("trade_date") != trade_date
+        or quote.get("source") != "tencent"
+        or definition_trade_at is None
+        or quote_trade_at is None
+        or definition_trade_at != quote_trade_at
+        or definition_trade_at.astimezone(
+            ZoneInfo(CN_MARKET_TIMEZONE)
+        ).date().isoformat()
+        != trade_date
+    ):
+        return False
+    if (
+        definition.get("bucket") not in {"strength", "pullback"}
+        or definition.get("tencent_bucket") not in {"strength", "pullback"}
+        or definition.get("tencent_source") != "tencent_batch_quotes"
+    ):
+        return False
+
+    positive_fields = (
+        "price",
+        "amount",
+        "one_lot_amount",
+        "tencent_price",
+        "tencent_amount",
+        "circ_mv",
+        "total_mv",
+    )
+    if any(
+        not _is_finite_discovery_number(definition.get(field))
+        or float(definition[field]) <= 0
+        for field in positive_fields
+    ):
+        return False
+
+    selection_fields = (
+        "tencent_one_lot_amount",
+        "tencent_quality_rank",
+        "selection_lane",
+    )
+    selection_field_presence = [field in definition for field in selection_fields]
+    if any(selection_field_presence):
+        quality_rank = definition.get("tencent_quality_rank")
+        if (
+            not all(selection_field_presence)
+            or not _is_finite_discovery_number(
+                definition.get("tencent_one_lot_amount")
+            )
+            or float(definition["tencent_one_lot_amount"]) <= 0
+            or not isinstance(quality_rank, int)
+            or isinstance(quality_rank, bool)
+            or quality_rank < 1
+            or definition.get("selection_lane")
+            not in {"quality_core", "one_lot_diversity", "quality_fill"}
+            or not _same_public_quote_number(
+                definition.get("tencent_one_lot_amount"),
+                float(definition["tencent_price"]) * DEFAULT_BUY_LOT_SIZE,
+            )
+        ):
+            return False
+
+    unit_interval_fields = (
+        "public_score",
+        "amount_percentile",
+        "move_quality",
+        "tencent_score",
+        "tencent_amount_percentile",
+        "tencent_market_cap_percentile",
+        "tencent_move_quality",
+        "turnover_quality",
+        "volume_ratio_quality",
+        "amplitude_quality",
+    )
+    if any(
+        not _is_finite_discovery_number(definition.get(field))
+        or not 0 <= float(definition[field]) <= 1
+        for field in unit_interval_fields
+    ):
+        return False
+
+    finite_fields = ("pct_change", "tencent_pct_change")
+    if any(
+        not _is_finite_discovery_number(definition.get(field))
+        for field in finite_fields
+    ):
+        return False
+
+    turnover_rate = definition.get("turnover_rate")
+    amplitude = definition.get("amplitude")
+    if (
+        not _is_finite_discovery_number(turnover_rate)
+        or not 0 <= float(turnover_rate) <= 10
+        or not _is_finite_discovery_number(amplitude)
+        or not 0 <= float(amplitude) <= 8
+    ):
+        return False
+
+    if "volume_ratio" not in definition or "limit_up" not in definition:
+        return False
+    volume_ratio = definition.get("volume_ratio")
+    if volume_ratio is not None and (
+        not _is_finite_discovery_number(volume_ratio)
+        or float(volume_ratio) < 0
+    ):
+        return False
+    limit_up = definition.get("limit_up")
+    if limit_up is not None and (
+        not _is_finite_discovery_number(limit_up)
+        or float(limit_up) <= 0
+    ):
+        return False
+
+    quote_price = quote.get("price")
+    if quote_price is None:
+        quote_price = quote.get("close")
+    required_quote_bindings = (
+        (definition.get("tencent_price"), quote_price),
+        (definition.get("tencent_pct_change"), quote.get("pct_chg")),
+        (definition.get("tencent_amount"), quote.get("amount")),
+        (definition.get("turnover_rate"), quote.get("turnover_rate")),
+        (definition.get("amplitude"), quote.get("amplitude")),
+        (definition.get("circ_mv"), quote.get("circ_mv")),
+        (definition.get("total_mv"), quote.get("total_mv")),
+    )
+    if any(
+        not _same_public_quote_number(actual, expected)
+        for actual, expected in required_quote_bindings
+    ):
+        return False
+    if (
+        not _same_public_quote_number(
+            definition.get("one_lot_amount"),
+            float(definition["price"]) * DEFAULT_BUY_LOT_SIZE,
+        )
+        or not _same_public_quote_number(
+            definition.get("volume_ratio"),
+            quote.get("volume_ratio"),
+            optional=True,
+        )
+        or not _same_public_quote_number(
+            definition.get("limit_up"),
+            quote.get("limit_up"),
+            optional=True,
+        )
+    ):
+        return False
+    return True
+
+
+def _validate_completed_public_discovery(
+    discovery_status: str,
+    tencent_stage_status: Any,
+    raw_definitions: Any,
+    raw_quote_map: Any,
+    *,
+    benchmark_trade_date: Any,
+    candidate_discovery: Any,
+) -> tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    if not _valid_opportunity_benchmark_trade_date(benchmark_trade_date):
+        _raise_candidate_discovery_consistency_error(
+            "公开全市场基准交易日无效"
+        )
+    if not _valid_public_candidate_discovery_metadata(
+        candidate_discovery,
+        discovery_status=discovery_status,
+        tencent_stage_status=tencent_stage_status,
+        raw_definitions=raw_definitions,
+    ):
+        _raise_candidate_discovery_consistency_error(
+            "公开全市场候选覆盖证据无效"
+        )
+    if not isinstance(raw_definitions, list) or not isinstance(
+        raw_quote_map,
+        Mapping,
+    ):
+        _raise_candidate_discovery_consistency_error(
+            "公开全市场候选发现结果不完整"
+        )
+
+    if discovery_status == "no_eligible_candidates":
+        if raw_definitions:
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场无候选状态与候选数据不一致"
+            )
+        if tencent_stage_status == "not_called_no_preselection":
+            if raw_quote_map:
+                _raise_candidate_discovery_consistency_error(
+                    "公开全市场预筛选为空时不应包含腾讯行情"
+                )
+        elif tencent_stage_status == "ok":
+            for code, raw_quote in raw_quote_map.items():
+                if (
+                    not isinstance(code, str)
+                    or A_SHARE_STOCK_CODE_PATTERN.fullmatch(code) is None
+                    or not isinstance(raw_quote, Mapping)
+                    or raw_quote.get("code") != code
+                ):
+                    _raise_candidate_discovery_consistency_error(
+                        "公开全市场已验证行情标识不一致"
+                    )
+        else:
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场无候选状态与腾讯验证阶段不一致"
+            )
+        return [], {}
+
+    if tencent_stage_status != "ok":
+        _raise_candidate_discovery_consistency_error(
+            "公开全市场候选缺少成功的腾讯验证阶段"
+        )
+
+    if not 1 <= len(raw_definitions) <= MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES:
+        _raise_candidate_discovery_consistency_error(
+            "公开全市场候选数量不符合约束"
+        )
+
+    definitions: List[Dict[str, Any]] = []
+    quote_map: Dict[str, Dict[str, Any]] = {}
+    seen_codes = set()
+    for raw_definition in raw_definitions:
+        if not isinstance(raw_definition, Mapping):
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场候选定义无效"
+            )
+        code = raw_definition.get("code")
+        if (
+            not isinstance(code, str)
+            or A_SHARE_STOCK_CODE_PATTERN.fullmatch(code) is None
+            or code in seen_codes
+        ):
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场候选代码无效或重复"
+            )
+        seen_codes.add(code)
+        if code not in raw_quote_map:
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场候选缺少已验证行情"
+            )
+        raw_quote = raw_quote_map[code]
+        if not isinstance(raw_quote, Mapping) or raw_quote.get("code") != code:
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场候选行情标识不一致"
+            )
+        if not _valid_public_discovery_evidence_definition(
+            raw_definition,
+            raw_quote,
+            benchmark_trade_date=benchmark_trade_date,
+        ):
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场候选排名证据无效"
+            )
+        definitions.append(deepcopy(dict(raw_definition)))
+        quote_map[code] = deepcopy(dict(raw_quote))
+    return definitions, quote_map
+
+
+def _validated_public_technical_screen(
+    value: Any,
+    definitions: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    normalized, error = validate_public_technical_screen_metadata(
+        value,
+        expected_definitions=definitions,
+    )
+    if error or normalized is None:
+        raise CLIError(
+            "公开候选技术初筛证据无效",
+            code="technical_deep_check_failed",
+            exit_code=4,
+            stage="technical_deep_check",
+        )
+    return normalized
+
+
+def _validated_public_earnings_screen(
+    value: Any,
+    technical_screen: Mapping[str, Any],
+    *,
+    benchmark_trade_date: str,
+) -> Dict[str, Any]:
+    expected_codes = technical_screen.get("selected_codes")
+    try:
+        expected_report_period = latest_completed_reporting_period(
+            benchmark_trade_date
+        )
+        expected_actual_report_period = latest_mandatory_actual_reporting_period(
+            benchmark_trade_date
+        )
+    except ValueError:
+        expected_report_period = ""
+        expected_actual_report_period = ""
+    normalized, error = validate_public_earnings_screen_metadata(
+        value,
+        expected_codes=(expected_codes if isinstance(expected_codes, list) else []),
+        expected_report_period=expected_report_period,
+        expected_actual_report_period=expected_actual_report_period,
+        benchmark_trade_date=benchmark_trade_date,
+    )
+    if error or normalized is None:
+        raise CLIError(
+            "公开候选业绩复核证据无效",
+            code="technical_deep_check_failed",
+            exit_code=4,
+            stage="earnings_forecast_review",
+        )
+    return normalized
+
+
+def _ordered_public_deep_check_candidates(
+    candidates: Any,
+    definitions: List[Dict[str, Any]],
+    quote_map: Mapping[str, Dict[str, Any]],
+    *,
+    selected_codes: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    expected_codes = (
+        list(selected_codes)
+        if selected_codes is not None
+        else [definition["code"] for definition in definitions]
+    )
+    if not isinstance(candidates, list) or len(candidates) != len(expected_codes):
+        raise CLIError(
+            "公开候选技术深检结果与候选发现不一致",
+            code="technical_deep_check_failed",
+            exit_code=4,
+            stage="technical_deep_check",
+        )
+
+    candidates_by_code: Dict[str, Dict[str, Any]] = {}
+    definitions_by_code = {
+        definition["code"]: definition for definition in definitions
+    }
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            break
+        code = candidate.get("code")
+        quote = candidate.get("quote")
+        guarded_price_plan = candidate.get("guarded_price_plan")
+        definition = definitions_by_code.get(code)
+        source_quote = quote_map.get(code) if isinstance(code, str) else None
+        expected_quote = (
+            _quote_snapshot(dict(source_quote), dict(definition))
+            if isinstance(source_quote, Mapping)
+            and isinstance(definition, Mapping)
+            else None
+        )
+        definition_trade_at = (
+            _parse_public_trade_at(definition.get("tencent_trade_at"))
+            if isinstance(definition, Mapping)
+            else None
+        )
+        quote_trade_at = (
+            _parse_public_trade_at(quote.get("trade_at"))
+            if isinstance(quote, Mapping)
+            else None
+        )
+        if (
+            not isinstance(code, str)
+            or code in candidates_by_code
+            or not isinstance(definition, Mapping)
+            or not isinstance(expected_quote, Mapping)
+            or not isinstance(candidate.get("name"), str)
+            or not str(candidate.get("name")).strip()
+            or not isinstance(quote, Mapping)
+            or quote.get("source") != "tencent"
+            or quote.get("code") != code
+            or quote.get("trade_date") != definition.get("trade_date")
+            or definition_trade_at is None
+            or quote_trade_at is None
+            or quote_trade_at != definition_trade_at
+            or not _same_public_quote_number(
+                quote.get("price"),
+                expected_quote.get("price"),
+            )
+            or not _same_public_quote_number(
+                quote.get("amount"),
+                expected_quote.get("amount"),
+            )
+            or not _same_public_quote_number(
+                quote.get("volume"),
+                expected_quote.get("volume"),
+            )
+            or not _same_public_quote_number(
+                quote.get("quote_volume"),
+                expected_quote.get("quote_volume"),
+                optional=True,
+            )
+            or not _same_public_quote_number(
+                quote.get("pe_ratio"),
+                expected_quote.get("pe_ratio"),
+                optional=True,
+            )
+            or not _same_public_quote_number(
+                quote.get("pb_ratio"),
+                expected_quote.get("pb_ratio"),
+                optional=True,
+            )
+            or not _same_public_quote_number(
+                quote.get("circ_mv"),
+                expected_quote.get("circ_mv"),
+            )
+            or not _same_public_quote_number(
+                quote.get("total_mv"),
+                expected_quote.get("total_mv"),
+            )
+            or not _is_finite_discovery_number(quote.get("price"))
+            or float(quote["price"]) <= 0
+            or not _is_finite_discovery_number(quote.get("amount"))
+            or float(quote["amount"]) <= 0
+            or not _is_finite_discovery_number(quote.get("volume"))
+            or float(quote["volume"]) <= 0
+            or not isinstance(guarded_price_plan, Mapping)
+            or not isinstance(guarded_price_plan.get("status"), str)
+            or not str(guarded_price_plan.get("status")).strip()
+            or not isinstance(guarded_price_plan.get("actionable"), bool)
+        ):
+            break
+        candidates_by_code[code] = _sanitize_public_deep_check_candidate(
+            candidate
+        )
+    else:
+        if set(candidates_by_code) == set(expected_codes):
+            return [candidates_by_code[code] for code in expected_codes]
+
+    raise CLIError(
+        "公开候选技术深检结果与候选发现不一致",
+        code="technical_deep_check_failed",
+        exit_code=4,
+        stage="technical_deep_check",
+    )
+
+
+def _build_public_timeout_research_candidates(
+    definitions: List[Dict[str, Any]],
+    quote_map: Mapping[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    timeout_reason = "技术深检超时，未形成可执行价格计划，仅保留腾讯已验证行情供观察。"
+    for raw_definition in definitions:
+        definition = deepcopy(dict(raw_definition))
+        code = definition["code"]
+        raw_quote = quote_map[code]
+        snapshot = _quote_snapshot(dict(raw_quote), definition)
+        for field in ("volume", "quote_volume"):
+            if field in raw_quote:
+                snapshot[field] = deepcopy(raw_quote[field])
+        snapshot = _sanitize_public_candidate_quote(snapshot)
+        candidates.append(
+            {
+                "code": code,
+                "name": snapshot.get("name") or definition.get("name"),
+                "theme": definition.get("theme"),
+                "theme_label": definition.get("theme_label"),
+                "priority": definition.get("priority"),
+                "discovery": deepcopy(definition.get("discovery")),
+                "quote": snapshot,
+                "plan_status": "technical_deep_check_timeout",
+                "guarded_price_plan": {
+                    "status": "technical_deep_check_timeout",
+                    "actionable": False,
+                    "reference_actionable": False,
+                    "reason": timeout_reason,
+                    "execution_blocked_by": [
+                        "technical_deep_check_timeout",
+                        "account_data_unavailable",
+                    ],
+                    "is_reference_only": True,
+                },
+                "risk_status": {
+                    "status": "observation_only",
+                    "new_position_allowed": False,
+                    "reason_code": "technical_deep_check_timeout",
+                    "reason": timeout_reason,
+                },
+                "risk_flags": [
+                    {
+                        "code": "technical_deep_check_timeout",
+                        "severity": "warning",
+                        "message": timeout_reason,
+                    }
+                ],
+                "triggers": {
+                    "source": "public_full_market",
+                    "observation_zone": deepcopy(
+                        definition.get("observation_zone")
+                    ),
+                    "breakout_price": definition.get("breakout_price"),
+                    "invalidation_price": definition.get("invalidation_price"),
+                    "note": definition.get("note"),
+                    "is_reference_only": True,
+                },
+                "affordable_with_cash": None,
+                "cash_after_one_lot": None,
+                "cash_usage_pct": None,
+                "same_theme_with_holdings": None,
+                "is_reference_only": True,
+                "decision": _public_research_candidate_decision(
+                    "technical_deep_check_timeout"
+                ),
+            }
+        )
+    return candidates
+
+
+def build_public_research_opportunities_payload(
+    discovery_result: Mapping[str, Any],
+    deep_check_result: Optional[Mapping[str, Any]],
+    *,
+    external_risk_level: Optional[str] = None,
+    database_status: Optional[Dict[str, Any]] = None,
+    context: Optional[OpportunityMarketContext] = None,
+) -> Dict[str, Any]:
+    """Build account-independent output from completed public discovery."""
+    if (
+        not isinstance(context, OpportunityMarketContext)
+        or context.public_snapshot_loaded is not True
+        or not isinstance(context.public_snapshot, Mapping)
+    ):
+        raise CLIError(
+            "公开市场上下文未准备完成",
+            code="candidate_discovery_unavailable",
+            exit_code=4,
+            stage="market_context",
+        )
+
+    discovery_status = (
+        discovery_result.get("status")
+        if isinstance(discovery_result, Mapping)
+        else None
+    )
+    raw_candidate_discovery = (
+        discovery_result.get("candidate_discovery")
+        if isinstance(discovery_result, Mapping)
+        else None
+    )
+    if (
+        discovery_status not in {"ok", "no_eligible_candidates"}
+        or not isinstance(raw_candidate_discovery, Mapping)
+        or raw_candidate_discovery.get("status") != discovery_status
+    ):
+        stage = (
+            discovery_result.get("stage")
+            if isinstance(discovery_result, Mapping)
+            else None
+        )
+        raise CLIError(
+            "公开全市场候选发现不可用",
+            code="candidate_discovery_unavailable",
+            exit_code=4,
+            stage=str(stage or "candidate_discovery"),
+        )
+
+    stage_sources = raw_candidate_discovery.get("stage_sources")
+    if not isinstance(stage_sources, Mapping):
+        raise CLIError(
+            "公开全市场候选覆盖阶段信息不完整",
+            code="candidate_discovery_unavailable",
+            exit_code=4,
+            stage="candidate_discovery",
+        )
+    tencent_stage = stage_sources.get(
+        "tencent_verification"
+    )
+    tencent_stage_status = (
+        tencent_stage.get("status") if isinstance(tencent_stage, Mapping) else None
+    )
+
+    raw_definitions = discovery_result.get("definitions")
+    raw_quote_map = discovery_result.get("quote_map")
+    benchmark_trade_date = raw_candidate_discovery.get(
+        "benchmark_trade_date"
+    )
+    if benchmark_trade_date != context.benchmark_trade_date:
+        _raise_candidate_discovery_consistency_error(
+            "公开全市场基准交易日与市场上下文不一致"
+        )
+    definitions, quote_map = _validate_completed_public_discovery(
+        discovery_status,
+        tencent_stage_status,
+        raw_definitions,
+        raw_quote_map,
+        benchmark_trade_date=benchmark_trade_date,
+        candidate_discovery=raw_candidate_discovery,
+    )
+    candidate_discovery = _sanitize_public_candidate_discovery(
+        raw_candidate_discovery
+    )
+    definitions = _normalize_public_discovery_definitions(definitions)
+
+    technical_status: str
+    earnings_status: str
+    technical_deep_stage_status: str
+    research_candidates: List[Dict[str, Any]]
+    if discovery_status == "no_eligible_candidates":
+        technical_status = "not_called_no_candidates"
+        earnings_status = "not_called_no_candidates"
+        technical_deep_stage_status = "not_called_no_candidates"
+        research_candidates = []
+        candidate_discovery["technical_checked_count"] = 0
+    else:
+        deep_status = (
+            deep_check_result.get("status")
+            if isinstance(deep_check_result, Mapping)
+            else None
+        )
+        if deep_status == "ok":
+            raw_technical_screen = deep_check_result.get("technical_screen")
+            technical_screen = (
+                _validated_public_technical_screen(
+                    raw_technical_screen,
+                    definitions,
+                )
+                if isinstance(raw_technical_screen, Mapping)
+                else None
+            )
+            raw_earnings_screen = deep_check_result.get("earnings_screen")
+            earnings_screen = (
+                _validated_public_earnings_screen(
+                    raw_earnings_screen,
+                    technical_screen,
+                    benchmark_trade_date=benchmark_trade_date,
+                )
+                if isinstance(raw_earnings_screen, Mapping)
+                and technical_screen is not None
+                else None
+            )
+            if technical_screen is not None and earnings_screen is None:
+                raise CLIError(
+                    "公开候选业绩预告筛选证据缺失",
+                    code="technical_deep_check_failed",
+                    exit_code=4,
+                    stage="earnings_forecast_review",
+                )
+            deep_candidates = _ordered_public_deep_check_candidates(
+                deep_check_result.get("candidates"),
+                definitions,
+                quote_map,
+                selected_codes=(
+                    earnings_screen["selected_codes"]
+                    if earnings_screen is not None
+                    else technical_screen["selected_codes"]
+                    if technical_screen is not None
+                    else None
+                ),
+            )
+            technical_status = "ok"
+            earnings_status = (
+                "ok"
+                if earnings_screen is not None
+                else "not_called_legacy_deep_check"
+            )
+            technical_deep_stage_status = (
+                "not_called_no_earnings_survivors"
+                if earnings_screen is not None
+                and earnings_screen["selected_count"] == 0
+                else "ok"
+            )
+            research_candidates = _normalize_public_research_candidates(
+                deep_candidates,
+                definitions,
+            )
+            candidate_discovery["technical_checked_count"] = len(
+                research_candidates
+            )
+            if technical_screen is not None:
+                candidate_discovery.update(
+                    {
+                        "technical_screened_count": technical_screen[
+                            "screened_count"
+                        ],
+                        "technical_passed_count": technical_screen[
+                            "passed_count"
+                        ],
+                        "technical_selected_count": technical_screen[
+                            "selected_count"
+                        ],
+                        "technical_screen_status_counts": deepcopy(
+                            technical_screen["status_counts"]
+                        ),
+                        "technical_closest_rejection_count": technical_screen[
+                            "closest_rejection_count"
+                        ],
+                        "technical_closest_rejections": deepcopy(
+                            technical_screen["closest_rejections"]
+                        ),
+                    }
+                )
+                candidate_discovery["stage_sources"]["technical_screen"] = {
+                    "provider": "tencent_daily_bars",
+                    "status": "ok",
+                }
+            if earnings_screen is not None:
+                candidate_discovery.update(
+                    {
+                        "earnings_screened_count": earnings_screen[
+                            "screened_count"
+                        ],
+                        "earnings_blocked_count": earnings_screen[
+                            "blocked_count"
+                        ],
+                        "earnings_selected_count": earnings_screen[
+                            "selected_count"
+                        ],
+                        "earnings_report_period": earnings_screen[
+                            "report_period"
+                        ],
+                        "earnings_actual_report_period": earnings_screen[
+                            "actual_report_period"
+                        ],
+                        "earnings_screen_status_counts": deepcopy(
+                            earnings_screen["status_counts"]
+                        ),
+                        "earnings_actual_status_counts": deepcopy(
+                            earnings_screen["actual_status_counts"]
+                        ),
+                        "earnings_screen_results": deepcopy(
+                            earnings_screen["results"]
+                        ),
+                    }
+                )
+                candidate_discovery["stage_sources"][
+                    "earnings_forecast_review"
+                ] = {
+                    "provider": EARNINGS_REVIEW_SOURCE,
+                    "status": "ok",
+                }
+        elif deep_status == "technical_deep_check_timeout":
+            if deep_check_result.get("mode") == "technical_funnel":
+                raise CLIError(
+                    "公开候选技术初筛超时，未返回不完整候选",
+                    code="technical_deep_check_timeout",
+                    exit_code=4,
+                    stage="technical_deep_check",
+                )
+            technical_status = "timeout"
+            earnings_status = "not_called_technical_timeout"
+            technical_deep_stage_status = "timeout"
+            research_candidates = _build_public_timeout_research_candidates(
+                definitions,
+                quote_map,
+            )
+            candidate_discovery["technical_checked_count"] = 0
+        else:
+            deep_error_type = (
+                deep_check_result.get("error_type")
+                if isinstance(deep_check_result, Mapping)
+                else None
+            )
+            error_code = (
+                str(deep_error_type or deep_status)
+                if isinstance(deep_error_type or deep_status, str)
+                and (deep_error_type or deep_status)
+                else "technical_deep_check_failed"
+            )
+            error_stage = (
+                "earnings_forecast_review"
+                if error_code
+                in {
+                    "EarningsForecastFetchError",
+                    "EarningsActualFetchError",
+                    "EarningsForecastScreenError",
+                    "InvalidEarningsScreenMetadata",
+                }
+                else "technical_deep_check"
+            )
+            raise CLIError(
+                (
+                    "公开候选业绩复核不可用"
+                    if error_stage == "earnings_forecast_review"
+                    else "公开候选技术深检不可用"
+                ),
+                code=error_code,
+                exit_code=4,
+                stage=error_stage,
+            )
+
+    if "earnings_forecast_review" not in candidate_discovery["stage_sources"]:
+        candidate_discovery["stage_sources"]["earnings_forecast_review"] = {
+            "provider": EARNINGS_REVIEW_SOURCE,
+            "status": earnings_status,
+        }
+    candidate_discovery["stage_sources"]["technical_deep_check"] = {
+        "provider": (
+            "cninfo_dividend_calendar"
+            if "technical_screen" in candidate_discovery["stage_sources"]
+            else "tencent_daily_bars"
+        ),
+        "status": technical_deep_stage_status,
+    }
+
+    normalized_external_risk_level = _validate_external_risk_level(
+        external_risk_level
+    )
+    external_risk_gate = build_external_risk_gate(
+        normalized_external_risk_level,
+        actionable_equity=None,
+    )
+    effective_database_status = deepcopy(
+        database_status
+        or {
+            "status": "unavailable",
+            "error_code": "database_error",
+        }
+    )
+    market_status = build_market_status_payload(
+        None,
+        database_status=deepcopy(effective_database_status),
+        context=context,
+    )
+
+    discovery_source = str(
+        candidate_discovery.get("source") or "public_full_market"
+    )
+    meta_sources = [discovery_source]
+    if technical_status == "ok":
+        meta_sources.append("tencent_daily_bars")
+    if earnings_status == "ok":
+        meta_sources.append(EARNINGS_FORECAST_SOURCE)
+        meta_sources.append(EARNINGS_ACTUAL_SOURCE)
+    if technical_deep_stage_status == "ok":
+        meta_sources.append("cninfo_dividend_calendar")
+    meta_source = "+".join(meta_sources)
+    available_data = ["public_full_market_snapshot"]
+    tencent_stage = candidate_discovery["stage_sources"].get(
+        "tencent_verification"
+    )
+    if (
+        isinstance(tencent_stage, Mapping)
+        and tencent_stage.get("status") == "ok"
+    ):
+        available_data.append("tencent_verified_quotes")
+    if technical_status == "ok":
+        available_data.append("technical_price_plan")
+    if candidate_discovery.get("technical_closest_rejection_count", 0) > 0:
+        available_data.append("technical_closest_rejections")
+    if earnings_status == "ok":
+        available_data.append("earnings_forecast_review")
+        available_data.append("latest_actual_earnings")
+
+    payload = {
+        "ok": True,
+        "data": {
+            "mode": "research_only",
+            "database": effective_database_status,
+            "account": {
+                "status": "unavailable",
+                "actionable": False,
+                "reason_code": "public_research_mode",
+                "configured_total_assets": None,
+                "cash_or_unallocated": None,
+                "estimated_equity": None,
+            },
+            "decision": {
+                **_public_research_candidate_decision(
+                    "public_full_market_research_only"
+                ),
+                "reason": "公开全市场模式不读取或推断账户、持仓和现金，禁止生成仓位数量。",
+            },
+            "external_risk_gate": external_risk_gate,
+            "market_status": deepcopy(
+                market_status.get("data", {})
+                if isinstance(market_status, Mapping)
+                else {}
+            ),
+            "candidate_discovery": candidate_discovery,
+            "candidates": research_candidates,
+            "context": {
+                "horizon": "未来两个交易日",
+                "source": "public_full_market",
+                "quote_source": discovery_source,
+                "technical_deep_check_status": technical_status,
+                "earnings_forecast_review_status": earnings_status,
+                "available_data": available_data,
+                "unavailable_data": [
+                    "account",
+                    "holdings",
+                    "cash",
+                    "recent_trades",
+                    "position_sizing",
+                ],
+            },
+            "disclaimer": "仅供研究参考，不构成投资建议或交易指令。",
+        },
+        "meta": {
+            "schema_version": 7,
+            "source": meta_source,
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    }
+    return enforce_research_only_safety(payload)
+
+
+_PUBLIC_ACCOUNT_SINGLE_SYMBOL_CAP_PCT = 20.0
+_ACCOUNT_HOLDING_CONTEXT_FIELDS = (
+    "code",
+    "name",
+    "market",
+    "theme",
+    "quantity",
+    "cost_price",
+    "current_price",
+    "market_value",
+    "profit_loss",
+    "profit_loss_pct",
+    "weight_by_estimated_equity_pct",
+    "valuation_actionable",
+    "is_reference_only",
+)
+_RECENT_TRADE_CONTEXT_FIELDS = (
+    "code",
+    "name",
+    "market",
+    "side",
+    "quantity",
+    "cost_price",
+    "sell_price",
+    "realized_pnl",
+    "effective_at",
+    "sold_at",
+    "traded_at",
+    "created_at",
+)
+
+
+def _public_account_context_source(
+    mongo_payload: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(mongo_payload, Mapping):
+        return None
+    data = mongo_payload.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    account = data.get("account")
+    holdings_risk = data.get("holdings_risk")
+    actionable_equity = data.get("actionable_equity")
+    if (
+        not isinstance(account, Mapping)
+        or not isinstance(holdings_risk, list)
+        or not isinstance(actionable_equity, Mapping)
+    ):
+        return None
+
+    cash = _round_number(account.get("cash_or_unallocated"))
+    equity = _round_number(actionable_equity.get("value"))
+    if equity is None:
+        equity = _round_number(account.get("estimated_equity"))
+    if cash is None or cash < 0 or equity is None or equity <= 0:
+        return None
+
+    normalized_holdings = []
+    for raw_holding in holdings_risk:
+        if not isinstance(raw_holding, Mapping):
+            return None
+        holding = _copy_public_scalar_fields(
+            raw_holding,
+            _ACCOUNT_HOLDING_CONTEXT_FIELDS,
+        )
+        code = holding.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return None
+        risk_flags = raw_holding.get("risk_flags")
+        holding["risk_keys"] = [
+            str(flag.get("key"))
+            for flag in risk_flags
+            if isinstance(flag, Mapping)
+            and isinstance(flag.get("key"), str)
+            and flag.get("key")
+        ] if isinstance(risk_flags, list) else []
+        normalized_holdings.append(holding)
+
+    trade_context = data.get("trade_context")
+    policy_recent_trades: List[Dict[str, Any]] = []
+    recent_trade_context = {
+        "recent_count": 0,
+        "last_trade": None,
+        "recent_realized_pnl": 0.0,
+        "is_reference_only": True,
+    }
+    if isinstance(trade_context, Mapping):
+        raw_recent_trades = trade_context.get("recent_trades")
+        if isinstance(raw_recent_trades, list):
+            policy_recent_trades = [
+                _copy_public_scalar_fields(
+                    raw_trade,
+                    _RECENT_TRADE_CONTEXT_FIELDS,
+                )
+                for raw_trade in raw_recent_trades
+                if isinstance(raw_trade, Mapping)
+            ]
+        recent_count = trade_context.get("recent_count")
+        if isinstance(recent_count, int) and not isinstance(recent_count, bool):
+            recent_trade_context["recent_count"] = max(0, recent_count)
+        recent_realized_pnl = _round_number(
+            trade_context.get("recent_realized_pnl")
+        )
+        if recent_realized_pnl is not None:
+            recent_trade_context["recent_realized_pnl"] = recent_realized_pnl
+        last_trade = trade_context.get("last_trade")
+        if isinstance(last_trade, Mapping):
+            recent_trade_context["last_trade"] = _copy_public_scalar_fields(
+                last_trade,
+                _RECENT_TRADE_CONTEXT_FIELDS,
+            )
+            if not policy_recent_trades:
+                policy_recent_trades = [
+                    deepcopy(recent_trade_context["last_trade"])
+                ]
+
+    return {
+        "account": {
+            "status": "available",
+            "actionable": False,
+            "reason_code": "public_candidates_account_fit_only",
+            "configured_total_assets": _round_number(
+                account.get("configured_total_assets")
+            ),
+            "cash_or_unallocated": cash,
+            "estimated_equity": equity,
+            "buy_lot_size": int(account.get("buy_lot_size") or DEFAULT_BUY_LOT_SIZE),
+            "holding_count": len(normalized_holdings),
+        },
+        "holdings": normalized_holdings,
+        "recent_trade_context": recent_trade_context,
+        "trade_context_for_policy": {
+            "recent_trades": policy_recent_trades,
+            "last_trade": deepcopy(recent_trade_context["last_trade"]),
+        },
+        "external_risk_gate": (
+            dict(data.get("external_risk_gate"))
+            if isinstance(data.get("external_risk_gate"), Mapping)
+            else {}
+        ),
+        "a_share_market_gate": (
+            dict(data.get("a_share_market_gate"))
+            if isinstance(data.get("a_share_market_gate"), Mapping)
+            else {}
+        ),
+    }
+
+
+def _candidate_public_account_fit(
+    candidate: Mapping[str, Any],
+    *,
+    account_context: Mapping[str, Any],
+    recent_sale_cooldown_codes: set[str],
+) -> Dict[str, Any]:
+    account = account_context["account"]
+    holdings = account_context["holdings"]
+    cash = float(account["cash_or_unallocated"])
+    equity = float(account["estimated_equity"])
+    one_lot_amount = _round_number(candidate.get("one_lot_amount"))
+    code = str(candidate.get("code") or "")
+
+    same_symbol_holdings = [
+        holding for holding in holdings if holding.get("code") == code
+    ]
+    existing_values = [
+        _round_number(holding.get("market_value"))
+        for holding in same_symbol_holdings
+    ]
+    existing_symbol_market_value = (
+        round(sum(float(value) for value in existing_values), 2)
+        if all(
+            holding.get("valuation_actionable") is True
+            for holding in same_symbol_holdings
+        )
+        and all(value is not None for value in existing_values)
+        else None
+    )
+    if not same_symbol_holdings:
+        existing_symbol_market_value = 0.0
+
+    single_symbol_cap_amount = round(
+        equity * _PUBLIC_ACCOUNT_SINGLE_SYMBOL_CAP_PCT / 100,
+        2,
+    )
+    post_trade_symbol_market_value = (
+        round(existing_symbol_market_value + one_lot_amount, 2)
+        if existing_symbol_market_value is not None and one_lot_amount is not None
+        else None
+    )
+    cash_affordable = bool(
+        one_lot_amount is not None and one_lot_amount <= cash
+    )
+    within_single_symbol_cap = bool(
+        post_trade_symbol_market_value is not None
+        and post_trade_symbol_market_value <= single_symbol_cap_amount
+    )
+    passes_account_size_checks = bool(
+        cash_affordable and within_single_symbol_cap
+    )
+
+    blocking_reasons: List[str] = []
+    if one_lot_amount is None or existing_symbol_market_value is None:
+        blocking_reasons.append("account_fit_data_incomplete")
+    else:
+        if not cash_affordable:
+            blocking_reasons.append("insufficient_cash")
+        if not within_single_symbol_cap:
+            blocking_reasons.append("post_trade_symbol_cap")
+
+    risk_flags = candidate.get("risk_flags")
+    trend_recovery_required = bool(
+        isinstance(risk_flags, list)
+        and any(
+            isinstance(flag, Mapping)
+            and flag.get("key") == "trend_recovery_required"
+            for flag in risk_flags
+        )
+    )
+    guarded_price_plan = candidate.get("guarded_price_plan")
+    if (
+        (
+            not isinstance(guarded_price_plan, Mapping)
+            or guarded_price_plan.get("status") != "ok"
+        )
+        and not trend_recovery_required
+    ):
+        blocking_reasons.append("technical_price_plan")
+    corporate_action = candidate.get("corporate_action")
+    if isinstance(corporate_action, Mapping) and (
+        corporate_action.get("blocks_new_position") is True
+        or corporate_action.get("price_plan_adjustment_required") is True
+    ):
+        blocking_reasons.append("corporate_action")
+    external_risk_gate = account_context.get("external_risk_gate")
+    if not isinstance(external_risk_gate, Mapping) or not external_risk_gate.get(
+        "actionable"
+    ):
+        blocking_reasons.append("external_risk_gate")
+    a_share_market_gate = account_context.get("a_share_market_gate")
+    if not isinstance(a_share_market_gate, Mapping) or (
+        a_share_market_gate.get("new_position_allowed") is not True
+    ):
+        blocking_reasons.append("a_share_market_gate")
+    if code in recent_sale_cooldown_codes:
+        blocking_reasons.append("recent_sale_cooldown")
+    if trend_recovery_required:
+        blocking_reasons.append("trend_recovery_required")
+    blocking_reasons.append("public_research_only")
+
+    return {
+        "status": "available",
+        "reference_basis": "tencent_spot_one_lot",
+        "one_lot_amount": one_lot_amount,
+        "cash_available": round(cash, 2),
+        "equity_value": round(equity, 2),
+        "single_symbol_cap_pct": _PUBLIC_ACCOUNT_SINGLE_SYMBOL_CAP_PCT,
+        "single_symbol_cap_amount": single_symbol_cap_amount,
+        "existing_symbol_market_value": existing_symbol_market_value,
+        "post_trade_symbol_market_value": post_trade_symbol_market_value,
+        "one_lot_cash_usage_pct": (
+            round(one_lot_amount / cash * 100, 2)
+            if one_lot_amount is not None and cash > 0
+            else None
+        ),
+        "one_lot_equity_pct": (
+            round(one_lot_amount / equity * 100, 2)
+            if one_lot_amount is not None and equity > 0
+            else None
+        ),
+        "post_trade_symbol_pct": (
+            round(post_trade_symbol_market_value / equity * 100, 2)
+            if post_trade_symbol_market_value is not None and equity > 0
+            else None
+        ),
+        "cash_affordable": cash_affordable,
+        "within_single_symbol_cap": within_single_symbol_cap,
+        "passes_account_size_checks": passes_account_size_checks,
+        "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+        "actionable": False,
+        "suggested_lots": 0,
+        "suggested_quantity": 0,
+    }
+
+
+def build_account_context_public_research_payload(
+    public_payload: Mapping[str, Any],
+    mongo_payload: Mapping[str, Any],
+    *,
+    as_of: Any = None,
+    benchmark_session_dates: Optional[Iterable[Any]] = None,
+) -> Dict[str, Any]:
+    """Add trusted account-fit evidence to public candidates without sizing."""
+    payload = deepcopy(dict(public_payload))
+    data = payload.get("data")
+    if not isinstance(data, dict) or data.get("mode") != "research_only":
+        return payload
+    account_context = _public_account_context_source(mongo_payload)
+    if account_context is None:
+        return payload
+
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return payload
+    candidate_copies = []
+    for raw_candidate in candidates:
+        if not isinstance(raw_candidate, Mapping):
+            return deepcopy(dict(public_payload))
+        candidate_copies.append(deepcopy(dict(raw_candidate)))
+
+    recent_sale_policy = _build_recent_sale_policy(
+        account_context["trade_context_for_policy"],
+        candidate_copies,
+        as_of=as_of,
+        benchmark_session_dates=benchmark_session_dates,
+    )
+    recent_sale_cooldown_codes = {
+        str(code or "").upper()
+        for code in recent_sale_policy.get("matched_candidate_codes", [])
+        if recent_sale_policy.get("status") == "cooldown"
+    }
+
+    normalized_candidates = []
+    for candidate in candidate_copies:
+        candidate["account_fit"] = _candidate_public_account_fit(
+            candidate,
+            account_context=account_context,
+            recent_sale_cooldown_codes=recent_sale_cooldown_codes,
+        )
+        guarded_price_plan = candidate.get("guarded_price_plan")
+        if isinstance(guarded_price_plan, dict):
+            execution_blocked_by = guarded_price_plan.get(
+                "execution_blocked_by"
+            )
+            if isinstance(execution_blocked_by, list):
+                guarded_price_plan["execution_blocked_by"] = [
+                    blocker
+                    for blocker in execution_blocked_by
+                    if blocker != "account_data_unavailable"
+                ]
+        normalized_candidates.append(candidate)
+
+    data["mode"] = "account_context_research_only"
+    data["account"] = account_context["account"]
+    data["holdings_context"] = {
+        "status": "available",
+        "holding_count": len(account_context["holdings"]),
+        "items": account_context["holdings"],
+        "is_reference_only": True,
+    }
+    data["recent_trade_context"] = account_context["recent_trade_context"]
+    data["recent_sale_policy"] = recent_sale_policy
+    data["candidates"] = normalized_candidates
+    decision = (
+        dict(data.get("decision"))
+        if isinstance(data.get("decision"), Mapping)
+        else {}
+    )
+    decision.update(
+        {
+            "action": "observe",
+            "actionable": False,
+            "reason_code": "public_candidates_account_fit_only",
+            "suggested_lots": 0,
+            "suggested_quantity": 0,
+            "reason": "公开候选已结合真实账户做一手资金适配，但仍禁止生成仓位数量。",
+        }
+    )
+    data["decision"] = decision
+
+    context = (
+        dict(data.get("context"))
+        if isinstance(data.get("context"), Mapping)
+        else {}
+    )
+    available_data = list(context.get("available_data") or [])
+    for item in (
+        "account_context",
+        "holdings_context",
+        "cash_fit",
+        "recent_trades",
+    ):
+        if item not in available_data:
+            available_data.append(item)
+    unavailable_data = [
+        item
+        for item in list(context.get("unavailable_data") or [])
+        if item not in {"account", "holdings", "cash", "recent_trades"}
+    ]
+    if "position_sizing" not in unavailable_data:
+        unavailable_data.append("position_sizing")
+    context["available_data"] = available_data
+    context["unavailable_data"] = unavailable_data
+    data["context"] = context
+
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["meta"] = meta
+    meta["schema_version"] = 8
+    source = str(meta.get("source") or "public_full_market")
+    if "mongo_account_context" not in source.split("+"):
+        meta["source"] = f"{source}+mongo_account_context"
+    return enforce_research_only_safety(payload)
+
+
 def build_market_status_payload(
     db: Any = None,
     *,
     database_status: Optional[Dict[str, Any]] = None,
+    context: Optional[OpportunityMarketContext] = None,
+    retry_public_timeout: bool = False,
 ) -> Dict[str, Any]:
     """Build a login-free A-share market gate, with optional Mongo breadth."""
-    market_gate = _build_a_share_market_gate(None, db=db)
+    effective_context = context or build_opportunity_market_context()
+    market_gate = _build_a_share_market_gate(
+        None,
+        db=db,
+        context=effective_context,
+    )
+    market_session = _market_session_context(effective_context.now)
+    cached_public_snapshot = effective_context.public_snapshot or {}
+    if (
+        retry_public_timeout
+        and cached_public_snapshot.get("status") == "public_breadth_timeout"
+    ):
+        effective_context.retry_public_snapshot_once_if_timeout()
+        market_gate = _build_a_share_market_gate(
+            None,
+            db=db,
+            context=effective_context,
+        )
     breadth_regime = (
         market_gate.get("breadth_regime")
         if isinstance(market_gate.get("breadth_regime"), dict)
@@ -3312,14 +6668,23 @@ def build_market_status_payload(
         database_status
         or ({"status": "connected"} if db is not None else {"status": "not_configured"})
     )
-    if breadth_regime.get("load_error"):
+    mongo_breadth = (
+        market_gate.get("mongo_breadth")
+        if isinstance(market_gate.get("mongo_breadth"), dict)
+        else {}
+    )
+    breadth_load_error = breadth_regime.get("load_error") or mongo_breadth.get("load_error")
+    if breadth_load_error:
         effective_database_status = {
             "status": "unavailable",
             "error_code": "database_error",
-            "error_type": breadth_regime.get("load_error"),
+            "error_type": breadth_load_error,
         }
 
-    if breadth_regime.get("status") == "ok":
+    breadth_source = str(breadth_regime.get("source") or "")
+    if breadth_regime.get("status") == "ok" and breadth_source == "akshare.sina.stock_zh_a_spot":
+        data_completeness = "indices_and_public_breadth"
+    elif breadth_regime.get("status") == "ok":
         data_completeness = "indices_and_breadth"
     elif market_gate.get("indices") or market_gate.get("index_regime", {}).get("indices"):
         data_completeness = "indices_only"
@@ -3355,10 +6720,16 @@ def build_market_status_payload(
             "reason": "指数和市场宽度均通过门禁，可继续评估个股条件。",
         }
 
+    if data_completeness == "indices_and_public_breadth":
+        payload_source = "tencent_major_indices+akshare_sina_public_breadth"
+    else:
+        payload_source = "tencent_major_indices+optional_mongo_market_breadth"
+
     return {
         "ok": True,
         "data": {
             "market": "CN",
+            "market_session": market_session,
             "market_gate": market_gate,
             "decision": decision,
             "data_completeness": data_completeness,
@@ -3367,10 +6738,391 @@ def build_market_status_payload(
         },
         "meta": {
             "schema_version": 1,
-            "source": "tencent_major_indices+optional_mongo_market_breadth",
+            "source": payload_source,
             "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         },
     }
+
+
+def _normalize_public_a_share_codes(
+    codes: Any,
+    *,
+    max_codes: int,
+    required_error_code: str,
+    invalid_error_code: str,
+    too_many_error_code: str,
+    stage: str,
+) -> List[str]:
+    if not isinstance(codes, list):
+        raise CLIError(
+            "至少提供一个 A 股代码",
+            code=required_error_code,
+            exit_code=2,
+            stage=stage,
+        )
+    normalized_codes: List[str] = []
+    for raw_code in codes:
+        raw_text = str(raw_code or "").strip()
+        code = normalize_cn_code(raw_text)
+        if (
+            _PUBLIC_A_SHARE_CODE_INPUT_PATTERN.fullmatch(raw_text) is None
+            or not code
+            or A_SHARE_STOCK_CODE_PATTERN.fullmatch(code) is None
+        ):
+            raise CLIError(
+                f"无效的 A 股代码: {raw_code}",
+                code=invalid_error_code,
+                exit_code=2,
+                stage=stage,
+            )
+        if code not in normalized_codes:
+            normalized_codes.append(code)
+    if not normalized_codes:
+        raise CLIError(
+            "至少提供一个 A 股代码",
+            code=required_error_code,
+            exit_code=2,
+            stage=stage,
+        )
+    if len(normalized_codes) > max_codes:
+        raise CLIError(
+            f"单次最多查询 {max_codes} 只股票",
+            code=too_many_error_code,
+            exit_code=2,
+            stage=stage,
+        )
+    return normalized_codes
+
+
+def _normalize_public_earnings_codes(codes: Any) -> List[str]:
+    return _normalize_public_a_share_codes(
+        codes,
+        max_codes=MAX_EARNINGS_SCREEN_CANDIDATES,
+        required_error_code="earnings_codes_required",
+        invalid_error_code="invalid_earnings_code",
+        too_many_error_code="too_many_earnings_codes",
+        stage="earnings_forecast_review",
+    )
+
+
+def _normalize_public_notice_codes(codes: Any) -> List[str]:
+    return _normalize_public_a_share_codes(
+        codes,
+        max_codes=MAX_NOTICE_REVIEW_CANDIDATES,
+        required_error_code="notice_codes_required",
+        invalid_error_code="invalid_notice_code",
+        too_many_error_code="too_many_notice_codes",
+        stage="recent_notice_review",
+    )
+
+
+def _normalize_notice_lookback_days(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= MAX_NOTICE_LOOKBACK_CALENDAR_DAYS
+    ):
+        raise CLIError(
+            f"公告回看天数必须在 1 到 {MAX_NOTICE_LOOKBACK_CALENDAR_DAYS} 之间",
+            code="invalid_notice_lookback_days",
+            exit_code=2,
+            stage="recent_notice_review",
+        )
+    return value
+
+
+def build_public_candidate_earnings_payload(
+    codes: Any,
+    *,
+    context: OpportunityMarketContext,
+    screener: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Build a login-free, research-only earnings review for A-share codes."""
+    normalized_codes = _normalize_public_earnings_codes(codes)
+    benchmark_trade_date = context.benchmark_trade_date
+    if not _valid_opportunity_benchmark_trade_date(benchmark_trade_date):
+        raise CLIError(
+            "腾讯市场上下文缺少有效基准交易日",
+            code="earnings_market_context_unavailable",
+            exit_code=4,
+            stage="tencent_market_context",
+        )
+    effective_screener = screener or screen_public_candidate_earnings_risk
+    try:
+        raw_screen = effective_screener(
+            normalized_codes,
+            benchmark_trade_date=benchmark_trade_date,
+        )
+    except Exception as exc:
+        raise CLIError(
+            "公开业绩复核失败",
+            code="EarningsForecastScreenError",
+            exit_code=4,
+            stage="earnings_forecast_review",
+            details={"error_type": type(exc).__name__},
+        ) from exc
+
+    raw_status = (
+        raw_screen.get("status")
+        if isinstance(raw_screen, Mapping)
+        else None
+    )
+    if raw_status != "ok":
+        error_code = (
+            "EarningsForecastFetchError"
+            if raw_status == "earnings_forecast_unavailable"
+            else "EarningsActualFetchError"
+            if raw_status == "earnings_actual_unavailable"
+            else "EarningsForecastScreenError"
+        )
+        raise CLIError(
+            "公开业绩数据源或结果不可用",
+            code=error_code,
+            exit_code=4,
+            stage="earnings_forecast_review",
+            details={
+                "provider_status": raw_status,
+                "source": (
+                    raw_screen.get("source")
+                    if isinstance(raw_screen, Mapping)
+                    else None
+                ),
+                "actual_source": (
+                    raw_screen.get("actual_source")
+                    if isinstance(raw_screen, Mapping)
+                    else None
+                ),
+                "report_period": (
+                    raw_screen.get("report_period")
+                    if isinstance(raw_screen, Mapping)
+                    else None
+                ),
+                "actual_report_period": (
+                    raw_screen.get("actual_report_period")
+                    if isinstance(raw_screen, Mapping)
+                    else None
+                ),
+                "error_type": (
+                    raw_screen.get("error_type")
+                    if isinstance(raw_screen, Mapping)
+                    else "InvalidProviderPayload"
+                ),
+            },
+        )
+
+    expected_report_period = latest_completed_reporting_period(
+        benchmark_trade_date
+    )
+    expected_actual_report_period = latest_mandatory_actual_reporting_period(
+        benchmark_trade_date
+    )
+    earnings_screen, validation_error = (
+        validate_public_earnings_screen_metadata(
+            raw_screen,
+            expected_codes=normalized_codes,
+            expected_report_period=expected_report_period,
+            expected_actual_report_period=expected_actual_report_period,
+            benchmark_trade_date=benchmark_trade_date,
+        )
+    )
+    if validation_error or earnings_screen is None:
+        raise CLIError(
+            "公开业绩复核证据无效",
+            code="InvalidEarningsScreenMetadata",
+            exit_code=4,
+            stage="earnings_forecast_review",
+        )
+
+    payload = {
+        "ok": True,
+        "data": {
+            "mode": "public_research_only",
+            "benchmark_trade_date": benchmark_trade_date,
+            "earnings_review": earnings_screen,
+            "decision": {
+                "action": "observe",
+                "actionable": False,
+                "reason_code": "earnings_evidence_only",
+                "suggested_lots": 0,
+                "suggested_quantity": 0,
+                "reason": "业绩证据不能单独构成股票候选或交易条件。",
+            },
+            "disclaimer": "仅供研究参考，不构成投资建议或交易指令。",
+        },
+        "meta": {
+            "schema_version": 1,
+            "source": EARNINGS_REVIEW_SOURCE,
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    }
+    return enforce_research_only_safety(payload)
+
+
+def build_public_candidate_notice_payload(
+    codes: Any,
+    *,
+    context: OpportunityMarketContext,
+    lookback_calendar_days: int = NOTICE_LOOKBACK_CALENDAR_DAYS,
+    reviewer: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Build a login-free, research-only recent-announcement review."""
+    normalized_codes = _normalize_public_notice_codes(codes)
+    normalized_lookback_days = _normalize_notice_lookback_days(
+        lookback_calendar_days
+    )
+    benchmark_trade_date = context.benchmark_trade_date
+    if not _valid_opportunity_benchmark_trade_date(benchmark_trade_date):
+        raise CLIError(
+            "腾讯市场上下文缺少有效基准交易日",
+            code="notice_market_context_unavailable",
+            exit_code=4,
+            stage="tencent_market_context",
+        )
+    if not isinstance(context.now, datetime):
+        raise CLIError(
+            "腾讯市场上下文缺少有效本地时间",
+            code="notice_market_context_unavailable",
+            exit_code=4,
+            stage="tencent_market_context",
+        )
+    market_timezone = ZoneInfo(CN_MARKET_TIMEZONE)
+    local_now = (
+        context.now.replace(tzinfo=market_timezone)
+        if context.now.tzinfo is None
+        else context.now.astimezone(market_timezone)
+    )
+    end_date = local_now.date()
+    start_date = end_date - timedelta(
+        days=normalized_lookback_days - 1
+    )
+    expected_source = (
+        NOTICE_REVIEW_SOURCE
+        if normalized_lookback_days == NOTICE_LOOKBACK_CALENDAR_DAYS
+        else NOTICE_HISTORY_SOURCE
+    )
+    try:
+        if reviewer is not None:
+            reviewer_kwargs: Dict[str, Any] = {"as_of_date": end_date}
+            if normalized_lookback_days != NOTICE_LOOKBACK_CALENDAR_DAYS:
+                reviewer_kwargs["lookback_calendar_days"] = (
+                    normalized_lookback_days
+                )
+            raw_review = reviewer(normalized_codes, **reviewer_kwargs)
+        elif normalized_lookback_days == NOTICE_LOOKBACK_CALENDAR_DAYS:
+            raw_review = review_public_candidate_notices(
+                normalized_codes,
+                as_of_date=end_date,
+            )
+        else:
+            raw_review = review_public_candidate_notice_history(
+                normalized_codes,
+                as_of_date=end_date,
+                lookback_calendar_days=normalized_lookback_days,
+            )
+    except Exception as exc:
+        raise CLIError(
+            "近期公告核查失败",
+            code="NoticeReviewError",
+            exit_code=4,
+            stage="recent_notice_review",
+            details={"error_type": type(exc).__name__},
+        ) from exc
+
+    raw_status = (
+        raw_review.get("status")
+        if isinstance(raw_review, Mapping)
+        else None
+    )
+    if raw_status != "ok":
+        error_code = (
+            "NoticeReviewFetchError"
+            if raw_status == "notice_source_unavailable"
+            else "NoticeReviewError"
+        )
+        raise CLIError(
+            "近期公告数据源或结果不可用",
+            code=error_code,
+            exit_code=4,
+            stage="recent_notice_review",
+            details={
+                "provider_status": raw_status,
+                "source": (
+                    raw_review.get("source")
+                    if isinstance(raw_review, Mapping)
+                    else None
+                ),
+                "start_date": (
+                    raw_review.get("start_date")
+                    if isinstance(raw_review, Mapping)
+                    else None
+                ),
+                "end_date": (
+                    raw_review.get("end_date")
+                    if isinstance(raw_review, Mapping)
+                    else None
+                ),
+                **(
+                    {"failed_date": raw_review.get("failed_date")}
+                    if isinstance(raw_review, Mapping)
+                    and raw_review.get("failed_date") is not None
+                    else {}
+                ),
+                **(
+                    {"failed_code": raw_review.get("failed_code")}
+                    if isinstance(raw_review, Mapping)
+                    and raw_review.get("failed_code") is not None
+                    else {}
+                ),
+                "error_type": (
+                    raw_review.get("error_type")
+                    if isinstance(raw_review, Mapping)
+                    else "InvalidProviderPayload"
+                ),
+            },
+        )
+
+    notice_review, validation_error = (
+        validate_public_candidate_notice_review(
+            raw_review,
+            expected_codes=normalized_codes,
+            expected_start_date=start_date,
+            expected_end_date=end_date,
+            expected_lookback_calendar_days=normalized_lookback_days,
+            expected_source=expected_source,
+        )
+    )
+    if validation_error or notice_review is None:
+        raise CLIError(
+            "近期公告核查证据无效",
+            code="InvalidNoticeReviewMetadata",
+            exit_code=4,
+            stage="recent_notice_review",
+        )
+
+    payload = {
+        "ok": True,
+        "data": {
+            "mode": "public_research_only",
+            "benchmark_trade_date": benchmark_trade_date,
+            "market_session": _market_session_context(context.now),
+            "notice_review": notice_review,
+            "decision": {
+                "action": "observe",
+                "actionable": False,
+                "reason_code": "recent_notice_evidence_only",
+                "suggested_lots": 0,
+                "suggested_quantity": 0,
+                "reason": "公告标题和标签仅用于人工核查，不能自动构成候选、阻断或交易条件。",
+            },
+            "disclaimer": "仅供研究参考，不构成投资建议或交易指令。",
+        },
+        "meta": {
+            "schema_version": 1,
+            "source": expected_source,
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    }
+    return enforce_research_only_safety(payload)
 
 
 def build_users_payload(db: Any, *, limit: int = 100) -> Dict[str, Any]:
@@ -3397,6 +7149,507 @@ def _validate_external_risk_level(level: Optional[str]) -> str:
         raise CLIError(str(exc), code="invalid_external_risk_level") from exc
 
 
+def _require_opportunity_time(
+    context: OpportunityMarketContext,
+    *,
+    stage: str,
+) -> None:
+    if context.remaining_seconds() <= 0:
+        raise CLIError(
+            "opportunities command deadline exceeded",
+            code="stage_timeout",
+            exit_code=4,
+            stage=stage,
+        )
+
+
+def _supports_opportunity_interval_timer() -> bool:
+    return (
+        threading.current_thread() is threading.main_thread()
+        and all(
+            hasattr(signal, name)
+            for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+        )
+    )
+
+
+@contextmanager
+def _opportunity_wall_clock_guard(
+    context: OpportunityMarketContext,
+    *,
+    stage: str,
+):
+    if not isinstance(context, OpportunityMarketContext):
+        yield
+        return
+
+    _require_opportunity_time(context, stage=stage)
+    if not _supports_opportunity_interval_timer():
+        yield
+        _require_opportunity_time(context, stage=stage)
+        return
+
+    signal_number = signal.SIGALRM
+    timer_kind = signal.ITIMER_REAL
+    try:
+        previous_handler = signal.getsignal(signal_number)
+        previous_delay, _previous_interval = signal.getitimer(timer_kind)
+    except (OSError, RuntimeError, ValueError):
+        yield
+        _require_opportunity_time(context, stage=stage)
+        return
+    if previous_delay > 0:
+        yield
+        _require_opportunity_time(context, stage=stage)
+        return
+
+    remaining_seconds = context.remaining_seconds()
+    if remaining_seconds <= 0:
+        _require_opportunity_time(context, stage=stage)
+
+    deadline_state = {
+        "triggered": False,
+        "interrupt_raised": False,
+        "cleanup_started": False,
+    }
+
+    def raise_stage_timeout(_signum: int, _frame: Any) -> None:
+        deadline_state["triggered"] = True
+        if deadline_state["interrupt_raised"]:
+            return
+        deadline_state["interrupt_raised"] = True
+        raise _OpportunityDeadlineInterrupt
+
+    handler_restore_required = False
+    timer_started = False
+
+    def cleanup() -> Optional[BaseException]:
+        nonlocal handler_restore_required, timer_started
+        deadline_state["cleanup_started"] = True
+        cleanup_error: Optional[BaseException] = None
+        if timer_started:
+            try:
+                signal.setitimer(timer_kind, 0.0)
+            except _OpportunityDeadlineInterrupt:
+                raise
+            except BaseException as exc:
+                cleanup_error = exc
+            else:
+                timer_started = False
+        if handler_restore_required:
+            try:
+                signal.signal(signal_number, previous_handler)
+            except _OpportunityDeadlineInterrupt:
+                raise
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            else:
+                handler_restore_required = False
+        return cleanup_error
+
+    setup_error: Optional[BaseException] = None
+    pending_error: Optional[BaseException] = None
+    cleanup_error: Optional[BaseException] = None
+    deadline_interrupt: Optional[_OpportunityDeadlineInterrupt] = None
+    try:
+        try:
+            handler_restore_required = True
+            signal.signal(signal_number, raise_stage_timeout)
+            signal.setitimer(timer_kind, remaining_seconds)
+            timer_started = True
+        except _OpportunityDeadlineInterrupt:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            setup_error = exc
+        except BaseException as exc:
+            pending_error = exc
+        else:
+            try:
+                yield
+            except _OpportunityDeadlineInterrupt:
+                raise
+            except BaseException as exc:
+                pending_error = exc
+        finally:
+            cleanup_error = cleanup()
+    except _OpportunityDeadlineInterrupt as exc:
+        deadline_interrupt = exc
+        cleanup_error = cleanup()
+
+    if deadline_state["triggered"] or deadline_interrupt is not None:
+        timeout_error = CLIError(
+            "opportunities command deadline exceeded",
+            code="stage_timeout",
+            exit_code=4,
+            stage=stage,
+        )
+        if deadline_interrupt is not None:
+            raise timeout_error from deadline_interrupt
+        raise timeout_error
+    if setup_error is not None:
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+        _require_opportunity_time(context, stage=stage)
+        yield
+        _require_opportunity_time(context, stage=stage)
+        return
+    if pending_error is not None:
+        raise pending_error.with_traceback(pending_error.__traceback__)
+    if cleanup_error is not None:
+        raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+    _require_opportunity_time(context, stage=stage)
+
+
+def _run_opportunity_sync_builder(
+    context: OpportunityMarketContext,
+    builder: Callable[[], Dict[str, Any]],
+) -> Dict[str, Any]:
+    with _opportunity_wall_clock_guard(context, stage="orchestration"):
+        return builder()
+
+
+def _opportunity_candidate_discovery_status(payload: Any) -> Optional[str]:
+    if not isinstance(payload, Mapping):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    candidate_discovery = data.get("candidate_discovery")
+    if not isinstance(candidate_discovery, Mapping):
+        return None
+    status = candidate_discovery.get("status")
+    return status if isinstance(status, str) else None
+
+
+def _should_fallback_to_public_research(payload: Any) -> bool:
+    return (
+        _opportunity_candidate_discovery_status(payload)
+        in _PUBLIC_RESEARCH_FALLBACK_DISCOVERY_STATUSES
+    )
+
+
+def _raise_public_discovery_unavailable(discovery_result: Any) -> None:
+    stage = (
+        discovery_result.get("stage")
+        if isinstance(discovery_result, Mapping)
+        else None
+    )
+    raw_candidate_discovery = (
+        discovery_result.get("candidate_discovery")
+        if isinstance(discovery_result, Mapping)
+        else None
+    )
+    candidate_discovery = (
+        deepcopy(dict(raw_candidate_discovery))
+        if isinstance(raw_candidate_discovery, Mapping)
+        else {"status": "candidate_discovery_unavailable"}
+    )
+    raise CLIError(
+        "公开全市场候选发现不可用",
+        code="candidate_discovery_unavailable",
+        exit_code=4,
+        details={
+            "stage": str(stage or "candidate_discovery"),
+            "candidate_discovery": candidate_discovery,
+        },
+    )
+
+
+def _valid_opportunity_benchmark_trade_date(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def _unavailable_tencent_market_context_discovery(
+    context: OpportunityMarketContext,
+) -> Dict[str, Any]:
+    raw_index_status = context.index_status
+    index_status = (
+        raw_index_status
+        if isinstance(raw_index_status, str) and raw_index_status
+        else "index_context_unavailable"
+    )
+    if index_status == "ok":
+        stage_status = "benchmark_trade_date_unavailable"
+        context_error: Any = {
+            "status": stage_status,
+            "stage": "tencent_market_context",
+            "index_status": index_status,
+            "benchmark_trade_date": context.benchmark_trade_date,
+        }
+    else:
+        stage_status = index_status
+        context_error = deepcopy(context.index_error)
+
+    empty_counts = {exchange: 0 for exchange in ("sh", "sz", "bj")}
+    candidate_discovery = {
+        "mode": "public_full_market",
+        "status": "candidate_discovery_unavailable",
+        "source": "tencent_batch_quotes",
+        "benchmark_trade_date": None,
+        "provider_expected_count": 0,
+        "provider_expected_exchange_counts": dict(empty_counts),
+        "raw_row_count": 0,
+        "unique_row_count": 0,
+        "universe_count": 0,
+        "exchange_counts": dict(empty_counts),
+        "total_coverage_ratio": 0.0,
+        "exchange_coverage_ratio": {
+            exchange: 0.0 for exchange in empty_counts
+        },
+        "eligible_count": 0,
+        "public_preselected_count": 0,
+        "tencent_requested_count": 0,
+        "tencent_minimum_verified_count": 0,
+        "tencent_verified_count": 0,
+        "tencent_rank_population_count": 0,
+        "selected_count": 0,
+        "technical_checked_count": 0,
+        "rejection_counts": {},
+        "quality_counts": {},
+        "stage_sources": {
+            "tencent_market_context": {
+                "provider": "tencent_batch_quotes",
+                "status": stage_status,
+                "error": context_error,
+            },
+            "public_snapshot": {
+                "provider": "akshare.sina.stock_zh_a_spot",
+                "status": "not_called_tencent_market_context_unavailable",
+            },
+            "tencent_verification": {
+                "provider": "tencent_batch_quotes",
+                "status": "not_called_tencent_market_context_unavailable",
+            },
+        },
+    }
+    return {
+        "status": "candidate_discovery_unavailable",
+        "stage": "tencent_market_context",
+        "definitions": [],
+        "quote_map": {},
+        "candidate_discovery": candidate_discovery,
+    }
+
+
+def _orchestrate_public_full_market_research_payload(
+    *,
+    context: OpportunityMarketContext,
+    external_risk_level: Optional[str] = None,
+    database_status: Optional[Dict[str, Any]] = None,
+    discovery_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one deadline-bounded public discovery workflow for opportunities."""
+    if context.index_status != "ok" or not _valid_opportunity_benchmark_trade_date(
+        context.benchmark_trade_date
+    ):
+        discovery_result = _unavailable_tencent_market_context_discovery(context)
+        if discovery_state is not None:
+            discovery_state["result"] = discovery_result
+        _raise_public_discovery_unavailable(discovery_result)
+
+    _require_opportunity_time(context, stage="sina_public_snapshot")
+    public_snapshot = context.ensure_public_snapshot()
+    _require_opportunity_time(context, stage="sina_public_snapshot")
+
+    tencent_batch_called = False
+    tencent_deadline_expired = False
+
+    def fetch_candidate_quotes(codes: Iterable[str]) -> Dict[str, Any]:
+        nonlocal tencent_batch_called, tencent_deadline_expired
+        requested_codes = list(codes)
+        if tencent_batch_called:
+            raise RuntimeError("public candidate Tencent batch already called")
+        tencent_batch_called = True
+        timeout_seconds = context.stage_timeout("tencent_candidate_review")
+        if timeout_seconds <= 0:
+            tencent_deadline_expired = True
+            return {
+                "status": "stage_timeout",
+                "requested_codes": requested_codes,
+                "rows": [],
+                "error_type": "CommandDeadlineExceeded",
+            }
+        result = fetch_tencent_quotes_batched_sync(
+            requested_codes,
+            timeout=timeout_seconds,
+        )
+        if context.remaining_seconds() <= 0:
+            tencent_deadline_expired = True
+        return result
+
+    _require_opportunity_time(context, stage="candidate_discovery")
+    discovery_result = discover_public_candidate_universe(
+        public_snapshot,
+        fetch_quotes=fetch_candidate_quotes,
+        now=context.now,
+    )
+    if discovery_state is not None:
+        discovery_state["result"] = discovery_result
+    if tencent_deadline_expired:
+        _require_opportunity_time(context, stage="tencent_candidate_review")
+    _require_opportunity_time(context, stage="candidate_discovery")
+
+    discovery_status = (
+        discovery_result.get("status")
+        if isinstance(discovery_result, Mapping)
+        else None
+    )
+    if discovery_status not in {"ok", "no_eligible_candidates"}:
+        _raise_public_discovery_unavailable(discovery_result)
+
+    deep_check_result: Optional[Dict[str, Any]] = None
+    if discovery_status == "ok":
+        candidate_discovery = discovery_result.get("candidate_discovery")
+        stage_sources = (
+            candidate_discovery.get("stage_sources")
+            if isinstance(candidate_discovery, Mapping)
+            else None
+        )
+        tencent_stage = (
+            stage_sources.get("tencent_verification")
+            if isinstance(stage_sources, Mapping)
+            else None
+        )
+        tencent_stage_status = (
+            tencent_stage.get("status")
+            if isinstance(tencent_stage, Mapping)
+            else None
+        )
+        benchmark_trade_date = (
+            candidate_discovery.get("benchmark_trade_date")
+            if isinstance(candidate_discovery, Mapping)
+            else None
+        )
+        if benchmark_trade_date != context.benchmark_trade_date:
+            _raise_candidate_discovery_consistency_error(
+                "公开全市场基准交易日与市场上下文不一致"
+            )
+        definitions, selected_quote_map = _validate_completed_public_discovery(
+            discovery_status,
+            tencent_stage_status,
+            discovery_result.get("definitions"),
+            discovery_result.get("quote_map"),
+            benchmark_trade_date=benchmark_trade_date,
+            candidate_discovery=candidate_discovery,
+        )
+        definitions = _normalize_public_discovery_definitions(definitions)
+        _require_opportunity_time(context, stage="candidate_discovery")
+        _require_opportunity_time(context, stage="technical_deep_inspection")
+        deep_check_result = run_public_candidate_technical_funnel(
+            definitions,
+            selected_quote_map,
+            benchmark_trade_date=benchmark_trade_date,
+            command_remaining_seconds=context.stage_timeout(
+                "technical_deep_inspection"
+            ),
+        )
+        _require_opportunity_time(context, stage="technical_deep_inspection")
+
+    _require_opportunity_time(context, stage="orchestration")
+    payload = build_public_research_opportunities_payload(
+        discovery_result,
+        deep_check_result,
+        external_risk_level=external_risk_level,
+        database_status=database_status,
+        context=context,
+    )
+    _require_opportunity_time(context, stage="orchestration")
+    return payload
+
+
+def _public_discovery_failure_details(
+    exc: CLIError,
+    discovery_result: Any,
+) -> Dict[str, Any]:
+    raw_candidate_discovery = (
+        discovery_result.get("candidate_discovery")
+        if isinstance(discovery_result, Mapping)
+        else None
+    )
+    if not isinstance(raw_candidate_discovery, Mapping) and isinstance(
+        exc.details,
+        Mapping,
+    ):
+        raw_candidate_discovery = exc.details.get("candidate_discovery")
+    candidate_discovery = (
+        deepcopy(dict(raw_candidate_discovery))
+        if isinstance(raw_candidate_discovery, Mapping)
+        else {"status": "candidate_discovery_unavailable"}
+    )
+
+    details_stage = (
+        exc.details.get("stage")
+        if isinstance(exc.details, Mapping)
+        else None
+    )
+    discovery_stage = (
+        discovery_result.get("stage")
+        if isinstance(discovery_result, Mapping)
+        else None
+    )
+    return {
+        "stage": str(
+            details_stage
+            or exc.stage
+            or discovery_stage
+            or "candidate_discovery"
+        ),
+        "candidate_discovery": candidate_discovery,
+    }
+
+
+def _build_public_full_market_research_payload(
+    *,
+    context: OpportunityMarketContext,
+    external_risk_level: Optional[str] = None,
+    database_status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    discovery_state: Dict[str, Any] = {}
+    try:
+        return _orchestrate_public_full_market_research_payload(
+            context=context,
+            external_risk_level=external_risk_level,
+            database_status=database_status,
+            discovery_state=discovery_state,
+        )
+    except CLIError as exc:
+        if exc.code in {
+            "stage_timeout",
+            "technical_deep_check_timeout",
+            "invalid_external_risk_level",
+        }:
+            raise
+        raise CLIError(
+            "公开全市场候选发现不可用",
+            code="candidate_discovery_unavailable",
+            exit_code=4,
+            details=_public_discovery_failure_details(
+                exc,
+                discovery_state.get("result"),
+            ),
+        ) from exc
+
+
+def _cli_error_payload(
+    exc: CLIError,
+    *,
+    include_stage: bool = False,
+) -> Dict[str, Any]:
+    error: Dict[str, Any] = {"code": exc.code, "message": exc.message}
+    details_has_stage = isinstance(exc.details, Mapping) and "stage" in exc.details
+    if include_stage and exc.stage is not None and not details_has_stage:
+        error["stage"] = exc.stage
+    if exc.details:
+        error["details"] = deepcopy(exc.details)
+    return {"ok": False, "error": error}
+
+
 def _run_json(
     builder,
     *,
@@ -3411,7 +7664,7 @@ def _run_json(
         _write_json(payload, pretty=pretty)
     except CLIError as exc:
         _write_json(
-            {"ok": False, "error": {"code": exc.code, "message": exc.message}},
+            _cli_error_payload(exc),
             pretty=pretty,
             stderr=True,
         )
@@ -3425,9 +7678,16 @@ def _run_json(
         raise typer.Exit(4) from exc
 
 
-def _optional_market_database() -> tuple[Any, Dict[str, Any]]:
+def _optional_market_database(
+    *,
+    timeout_cap_ms: Optional[int] = None,
+) -> tuple[Any, Dict[str, Any]]:
     try:
-        return _get_database(), {"status": "connected"}
+        if timeout_cap_ms is None:
+            database = _get_database()
+        else:
+            database = _get_database(timeout_cap_ms=timeout_cap_ms)
+        return database, {"status": "connected"}
     except CLIError as exc:
         return None, {"status": "unavailable", "error_code": exc.code}
     except PyMongoError:
@@ -3559,7 +7819,7 @@ def trades_command(
 
 @holdings_app.command(
     name="market-status",
-    help="无需登录输出A股市场门禁 JSON；Mongo不可用时降级为腾讯指数结果",
+    help="无需登录输出A股市场门禁 JSON；Mongo宽度不可用时限时尝试新浪公共宽度",
 )
 def market_status_command(
     pretty: bool = typer.Option(False, "--pretty", help="格式化 JSON 输出"),
@@ -3570,18 +7830,123 @@ def market_status_command(
             payload = build_market_status_payload(
                 database,
                 database_status=database_status,
+                retry_public_timeout=True,
             )
         _write_json(payload, pretty=pretty)
     except CLIError as exc:
         _write_json(
-            {"ok": False, "error": {"code": exc.code, "message": exc.message}},
+            _cli_error_payload(exc),
             pretty=pretty,
             stderr=True,
         )
         raise typer.Exit(exc.exit_code) from exc
 
 
-@holdings_app.command(name="opportunities", help="输出未来两日观察池 JSON，包含现金约束、腾讯行情和风险标签")
+@holdings_app.command(
+    name="earnings",
+    help="无需登录批量核对 A 股业绩预告和最新强制披露实绩，最多 8 只",
+)
+def earnings_command(
+    codes: Optional[List[str]] = typer.Option(
+        None,
+        "--code",
+        help="A 股代码，可重复传入，最多 8 只",
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="格式化 JSON 输出"),
+) -> None:
+    try:
+        normalized_codes = _normalize_public_earnings_codes(codes)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            context = build_opportunity_market_context()
+            _require_opportunity_time(context, stage="tencent_market_context")
+            with _opportunity_wall_clock_guard(
+                context,
+                stage="earnings_forecast_review",
+            ):
+                payload = build_public_candidate_earnings_payload(
+                    normalized_codes,
+                    context=context,
+                )
+            _require_opportunity_time(
+                context,
+                stage="earnings_forecast_review",
+            )
+            serialized_payload = _serialize_json(payload, pretty=pretty)
+            _require_opportunity_time(
+                context,
+                stage="earnings_forecast_review",
+            )
+        _write_serialized_json(serialized_payload)
+    except CLIError as exc:
+        _write_json(
+            _cli_error_payload(exc, include_stage=True),
+            pretty=pretty,
+            stderr=True,
+        )
+        raise typer.Exit(exc.exit_code) from exc
+
+
+@holdings_app.command(
+    name="notices",
+    help="无需登录批量核对 A 股最近 7 个自然日公告，最多 8 只",
+)
+def notices_command(
+    codes: Optional[List[str]] = typer.Option(
+        None,
+        "--code",
+        help="A 股代码，可重复传入，最多 8 只",
+    ),
+    lookback_days: int = typer.Option(
+        NOTICE_LOOKBACK_CALENDAR_DAYS,
+        "--lookback-days",
+        help="公告回看自然日，1-90；超过 7 天改用个股公告接口",
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="格式化 JSON 输出"),
+) -> None:
+    try:
+        normalized_codes = _normalize_public_notice_codes(codes)
+        normalized_lookback_days = _normalize_notice_lookback_days(
+            lookback_days
+        )
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            context = build_opportunity_market_context()
+            _require_opportunity_time(context, stage="tencent_market_context")
+            with _opportunity_wall_clock_guard(
+                context,
+                stage="recent_notice_review",
+            ):
+                payload = build_public_candidate_notice_payload(
+                    normalized_codes,
+                    context=context,
+                    lookback_calendar_days=normalized_lookback_days,
+                )
+            _require_opportunity_time(
+                context,
+                stage="recent_notice_review",
+            )
+            serialized_payload = _serialize_json(payload, pretty=pretty)
+            _require_opportunity_time(
+                context,
+                stage="recent_notice_review",
+            )
+        _write_serialized_json(serialized_payload)
+    except CLIError as exc:
+        _write_json(
+            _cli_error_payload(exc, include_stage=True),
+            pretty=pretty,
+            stderr=True,
+        )
+        raise typer.Exit(exc.exit_code) from exc
+
+
+@holdings_app.command(
+    name="opportunities",
+    help=(
+        "输出未来两日观察池 JSON；不传候选时优先使用 Mongo；"
+        "Mongo 不可用，或行情候选池不可用、为空、过期、覆盖不足时"
+        "自动执行公开全市场研究"
+    ),
+)
 def opportunities_command(
     username: Optional[str] = typer.Option(None, "--username", help="登录用户名"),
     email: Optional[str] = typer.Option(None, "--email", help="登录邮箱"),
@@ -3589,28 +7954,191 @@ def opportunities_command(
     candidate_codes: Optional[List[str]] = typer.Option(
         None,
         "--candidate-code",
-        help="自定义候选股票代码，可重复传入；不传则从最新 Mongo 行情动态初筛",
+        help="手工候选路径，可重复传入，最多 8 只",
     ),
     external_risk_level: Optional[str] = typer.Option(
         None,
         "--external-risk-level",
         help="外部风险等级 green/yellow/red；不传按 unknown 0% 处理",
     ),
+    target_exposure_pct: Optional[float] = typer.Option(
+        None,
+        "--target-exposure-pct",
+        help="显式截止日目标仓位百分比；必须与 --deployment-deadline 一起使用",
+    ),
+    deployment_deadline: Optional[str] = typer.Option(
+        None,
+        "--deployment-deadline",
+        help="仓位目标截止日，格式 YYYY-MM-DD；必须显式提供候选代码",
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="格式化 JSON 输出"),
 ) -> None:
-    _run_json(
-        lambda db: build_opportunities_payload(
-            db,
-            username=username,
-            email=email,
-            user_id=user_id,
-            candidate_codes=candidate_codes,
-            buy_lot_size=DEFAULT_BUY_LOT_SIZE,
-            external_risk_level=external_risk_level,
-        ),
-        pretty=pretty,
-        preflight=lambda: _validate_external_risk_level(external_risk_level),
-    )
+    try:
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            _validate_external_risk_level(external_risk_level)
+            deployment_objective = _validate_deployment_objective(
+                target_exposure_pct,
+                deployment_deadline,
+            )
+            if deployment_objective is not None and not candidate_codes:
+                raise CLIError(
+                    "截止日仓位目标必须显式提供至少一个 --candidate-code",
+                    code="deployment_objective_requires_candidates",
+                )
+            context = build_opportunity_market_context()
+            _require_opportunity_time(context, stage="tencent_market_context")
+            precomputed_manual_earnings_review = None
+            if candidate_codes:
+                manual_definitions = _candidate_definitions(candidate_codes)
+                precomputed_manual_earnings_review = _run_opportunity_sync_builder(
+                    context,
+                    lambda: _manual_candidate_earnings_review(
+                        manual_definitions,
+                        benchmark_trade_date=getattr(
+                            context,
+                            "benchmark_trade_date",
+                            None,
+                        ),
+                    ),
+                )
+            mongo_timeout_seconds = context.stage_timeout("mongo")
+            if mongo_timeout_seconds <= 0:
+                database, database_status = None, {
+                    "status": "unavailable",
+                    "error_code": "stage_timeout",
+                    "stage": "mongo",
+                    "reason": "command_deadline_exceeded",
+                }
+            else:
+                mongo_timeout_ms = min(
+                    5000,
+                    max(1, int(mongo_timeout_seconds * 1000)),
+                )
+                database, database_status = _optional_market_database(
+                    timeout_cap_ms=mongo_timeout_ms,
+                )
+            _require_opportunity_time(context, stage="mongo")
+            if database is not None:
+                try:
+                    payload = _run_opportunity_sync_builder(
+                        context,
+                        lambda: build_opportunities_payload(
+                            database,
+                            username=username,
+                            email=email,
+                            user_id=user_id,
+                            candidate_codes=candidate_codes,
+                            buy_lot_size=DEFAULT_BUY_LOT_SIZE,
+                            external_risk_level=external_risk_level,
+                            context=context,
+                            precomputed_manual_earnings_review=(
+                                precomputed_manual_earnings_review
+                            ),
+                            target_exposure_pct=target_exposure_pct,
+                            deployment_deadline=deployment_deadline,
+                        ),
+                    )
+                except PyMongoError:
+                    failed_database_status = {
+                        "status": "unavailable",
+                        "error_code": "database_error",
+                    }
+                    if candidate_codes:
+                        payload = _run_opportunity_sync_builder(
+                            context,
+                            lambda: build_research_only_opportunities_payload(
+                                candidate_codes=candidate_codes,
+                                username=username,
+                                email=email,
+                                user_id=user_id,
+                                external_risk_level=external_risk_level,
+                                database_status=failed_database_status,
+                                context=context,
+                                precomputed_manual_earnings_review=(
+                                    precomputed_manual_earnings_review
+                                ),
+                                target_exposure_pct=target_exposure_pct,
+                                deployment_deadline=deployment_deadline,
+                            ),
+                        )
+                    else:
+                        payload = _run_opportunity_sync_builder(
+                            context,
+                            lambda: _build_public_full_market_research_payload(
+                                context=context,
+                                external_risk_level=external_risk_level,
+                                database_status=failed_database_status,
+                            ),
+                        )
+                else:
+                    if (
+                        not candidate_codes
+                        and _should_fallback_to_public_research(payload)
+                    ):
+                        mongo_account_payload = payload
+                        public_payload = _run_opportunity_sync_builder(
+                            context,
+                            lambda: _build_public_full_market_research_payload(
+                                context=context,
+                                external_risk_level=external_risk_level,
+                                database_status={"status": "connected"},
+                            ),
+                        )
+                        payload = build_account_context_public_research_payload(
+                            public_payload,
+                            mongo_account_payload,
+                            as_of=context.now,
+                            benchmark_session_dates=(
+                                [context.benchmark_trade_date]
+                                if context.benchmark_trade_date
+                                else None
+                            ),
+                        )
+            elif candidate_codes:
+                payload = _run_opportunity_sync_builder(
+                    context,
+                    lambda: build_research_only_opportunities_payload(
+                        candidate_codes=candidate_codes,
+                        username=username,
+                        email=email,
+                        user_id=user_id,
+                        external_risk_level=external_risk_level,
+                        database_status=database_status,
+                        context=context,
+                        precomputed_manual_earnings_review=(
+                            precomputed_manual_earnings_review
+                        ),
+                        target_exposure_pct=target_exposure_pct,
+                        deployment_deadline=deployment_deadline,
+                    ),
+                )
+            else:
+                payload = _run_opportunity_sync_builder(
+                    context,
+                    lambda: _build_public_full_market_research_payload(
+                        context=context,
+                        external_risk_level=external_risk_level,
+                        database_status=database_status,
+                    ),
+                )
+            _require_opportunity_time(context, stage="orchestration")
+            serialized_payload = _serialize_json(payload, pretty=pretty)
+            _require_opportunity_time(context, stage="orchestration")
+        _write_serialized_json(serialized_payload)
+    except CLIError as exc:
+        _write_json(
+            _cli_error_payload(exc, include_stage=True),
+            pretty=pretty,
+            stderr=True,
+        )
+        raise typer.Exit(exc.exit_code) from exc
+    except PyMongoError as exc:
+        _write_json(
+            {"ok": False, "error": {"code": "database_error", "message": str(exc)}},
+            pretty=pretty,
+            stderr=True,
+        )
+        raise typer.Exit(4) from exc
 
 
 def main() -> None:

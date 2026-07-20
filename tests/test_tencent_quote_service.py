@@ -1,8 +1,12 @@
+import json
 import sys
 from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
+
+from app.services import tencent_quote_service as quote_service
 from app.services.tencent_quote_service import (
     assess_cn_quote_freshness,
     fetch_tencent_daily_bars_sync,
@@ -25,7 +29,12 @@ def _make_tencent_payload(
     turnover_rate: str = "0.69",
     circ_mv_yi: str = "0.93",
     total_mv_yi: str = "1.20",
+    limit_up: str = "5.71",
+    limit_down: str = "4.67",
+    volume_ratio: str = "0.63",
     provider_timestamp: str = "20260710145930",
+    provider_symbol: str | None = None,
+    field_count: int = 50,
 ) -> str:
     fields = ["0"] * 50
     fields[1] = name
@@ -48,8 +57,11 @@ def _make_tencent_payload(
     fields[44] = circ_mv_yi
     fields[45] = total_mv_yi
     fields[46] = "1.20"
-    fields[49] = "0.63"
-    return f'v_sh{code}="{"~".join(fields)}";'
+    fields[47] = limit_up
+    fields[48] = limit_down
+    fields[49] = volume_ratio
+    symbol = provider_symbol or f"sh{code}"
+    return f'v_{symbol}="{"~".join(fields[:field_count])}";'
 
 
 def test_to_tencent_symbol_adds_market_prefix():
@@ -80,6 +92,8 @@ def test_parse_tencent_quote_payload_returns_market_quote_shape():
     assert quote["pre_close"] == 5.00
     assert quote["turnover_rate"] == 0.69
     assert quote["amplitude"] == 2.00
+    assert quote["limit_up"] == 5.71
+    assert quote["limit_down"] == 4.67
     assert quote["volume_ratio"] == 0.63
     assert quote["pe_ratio"] == 12.3
     assert quote["pb_ratio"] == 1.20
@@ -132,6 +146,219 @@ def test_parse_tencent_quote_payload_rejects_empty_and_malformed_payloads():
     assert parse_tencent_quote_payload("601006", "bad payload") is None
 
 
+def test_parse_tencent_quote_payload_rejects_a_complete_non_positive_price():
+    assert (
+        parse_tencent_quote_payload(
+            "601006",
+            _make_tencent_payload(price="0"),
+        )
+        is None
+    )
+
+
+def test_parse_tencent_quote_batch_preserves_order_symbols_and_duplicates():
+    payload = "\n".join(
+        [
+            _make_tencent_payload(
+                code="600000",
+                name="浦发银行",
+                provider_symbol="sh600000",
+            ),
+            _make_tencent_payload(
+                code="000001",
+                name="平安银行",
+                provider_symbol="sz000001",
+            ),
+            _make_tencent_payload(
+                code="600000",
+                name="浦发银行重复行",
+                provider_symbol="sh600000",
+            ),
+        ]
+    )
+
+    rows = quote_service.parse_tencent_quote_batch_payload(payload)
+
+    assert [row["code"] for row in rows] == ["600000", "000001", "600000"]
+    assert [row["provider_symbol"] for row in rows] == [
+        "sh600000",
+        "sz000001",
+        "sh600000",
+    ]
+    assert [row["envelope_code"] for row in rows] == [
+        "600000",
+        "000001",
+        "600000",
+    ]
+    assert [row["payload_code"] for row in rows] == [
+        "600000",
+        "000001",
+        "600000",
+    ]
+    assert [row["parse_status"] for row in rows] == ["ok", "ok", "ok"]
+    assert rows[2]["name"] == "浦发银行重复行"
+
+
+def test_parse_tencent_quote_batch_preserves_complete_invalid_price_identity():
+    payload = "\n".join(
+        [
+            _make_tencent_payload(
+                code="600000",
+                name="浦发银行",
+                provider_symbol="sh600000",
+            ),
+            _make_tencent_payload(
+                code="600000",
+                name="浦发银行无效价",
+                price="0",
+                provider_symbol="sh600000",
+            ),
+        ]
+    )
+
+    rows = quote_service.parse_tencent_quote_batch_payload(payload)
+
+    assert [row["code"] for row in rows] == ["600000", "600000"]
+    assert [row["provider_symbol"] for row in rows] == [
+        "sh600000",
+        "sh600000",
+    ]
+    assert rows[0]["close"] == 5.19
+    assert rows[1].get("close") is None
+    assert rows[1] == {
+        "code": "600000",
+        "provider_symbol": "sh600000",
+        "envelope_code": "600000",
+        "payload_code": "600000",
+        "parse_status": "invalid_price",
+        "source": "tencent",
+        "close": None,
+        "amount": 6_404_500.0,
+    }
+    assert json.dumps(rows, allow_nan=False)
+
+
+def test_parse_tencent_quote_batch_preserves_malformed_assignment_envelopes():
+    payload = "\n".join(
+        [
+            _make_tencent_payload(code="600000", provider_symbol="sh600000"),
+            'v_sz300750="damaged";',
+            "",
+            'v_bj430047="";',
+            _make_tencent_payload(code="000001", provider_symbol="sz000001"),
+        ]
+    )
+
+    rows = quote_service.parse_tencent_quote_batch_payload(payload)
+
+    assert [row["code"] for row in rows] == [
+        "600000",
+        "300750",
+        "430047",
+        "000001",
+    ]
+    assert [row["envelope_code"] for row in rows] == [
+        "600000",
+        "300750",
+        "430047",
+        "000001",
+    ]
+    assert [row["payload_code"] for row in rows] == [
+        "600000",
+        None,
+        None,
+        "000001",
+    ]
+    assert [row["parse_status"] for row in rows] == [
+        "ok",
+        "malformed_payload",
+        "empty_payload",
+        "ok",
+    ]
+
+
+def test_parse_tencent_quote_batch_keeps_empty_and_valid_same_envelope_rows():
+    payload = "\n".join(
+        [
+            'v_sh600000="";',
+            _make_tencent_payload(code="600000", provider_symbol="sh600000"),
+        ]
+    )
+
+    rows = quote_service.parse_tencent_quote_batch_payload(payload)
+
+    assert len(rows) == 2
+    assert [row["envelope_code"] for row in rows] == ["600000", "600000"]
+    assert [row["parse_status"] for row in rows] == ["empty_payload", "ok"]
+    assert rows[0]["payload_code"] is None
+    assert rows[0]["code"] == "600000"
+
+
+def test_parse_tencent_quote_batch_keeps_49_field_invalid_price_assignment():
+    rows = quote_service.parse_tencent_quote_batch_payload(
+        _make_tencent_payload(
+            code="600000",
+            provider_symbol="sh600000",
+            price="0",
+            field_count=49,
+        )
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["envelope_code"] == "600000"
+    assert rows[0]["payload_code"] == "600000"
+    assert rows[0]["parse_status"] == "invalid_price"
+    assert rows[0].get("close") is None
+
+
+def test_parse_tencent_quote_batch_separates_envelope_and_payload_code():
+    rows = quote_service.parse_tencent_quote_batch_payload(
+        _make_tencent_payload(
+            code="000001",
+            provider_symbol="sh600000",
+        )
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["provider_symbol"] == "sh600000"
+    assert rows[0]["envelope_code"] == "600000"
+    assert rows[0]["payload_code"] == "000001"
+    assert rows[0]["code"] == "000001"
+    assert rows[0]["parse_status"] == "ok"
+
+
+def test_parse_tencent_quote_batch_ignores_assignment_like_text_inside_fields():
+    payload = "\n".join(
+        [
+            _make_tencent_payload(
+                code="600000",
+                name="浦发银行 v_sz300750=not-an-assignment",
+                provider_symbol="sh600000",
+            ),
+            _make_tencent_payload(code="000001", provider_symbol="sz000001"),
+        ]
+    )
+
+    rows = quote_service.parse_tencent_quote_batch_payload(payload)
+
+    assert [row["code"] for row in rows] == ["600000", "000001"]
+    assert rows[0]["name"] == "浦发银行 v_sz300750=not-an-assignment"
+
+
+def test_parse_tencent_quote_batch_parses_semicolon_adjacent_assignments():
+    payload = "".join(
+        [
+            _make_tencent_payload(code="600000", provider_symbol="sh600000"),
+            _make_tencent_payload(code="000001", provider_symbol="sz000001"),
+        ]
+    )
+
+    rows = quote_service.parse_tencent_quote_batch_payload(payload)
+
+    assert [row["code"] for row in rows] == ["600000", "000001"]
+    assert [row["provider_symbol"] for row in rows] == ["sh600000", "sz000001"]
+
+
 def test_fetch_tencent_quote_uses_https(monkeypatch):
     captured = {}
 
@@ -151,6 +378,462 @@ def test_fetch_tencent_quote_uses_https(monkeypatch):
     assert quote is not None
     assert captured["url"].startswith("https://qt.gtimg.cn/")
     assert captured["headers"]["Referer"].startswith("https://")
+
+
+def test_fetch_tencent_quotes_uses_one_request_and_ordered_unique_codes(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "\n".join(
+            [
+                _make_tencent_payload(code="600000", provider_symbol="sh600000"),
+                _make_tencent_payload(code="000001", provider_symbol="sz000001"),
+                _make_tencent_payload(code="600000", provider_symbol="sh600000"),
+            ]
+        )
+        encoding = None
+
+    response = FakeResponse()
+
+    def fake_get(url, *, headers, timeout):
+        calls.append({"url": url, "headers": headers, "timeout": timeout})
+        return response
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", fake_get)
+
+    result = quote_service.fetch_tencent_quotes_sync(
+        ["600000", "sh600000", "000001.SZ"],
+        timeout=7.5,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://qt.gtimg.cn/q=sh600000,sz000001"
+    assert calls[0]["timeout"] == 7.5
+    assert calls[0]["headers"]["Referer"] == "https://finance.qq.com"
+    assert response.encoding == "gbk"
+    assert result["status"] == "ok"
+    assert result["requested_codes"] == ["600000", "000001"]
+    assert [row["code"] for row in result["rows"]] == ["600000", "000001", "600000"]
+    assert result["error_type"] is None
+
+
+def test_fetch_tencent_quotes_preserves_four_major_index_provider_symbols(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+        encoding = None
+
+    def fake_get(url, *, headers, timeout):
+        calls.append({"url": url, "timeout": timeout})
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", fake_get)
+
+    result = quote_service.fetch_tencent_quotes_sync(
+        ["sh000001", "sz399001", "sz399006", "sh000688"],
+        timeout=9.5,
+    )
+
+    assert calls == [
+        {
+            "url": (
+                "https://qt.gtimg.cn/q="
+                "sh000001,sz399001,sz399006,sh000688"
+            ),
+            "timeout": 9.5,
+        }
+    ]
+    assert result["status"] == "ok"
+    assert result["requested_codes"] == [
+        "sh000001",
+        "sz399001",
+        "sz399006",
+        "sh000688",
+    ]
+
+
+def test_fetch_tencent_quotes_deduplicates_index_aliases_by_provider_symbol(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+        encoding = None
+
+    def fake_get(url, *, headers, timeout):
+        captured["url"] = url
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", fake_get)
+
+    result = quote_service.fetch_tencent_quotes_sync(
+        [
+            "sz399001",
+            "399001",
+            "399001.SZ",
+            "sz399006",
+            "399006",
+            "399006.SZ",
+            "000001",
+            "sz000001",
+        ]
+    )
+
+    assert result["requested_codes"] == ["sz399001", "sz399006", "000001"]
+    assert captured["url"] == (
+        "https://qt.gtimg.cn/q=sz399001,sz399006,sz000001"
+    )
+
+
+def test_fetch_tencent_quotes_limits_request_to_first_40_unique_codes(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+        encoding = None
+
+    def fake_get(url, *, headers, timeout):
+        captured["url"] = url
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", fake_get)
+    codes = [str(code) for code in range(600000, 600041)]
+
+    result = quote_service.fetch_tencent_quotes_sync(codes)
+
+    assert result["requested_codes"] == codes[:40]
+    assert captured["url"].count(",") == 39
+    assert captured["url"].endswith("sh600039")
+
+
+def test_fetch_tencent_quotes_batched_splits_160_codes_into_ordered_40_code_requests(
+    monkeypatch,
+):
+    codes = [f"{600000 + index:06d}" for index in range(160)]
+    calls = []
+
+    def fake_fetch(batch, *, timeout):
+        requested_codes = list(batch)
+        calls.append({"codes": requested_codes, "timeout": timeout})
+        return {
+            "status": "ok",
+            "requested_codes": requested_codes,
+            "rows": [{"code": code} for code in requested_codes],
+            "error_type": None,
+        }
+
+    monotonic_values = iter([100.0, 100.1, 100.2, 100.3, 100.4])
+    monkeypatch.setattr(quote_service, "fetch_tencent_quotes_sync", fake_fetch)
+    monkeypatch.setattr(
+        quote_service.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    result = quote_service.fetch_tencent_quotes_batched_sync(codes, timeout=8.0)
+
+    assert [len(call["codes"]) for call in calls] == [40, 40, 40, 40]
+    assert [code for call in calls for code in call["codes"]] == codes
+    assert all(0 < call["timeout"] <= 8.0 for call in calls)
+    assert result == {
+        "status": "ok",
+        "requested_codes": codes,
+        "rows": [{"code": code} for code in codes],
+        "error_type": None,
+        "batch_count": 4,
+        "completed_batch_count": 4,
+    }
+
+
+def test_fetch_tencent_quotes_batched_fails_closed_without_partial_rows(monkeypatch):
+    codes = [f"{600000 + index:06d}" for index in range(81)]
+    calls = []
+
+    def fake_fetch(batch, *, timeout):
+        requested_codes = list(batch)
+        calls.append(requested_codes)
+        if len(calls) == 2:
+            return {
+                "status": "fetch_error",
+                "requested_codes": requested_codes,
+                "rows": [],
+                "error_type": "request_timeout",
+            }
+        return {
+            "status": "ok",
+            "requested_codes": requested_codes,
+            "rows": [{"code": code} for code in requested_codes],
+            "error_type": None,
+        }
+
+    monkeypatch.setattr(quote_service, "fetch_tencent_quotes_sync", fake_fetch)
+
+    result = quote_service.fetch_tencent_quotes_batched_sync(codes, timeout=8.0)
+
+    assert len(calls) == 2
+    assert result == {
+        "status": "fetch_error",
+        "requested_codes": codes,
+        "rows": [],
+        "error_type": "request_timeout",
+        "batch_count": 3,
+        "completed_batch_count": 1,
+        "failed_batch_index": 1,
+    }
+
+
+def test_fetch_tencent_quotes_batched_caps_the_public_screen_pool_at_160(monkeypatch):
+    codes = [f"{600000 + index:06d}" for index in range(170)]
+    calls = []
+
+    def fake_fetch(batch, *, timeout):
+        requested_codes = list(batch)
+        calls.append(requested_codes)
+        return {
+            "status": "ok",
+            "requested_codes": requested_codes,
+            "rows": [],
+            "error_type": None,
+        }
+
+    monkeypatch.setattr(quote_service, "fetch_tencent_quotes_sync", fake_fetch)
+
+    result = quote_service.fetch_tencent_quotes_batched_sync(codes)
+
+    assert result["requested_codes"] == codes[:160]
+    assert len(calls) == 4
+    assert all(len(batch) == 40 for batch in calls)
+
+
+def test_fetch_tencent_quotes_returns_empty_without_request(monkeypatch):
+    def unexpected_get(url, *, headers, timeout):
+        raise AssertionError("empty request must not call Tencent")
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", unexpected_get)
+
+    result = quote_service.fetch_tencent_quotes_sync([])
+
+    assert result == {
+        "status": "empty",
+        "requested_codes": [],
+        "rows": [],
+        "error_type": None,
+    }
+
+
+def test_fetch_tencent_quotes_returns_stable_http_failure(monkeypatch):
+    class FakeResponse:
+        status_code = 503
+        text = "unavailable"
+        encoding = None
+
+    monkeypatch.setattr(
+        "app.services.tencent_quote_service.requests.get",
+        lambda url, *, headers, timeout: FakeResponse(),
+    )
+
+    result = quote_service.fetch_tencent_quotes_sync(["600000"])
+
+    assert result == {
+        "status": "fetch_error",
+        "requested_codes": ["600000"],
+        "rows": [],
+        "error_type": "HTTPError",
+        "http_status": 503,
+    }
+
+
+def test_fetch_tencent_quotes_returns_stable_request_failure(monkeypatch):
+    def fake_get(url, *, headers, timeout):
+        raise quote_service.requests.Timeout("slow response")
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", fake_get)
+
+    result = quote_service.fetch_tencent_quotes_sync(["600000"])
+
+    assert result == {
+        "status": "fetch_error",
+        "requested_codes": ["600000"],
+        "rows": [],
+        "error_type": "request_timeout",
+    }
+
+
+def test_fetch_tencent_quotes_rejects_scalar_code_inputs_without_request(monkeypatch):
+    def unexpected_get(url, *, headers, timeout):
+        raise AssertionError("invalid top-level input must not call Tencent")
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", unexpected_get)
+
+    for invalid_codes in (None, "600000", b"600000"):
+        result = quote_service.fetch_tencent_quotes_sync(invalid_codes)
+
+        assert result == {
+            "status": "invalid_request",
+            "requested_codes": [],
+            "rows": [],
+            "error_type": "invalid_codes",
+        }
+
+
+def test_fetch_tencent_quotes_only_accepts_valid_exchange_matched_ascii_codes(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+        encoding = None
+
+    def fake_get(url, *, headers, timeout):
+        captured["url"] = url
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", fake_get)
+
+    result = quote_service.fetch_tencent_quotes_sync(
+        [
+            "foo1",
+            "６０００００",
+            "500000",
+            "sz600000",
+            "600000.sz",
+            "sh600000",
+            "600000.SH",
+            "000001",
+            "SZ300750",
+            "430047.BJ",
+            "bj830001",
+            "870001",
+            "880001",
+            "920001",
+        ]
+    )
+
+    assert result["requested_codes"] == [
+        "600000",
+        "000001",
+        "300750",
+        "430047",
+        "830001",
+        "870001",
+        "880001",
+        "920001",
+    ]
+    assert captured["url"] == (
+        "https://qt.gtimg.cn/q="
+        "sh600000,sz000001,sz300750,bj430047,"
+        "bj830001,bj870001,bj880001,bj920001"
+    )
+
+
+def test_fetch_tencent_quotes_returns_stable_failure_for_broken_iterator(monkeypatch):
+    class BrokenCodes:
+        def __iter__(self):
+            yield "600000"
+            raise RuntimeError("broken iterator")
+
+    def unexpected_get(url, *, headers, timeout):
+        raise AssertionError("broken iterator must not call Tencent")
+
+    normalize_calls = []
+    original_normalize = quote_service._normalize_tencent_request_code
+
+    def track_normalize(value):
+        normalize_calls.append(value)
+        return original_normalize(value)
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", unexpected_get)
+    monkeypatch.setattr(
+        quote_service,
+        "_normalize_tencent_request_code",
+        track_normalize,
+    )
+
+    result = quote_service.fetch_tencent_quotes_sync(BrokenCodes())
+
+    assert result == {
+        "status": "invalid_request",
+        "requested_codes": [],
+        "rows": [],
+        "error_type": "invalid_codes",
+    }
+    assert normalize_calls == []
+
+
+def test_fetch_tencent_quotes_does_not_hide_internal_normalization_errors(
+    monkeypatch,
+):
+    def broken_normalize(value):
+        raise RuntimeError(f"normalizer failed for {value}")
+
+    monkeypatch.setattr(
+        quote_service,
+        "_normalize_tencent_request_code",
+        broken_normalize,
+    )
+
+    with pytest.raises(RuntimeError, match="normalizer failed"):
+        quote_service.fetch_tencent_quotes_sync(["600000"])
+
+
+def test_fetch_tencent_quotes_reports_parser_internal_error(
+    monkeypatch,
+    caplog,
+):
+    class FakeResponse:
+        status_code = 200
+        text = _make_tencent_payload()
+        encoding = None
+
+    monkeypatch.setattr(
+        quote_service.requests,
+        "get",
+        lambda url, *, headers, timeout: FakeResponse(),
+    )
+    monkeypatch.setattr(
+        quote_service,
+        "parse_tencent_quote_batch_payload",
+        lambda payload: (_ for _ in ()).throw(RuntimeError("parser exploded")),
+    )
+
+    with caplog.at_level("ERROR", logger=quote_service.__name__):
+        result = quote_service.fetch_tencent_quotes_sync(["600000"])
+
+    assert result == {
+        "status": "internal_error",
+        "requested_codes": ["600000"],
+        "rows": [],
+        "error_type": "parser_error",
+    }
+    assert any(record.exc_info for record in caplog.records)
+
+
+def test_fetch_tencent_quotes_uses_stable_request_exception_types(monkeypatch):
+    current_error = quote_service.requests.ConnectTimeout("connect timeout")
+
+    def fake_get(url, *, headers, timeout):
+        raise current_error
+
+    monkeypatch.setattr("app.services.tencent_quote_service.requests.get", fake_get)
+
+    for timeout_error in (
+        quote_service.requests.Timeout("timeout"),
+        quote_service.requests.ConnectTimeout("connect timeout"),
+        quote_service.requests.ReadTimeout("read timeout"),
+    ):
+        current_error = timeout_error
+        result = quote_service.fetch_tencent_quotes_sync(["600000"])
+        assert result["error_type"] == "request_timeout"
+
+    current_error = quote_service.requests.ConnectionError("connection failed")
+    result = quote_service.fetch_tencent_quotes_sync(["600000"])
+    assert result["error_type"] == "request_failed"
 
 
 def test_quote_freshness_uses_provider_time_at_exact_boundaries():
@@ -231,6 +914,177 @@ def test_quote_freshness_marks_off_session_and_fallback_as_display_only():
     }
     assert fallback["actionable"] is False
     assert fallback["status"] == "display_only_source"
+
+
+def test_research_quote_freshness_uses_intraday_age_boundaries():
+    now = datetime(2026, 7, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    exactly_five_minutes = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T09:55:00+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    five_minutes_and_one_second = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T09:54:59+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    exactly_two_minutes_future = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T10:02:00+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    two_minutes_and_one_second_future = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T10:02:01+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+
+    assert exactly_five_minutes["data_complete"] is True
+    assert exactly_five_minutes["age_seconds"] == 300
+    assert five_minutes_and_one_second["data_complete"] is False
+    assert five_minutes_and_one_second["status"] == "stale_trade_at"
+    assert exactly_two_minutes_future["data_complete"] is True
+    assert two_minutes_and_one_second_future["data_complete"] is False
+    assert two_minutes_and_one_second_future["status"] == "future_trade_at"
+    assert all(
+        "actionable" not in result
+        for result in (
+            exactly_five_minutes,
+            five_minutes_and_one_second,
+            exactly_two_minutes_future,
+            two_minutes_and_one_second_future,
+        )
+    )
+
+
+def test_research_quote_freshness_uses_completed_day_close_threshold():
+    now = datetime(2026, 7, 10, 15, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    complete = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T14:55:00+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    incomplete = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T14:54:59+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+
+    assert complete["data_complete"] is True
+    assert complete["status"] == "fresh"
+    assert incomplete["data_complete"] is False
+    assert incomplete["status"] == "stale_trade_at"
+
+
+def test_research_quote_freshness_limits_completed_day_future_skew():
+    now = datetime(2026, 7, 10, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    exactly_two_minutes_future = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T15:02:00+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    two_minutes_and_one_second_future = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T15:02:01+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+
+    assert exactly_two_minutes_future["data_complete"] is True
+    assert two_minutes_and_one_second_future["data_complete"] is False
+    assert two_minutes_and_one_second_future["status"] == "future_trade_at"
+
+
+def test_research_quote_freshness_handles_datetime_max_without_overflow():
+    result = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "9999-12-31T23:59:59+08:00"},
+        benchmark_trade_date="9999-12-31",
+        now=datetime.max.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result["data_complete"] is True
+    assert result["status"] == "fresh"
+
+
+def test_research_quote_freshness_handles_extreme_future_skew_without_overflow():
+    result = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T15:02:01+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=datetime(2026, 7, 10, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        max_future_skew_seconds=10**20,
+    )
+
+    assert result["data_complete"] is True
+    assert result["status"] == "fresh"
+
+
+def test_research_quote_freshness_treats_prior_benchmark_as_completed_day():
+    quote = {"source": "tencent", "trade_at": "2026-07-10T14:55:00+08:00"}
+    before_open = datetime(2026, 7, 13, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    weekend = datetime(2026, 7, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    before_open_result = quote_service.assess_tencent_research_quote_freshness(
+        quote,
+        benchmark_trade_date="2026-07-10",
+        now=before_open,
+    )
+    weekend_result = quote_service.assess_tencent_research_quote_freshness(
+        quote,
+        benchmark_trade_date="2026-07-10",
+        now=weekend,
+    )
+    incomplete = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-10T14:54:59+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=before_open,
+    )
+
+    assert before_open_result["data_complete"] is True
+    assert weekend_result["data_complete"] is True
+    assert incomplete["data_complete"] is False
+    assert incomplete["status"] == "stale_trade_at"
+
+
+def test_research_quote_freshness_rejects_wrong_or_future_benchmark_date():
+    now = datetime(2026, 7, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    wrong_trade_date = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-09T15:00:00+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    future_benchmark = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "2026-07-13T15:00:00+08:00"},
+        benchmark_trade_date="2026-07-13",
+        now=now,
+    )
+
+    assert wrong_trade_date["data_complete"] is False
+    assert wrong_trade_date["status"] == "trade_date_mismatch"
+    assert future_benchmark["data_complete"] is False
+    assert future_benchmark["status"] == "future_benchmark_trade_date"
+
+
+def test_research_quote_freshness_requires_tencent_and_parseable_trade_at():
+    now = datetime(2026, 7, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    wrong_source = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "akshare", "trade_at": "2026-07-10T10:00:00+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    malformed_time = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "trade_at": "not-a-time"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+
+    assert wrong_source["data_complete"] is False
+    assert wrong_source["status"] == "invalid_source"
+    assert malformed_time["data_complete"] is False
+    assert malformed_time["status"] == "missing_trade_at"
 
 
 def test_normalize_tencent_daily_bars_drops_invalid_rows_deduplicates_and_sorts():

@@ -106,6 +106,28 @@ def test_size_candidate_evaluates_whole_lots_against_shared_loss_budget():
     assert sizing["blocking_failed_gates"] == []
 
 
+def test_size_candidate_accepts_explicit_deadline_mode_caps():
+    sizing = size_ashare_candidate(
+        entry_price=24.5,
+        stop_price=23.1,
+        target_price=27.2,
+        actionable_equity=10685.41,
+        cash_available=10685.41,
+        original_cash=10685.41,
+        remaining_new_exposure=6945.52,
+        remaining_initial_deploy=6945.52,
+        remaining_loss_budget=320.56,
+        existing_symbol_market_value=0.0,
+        candidate_cash_cap_amount=2671.35,
+        post_trade_symbol_cap_pct=25.0,
+    )
+
+    assert sizing["suggested_lots"] == 1
+    assert sizing["constraints"]["candidate_cash_cap"] == 2671.35
+    assert sizing["constraints"]["post_trade_symbol_cap_pct"] == 25.0
+    assert sizing["constraints"]["post_trade_symbol_cap"] == 2671.35
+
+
 def test_size_candidate_fails_closed_for_rr_cash_and_symbol_caps():
     low_rr = size_ashare_candidate(
         entry_price=20.0,

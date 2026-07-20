@@ -146,3 +146,33 @@ def test_fetch_dividend_calendar_returns_structured_unavailable(monkeypatch):
         "reason": "cninfo unavailable",
         "is_reference_only": True,
     }
+
+
+def test_fetch_dividend_calendar_retries_transient_provider_parse_error(monkeypatch):
+    calls = []
+
+    class FakeFrame:
+        def to_dict(self, orient):
+            assert orient == "records"
+            return [_dividend_row()]
+
+    def load(*, symbol):
+        calls.append(symbol)
+        if len(calls) == 1:
+            raise KeyError("records")
+        return FakeFrame()
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "akshare",
+        SimpleNamespace(stock_dividend_cninfo=load),
+    )
+
+    result = fetch_cn_dividend_calendar_sync(
+        "600900",
+        as_of=datetime(2026, 7, 13, 22, 0, tzinfo=CN_TZ),
+    )
+
+    assert calls == ["600900", "600900"]
+    assert result["ok"] is True
+    assert result["status"] == "upcoming_corporate_action"
