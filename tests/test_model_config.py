@@ -9,7 +9,7 @@ import json
 import aiohttp
 from typing import Dict, Any, Optional
 
-BASE_URL = "http://localhost:8001"
+BASE_URL = "http://localhost:8331"
 
 # 全局访问令牌
 access_token: Optional[str] = None

@@ -61,7 +61,7 @@ TradingAgentsCN-portable/
 
 ## 常见配置项（.env）
 - `HOST=127.0.0.1`：后端监听地址；建议保留本机以确保安全
-- `PORT=8000`：后端端口；占用时运行时回退（例如 8001）
+- `PORT=8000`：后端端口；占用时运行时回退（例如 8331）
 - `SERVE_FRONTEND=true`、`FRONTEND_STATIC=frontend/dist`：启用后端静态挂载与 SPA fallback
 - `AUTO_OPEN_BROWSER=true`：启动后自动打开浏览器
 - `JWT_SECRET`、`CSRF_SECRET`：强随机密钥（安装脚本生成）

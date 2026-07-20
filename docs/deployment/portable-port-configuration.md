@@ -74,10 +74,10 @@ TradingAgents-CN 绿色版使用以下端口：
    PORT=8000
    ```
 
-3. **修改端口号**（例如改为 8001）：
+3. **修改端口号**（例如改为 8331）：
    ```ini
    HOST=0.0.0.0
-   PORT=8001
+   PORT=8331
    ```
 
 4. **同时修改 Nginx 配置**：
@@ -94,7 +94,7 @@ TradingAgents-CN 绿色版使用以下端口：
    ```nginx
    # Backend upstream
    upstream backend {
-       server 127.0.0.1:8001;
+       server 127.0.0.1:8331;
    }
    ```
 
@@ -219,7 +219,7 @@ MongoDB 的配置文件是在启动时自动生成的，需要修改启动脚本
 | 服务 | 原端口 | 新端口 |
 |------|-------|-------|
 | 前端 (Nginx) | 80 | 8080 |
-| 后端 (FastAPI) | 8000 | 8001 |
+| 后端 (FastAPI) | 8000 | 8331 |
 | MongoDB | 27017 | 27018 |
 | Redis | 6379 | 6380 |
 
@@ -232,7 +232,7 @@ MongoDB 的配置文件是在启动时自动生成的，需要修改启动脚本
    
    # 第 32 行：后端代理端口
    upstream backend {
-       server 127.0.0.1:8001;
+       server 127.0.0.1:8331;
    }
    ```
 
@@ -240,7 +240,7 @@ MongoDB 的配置文件是在启动时自动生成的，需要修改启动脚本
    ```ini
    # 后端端口
    HOST=0.0.0.0
-   PORT=8001
+   PORT=8331
    
    # MongoDB 端口
    MONGODB_HOST=localhost
@@ -375,4 +375,3 @@ netstat -ano | findstr :80
 ---
 
 **最后更新**: 2025-11-05
-

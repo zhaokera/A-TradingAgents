@@ -173,7 +173,7 @@ OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ```env
 # 后端端口（默认 8000）
-BACKEND_PORT=8001
+BACKEND_PORT=8331
 
 # 前端端口（默认 5173）
 FRONTEND_PORT=5174
@@ -235,4 +235,3 @@ FRONTEND_PORT=5174
 - 💻 **开发者** → [本地代码版](#方式三本地代码版最灵活-推荐开发者)
 
 祝您使用愉快！如有问题，欢迎随时联系我们。
-
