@@ -5,6 +5,8 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 
+from app.services.investment_policy import INVESTMENT_OBJECTIVE
+
 from app.services.holding_price_guardrails import calculate_net_reward_risk
 
 
@@ -18,8 +20,8 @@ LOT_SIZE = 100
 MIN_NET_REWARD_RISK = Decimal("1.5")
 
 EXTERNAL_RISK_CAPS = {
-    "green": Decimal("0.20"),
-    "yellow": Decimal("0.12"),
+    "green": Decimal("0.60"),
+    "yellow": Decimal("0.30"),
     "red": Decimal("0"),
     "unknown": Decimal("0"),
 }
@@ -144,8 +146,8 @@ def build_external_risk_gate(level: Optional[str], *, actionable_equity: Optiona
     amount = _money(equity * cap) if equity is not None else Decimal("0")
     actionable = cap > 0 and equity is not None
     reasons = {
-        "green": "外部风险为绿色，新仓总额上限为可执行权益的20%。",
-        "yellow": "外部风险为黄色，新仓总额上限降至可执行权益的12%。",
+        "green": "外部风险为绿色，新仓总额上限为可执行权益的60%。",
+        "yellow": "外部风险为黄色，新仓总额上限降至可执行权益的30%。",
         "red": "外部风险为红色，禁止生成新仓数量。",
         "unknown": "外部风险未确认，按0%上限失败关闭。",
     }
@@ -176,13 +178,15 @@ def size_ashare_candidate(
     remaining_loss_budget: float,
     existing_symbol_market_value: Optional[float],
     candidate_cash_cap_amount: Optional[float] = None,
-    post_trade_symbol_cap_pct: float = 20.0,
+    post_trade_symbol_cap_pct: float = 40.0,
 ) -> Dict[str, Any]:
     equity = float(actionable_equity or 0)
     candidate_cash_cap = round(
         float(candidate_cash_cap_amount)
         if candidate_cash_cap_amount is not None
-        else float(original_cash) * 0.35,
+        else float(original_cash)
+        * INVESTMENT_OBJECTIVE["portfolio"]["hard_single_symbol_cap_pct"]
+        / 100,
         2,
     )
     normalized_symbol_cap_pct = min(max(float(post_trade_symbol_cap_pct), 0.0), 100.0)

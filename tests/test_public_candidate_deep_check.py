@@ -559,6 +559,52 @@ def test_technical_funnel_worker_screens_all_and_builds_only_top_eight():
     assert builder_calls[0]["allow_reference_price_plan"] is True
 
 
+def test_technical_funnel_reserves_top_eight_for_core_objective_first():
+    definitions = [
+        {
+            **_definition(f"{600000 + index:06d}"),
+            "objective_tier": "non_core",
+            "objective_match_score": 0.0,
+            "tencent_score": 0.9,
+            "tencent_one_lot_amount": 1000.0,
+        }
+        for index in range(8)
+    ]
+    definitions.append(
+        {
+            **_definition("600406"),
+            "name": "国电南瑞",
+            "objective_tier": "core",
+            "objective_match_score": 1.0,
+            "tencent_score": 0.2,
+            "tencent_one_lot_amount": 2300.0,
+        }
+    )
+    quote_map = {
+        definition["code"]: _quote(definition["code"])
+        for definition in definitions
+    }
+
+    result = deep_check._run_technical_funnel_worker_payload(
+        {
+            "definitions": definitions,
+            "quote_map": quote_map,
+            "benchmark_trade_date": "2026-07-17",
+        },
+        technical_screener=lambda definition, _quote: _screen_result(
+            definition["code"],
+            net_reward_risk=(1.6 if definition["code"] == "600406" else 3.0),
+        ),
+        earnings_screener=lambda codes, **_kwargs: _earnings_screen(codes),
+        candidate_builder=lambda selected, **_kwargs: [
+            {"code": item["code"]} for item in selected
+        ],
+    )
+
+    assert result["technical_screen"]["selected_codes"][0] == "600406"
+    assert len(result["technical_screen"]["selected_codes"]) == 8
+
+
 def test_technical_funnel_worker_retains_closest_net_rr_rejections_for_audit():
     definitions = [
         {

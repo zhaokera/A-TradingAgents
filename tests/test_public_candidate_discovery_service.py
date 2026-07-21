@@ -509,6 +509,40 @@ def test_public_score_uses_full_eligible_population_and_piecewise_move_quality()
     assert definitions["600041"]["public_score"] == pytest.approx(0.325)
 
 
+def test_public_ranking_prioritizes_technology_new_productivity_objective():
+    result = rank_public_candidate_universe(
+        [
+            _row(
+                "600690",
+                name="海尔智家",
+                pct_chg=1.5,
+                amount=900_000_000.0,
+            ),
+            _row(
+                "601899",
+                name="紫金矿业",
+                pct_chg=1.0,
+                amount=300_000_000.0,
+            ),
+            _row(
+                "600406",
+                name="国电南瑞",
+                pct_chg=0.3,
+                amount=100_000_000.0,
+            ),
+        ],
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        limit=2,
+    )
+
+    assert [item["code"] for item in result["definitions"]] == [
+        "600406",
+        "601899",
+    ]
+    assert result["definitions"][0]["objective_tier"] == "core"
+    assert result["definitions"][1]["objective_tier"] == "related"
+
+
 def test_amount_percentiles_exclude_rejected_rows_and_precede_bucket_quotas():
     rows = [
         _row("600050", amount=100_000_000.0),

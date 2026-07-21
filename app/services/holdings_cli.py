@@ -55,6 +55,10 @@ from app.services.holding_risk_sizing import (
     build_external_risk_gate,
     size_ashare_candidate,
 )
+from app.services.investment_policy import (
+    INVESTMENT_OBJECTIVE,
+    classify_investment_objective,
+)
 from app.services.opportunity_market_context import (
     OpportunityMarketContext,
     build_opportunity_market_context,
@@ -143,9 +147,14 @@ DEFAULT_CLI_USERNAME = "admin"
 DEFAULT_BUY_LOT_SIZE = 100
 MAX_MANUAL_OPPORTUNITY_CANDIDATES = MAX_EARNINGS_SCREEN_CANDIDATES
 CN_MARKET_TIMEZONE = "Asia/Shanghai"
-DEADLINE_EXPOSURE_BUFFER_PCT = 5.0
-DEADLINE_MAX_SINGLE_CANDIDATE_PCT = 25.0
-DEADLINE_TOTAL_LOSS_BUDGET_PCT = 3.5
+PORTFOLIO_POLICY = INVESTMENT_OBJECTIVE["portfolio"]
+DEADLINE_EXPOSURE_BUFFER_PCT = 0.0
+DEADLINE_MAX_SINGLE_CANDIDATE_PCT = PORTFOLIO_POLICY[
+    "hard_single_symbol_cap_pct"
+]
+DEADLINE_TOTAL_LOSS_BUDGET_PCT = PORTFOLIO_POLICY[
+    "total_new_position_loss_budget_pct"
+]
 A_SHARE_REGIME_INDEX_SYMBOLS = ("sh000001", "sz399001", "sz399006", "sh000688")
 DEFAULT_OPPORTUNITY_CANDIDATES = [
     {
@@ -664,7 +673,18 @@ def _validate_deployment_objective(
             code="deployment_deadline_expired",
         )
 
-    maximum_exposure_pct = min(100.0, target + DEADLINE_EXPOSURE_BUFFER_PCT)
+    maximum_policy_exposure = float(
+        PORTFOLIO_POLICY["green_new_exposure_cap_pct"]
+    )
+    if target > maximum_policy_exposure:
+        raise CLIError(
+            f"target-exposure-pct 不能超过当前风险策略上限 {maximum_policy_exposure:.0f}",
+            code="target_exposure_exceeds_policy_cap",
+        )
+    maximum_exposure_pct = min(
+        maximum_policy_exposure,
+        target + DEADLINE_EXPOSURE_BUFFER_PCT,
+    )
     return {
         "mode": "deadline_target",
         "status": "active",
@@ -674,9 +694,11 @@ def _validate_deployment_objective(
         "deadline": deadline.isoformat(),
         "max_single_candidate_pct": DEADLINE_MAX_SINGLE_CANDIDATE_PCT,
         "total_loss_budget_pct": DEADLINE_TOTAL_LOSS_BUDGET_PCT,
-        "soft_constraints": ["external_risk_gate", "a_share_market_gate"],
+        "soft_constraints": [],
         "hard_constraints": [
             "account_data",
+            "external_risk_gate",
+            "a_share_market_gate",
             "quote_freshness",
             "earnings_risk_gate",
             "earnings_review_unavailable",
@@ -2026,6 +2048,19 @@ def _build_opportunity_candidates(
         else:
             quote = fetch_tencent_quote_sync(code) or {}
         snapshot = _quote_snapshot(quote, definition)
+        objective_profile = classify_investment_objective(
+            code,
+            snapshot.get("name") or definition.get("name"),
+        )
+        if definition.get("objective_tier") in {
+            "core",
+            "related",
+            "non_core",
+        }:
+            objective_profile = {
+                key: definition.get(key, value)
+                for key, value in objective_profile.items()
+            }
         corporate_action = fetch_cn_dividend_calendar_sync(code)
         upcoming_price_adjustment_required = bool(
             corporate_action.get("price_plan_adjustment_required")
@@ -2301,6 +2336,7 @@ def _build_opportunity_candidates(
                 "name": snapshot.get("name") or definition.get("name"),
                 "theme": definition.get("theme"),
                 "theme_label": definition.get("theme_label"),
+                **objective_profile,
                 "priority": definition.get("priority"),
                 "discovery": definition.get("discovery"),
                 "quote": snapshot,
@@ -2598,9 +2634,13 @@ def _build_cash_deployment_plan(
         maximum_exposure_amount = None
         minimum_exposure_gap = None
         maximum_exposure_gap = None
-        initial_deploy_cap_pct = 50.0
-        reserve_cash_pct = 50.0
-        max_single_candidate_pct = 35.0
+        initial_deploy_cap_pct = float(
+            PORTFOLIO_POLICY["green_new_exposure_cap_pct"]
+        )
+        reserve_cash_pct = float(PORTFOLIO_POLICY["reserve_cash_pct"])
+        max_single_candidate_pct = float(
+            PORTFOLIO_POLICY["hard_single_symbol_cap_pct"]
+        )
         initial_deploy_cap_amount = (
             round(cash * initial_deploy_cap_pct / 100, 2)
             if cash is not None
@@ -2630,8 +2670,14 @@ def _build_cash_deployment_plan(
     market_multiplier = min(max(market_multiplier or 0.0, 0.0), 1.0)
     external_new_exposure = _round_number(external_risk_gate.get("max_new_exposure_amount")) or 0.0
     if deadline_mode:
-        effective_new_exposure_cap = round(float(initial_deploy_cap_amount or 0), 2)
-        effective_market_multiplier = 1.0
+        effective_new_exposure_cap = round(
+            min(
+                float(initial_deploy_cap_amount or 0),
+                external_new_exposure * market_multiplier,
+            ),
+            2,
+        )
+        effective_market_multiplier = market_multiplier
         total_loss_budget_pct = float(
             objective.get("total_loss_budget_pct")
             or DEADLINE_TOTAL_LOSS_BUDGET_PCT
@@ -2642,7 +2688,9 @@ def _build_cash_deployment_plan(
             2,
         )
         effective_market_multiplier = market_multiplier
-        total_loss_budget_pct = 0.75
+        total_loss_budget_pct = float(
+            PORTFOLIO_POLICY["total_new_position_loss_budget_pct"]
+        )
     remaining_new_exposure = effective_new_exposure_cap
     total_loss_budget = (
         round(equity_value * total_loss_budget_pct / 100, 2)
@@ -2736,9 +2784,9 @@ def _build_cash_deployment_plan(
             base_failed_gates.append("limit_up_or_hot_move")
         if blocked_by_divergence:
             base_failed_gates.append("high_divergence")
-        if not deadline_mode and not external_risk_gate.get("actionable"):
+        if not external_risk_gate.get("actionable"):
             base_failed_gates.append("external_risk_gate")
-        if not deadline_mode and not a_share_market_gate.get("new_position_allowed"):
+        if not a_share_market_gate.get("new_position_allowed"):
             base_failed_gates.append("a_share_market_gate")
         if deadline_mode and not objective_account_ready:
             base_failed_gates.append("deployment_objective_account_data")
@@ -2792,6 +2840,16 @@ def _build_cash_deployment_plan(
             else "当前技术价格计划不可执行，先刷新行情和日线。"
         )
         if all(executable.values()):
+            per_position_loss_budget = (
+                round(
+                    float(equity_value)
+                    * float(PORTFOLIO_POLICY["per_position_loss_budget_pct"])
+                    / 100,
+                    2,
+                )
+                if equity_value is not None
+                else 0.0
+            )
             risk_sizing = size_ashare_candidate(
                 entry_price=executable["entry"],
                 stop_price=executable["stop"],
@@ -2801,12 +2859,13 @@ def _build_cash_deployment_plan(
                 original_cash=cash or 0.0,
                 remaining_new_exposure=remaining_new_exposure,
                 remaining_initial_deploy=remaining_initial_cap or 0.0,
-                remaining_loss_budget=remaining_loss_budget,
+                remaining_loss_budget=min(
+                    remaining_loss_budget,
+                    per_position_loss_budget,
+                ),
                 existing_symbol_market_value=existing_symbol_market_value,
                 candidate_cash_cap_amount=max_single_candidate_amount,
-                post_trade_symbol_cap_pct=(
-                    max_single_candidate_pct if deadline_mode else 20.0
-                ),
+                post_trade_symbol_cap_pct=max_single_candidate_pct,
             )
         else:
             risk_sizing = {
@@ -3057,14 +3116,14 @@ def _build_cash_deployment_plan(
             "projected_exposure_pct": projected_exposure_pct,
             "target_shortfall_amount": target_shortfall_amount,
             "target_met": target_met,
-            "soft_constraint_assessment": {
+            "hard_constraint_assessment": {
                 "external_risk_level": external_risk_gate.get("level"),
                 "external_risk_actionable": external_risk_gate.get("actionable"),
                 "a_share_market_level": a_share_market_gate.get("level"),
                 "a_share_new_position_allowed": a_share_market_gate.get(
                     "new_position_allowed"
                 ),
-                "effect": "limit_price_and_staging_only",
+                "effect": "blocks_new_position_when_gate_is_closed",
             },
         }
 
@@ -3095,6 +3154,9 @@ def _build_cash_deployment_plan(
         "initial_deploy_cap_amount": initial_deploy_cap_amount,
         "reserve_cash_pct": reserve_cash_pct,
         "max_single_candidate_pct": max_single_candidate_pct,
+        "preferred_single_candidate_pct": float(
+            PORTFOLIO_POLICY["preferred_single_symbol_pct"]
+        ),
         "max_single_candidate_amount": max_single_candidate_amount,
         "remaining_initial_cap": remaining_initial_cap,
         "remaining_new_exposure": remaining_new_exposure,
@@ -3112,6 +3174,10 @@ def _build_cash_deployment_plan(
         "deployment_objective": deployment_objective_result,
         "actionable_equity": actionable_equity,
         "candidate_lot_plan": candidate_lot_plan,
+        "investment_objective": {
+            "id": INVESTMENT_OBJECTIVE["id"],
+            "label": INVESTMENT_OBJECTIVE["label"],
+        },
         "note": "仓位计划仅用于研究和资金约束参考，不构成投资建议或交易指令。",
     }
 
@@ -4430,6 +4496,13 @@ _PUBLIC_DISCOVERY_DEFINITION_SCALAR_FIELDS = (
     "exchange",
     "theme",
     "theme_label",
+    "objective_id",
+    "objective_label",
+    "objective_tier",
+    "objective_tier_label",
+    "objective_segment",
+    "objective_match_score",
+    "objective_reason",
     "price",
     "pct_change",
     "amount",
@@ -4930,6 +5003,13 @@ def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str,
             "name",
             "theme",
             "theme_label",
+            "objective_id",
+            "objective_label",
+            "objective_tier",
+            "objective_tier_label",
+            "objective_segment",
+            "objective_match_score",
+            "objective_reason",
             "buy_lot_size",
             "one_lot_amount",
             "is_reference_only",
@@ -4996,6 +5076,15 @@ def _public_discovery_evidence(
         "source": "public_full_market",
         "trade_date": definition.get("trade_date"),
         "public_rank": priority,
+        "objective": {
+            "id": definition.get("objective_id"),
+            "label": definition.get("objective_label"),
+            "tier": definition.get("objective_tier"),
+            "tier_label": definition.get("objective_tier_label"),
+            "segment": definition.get("objective_segment"),
+            "match_score": definition.get("objective_match_score"),
+            "reason": definition.get("objective_reason"),
+        },
         "public": {
             "bucket": definition.get("bucket"),
             "score": definition.get("public_score"),
@@ -5398,6 +5487,7 @@ def _valid_public_discovery_evidence_definition(
             return False
 
     unit_interval_fields = (
+        "objective_match_score",
         "public_score",
         "amount_percentile",
         "move_quality",
@@ -5413,6 +5503,17 @@ def _valid_public_discovery_evidence_definition(
         not _is_finite_discovery_number(definition.get(field))
         or not 0 <= float(definition[field]) <= 1
         for field in unit_interval_fields
+    ):
+        return False
+
+    if (
+        definition.get("objective_id") != INVESTMENT_OBJECTIVE["id"]
+        or definition.get("objective_label") != INVESTMENT_OBJECTIVE["label"]
+        or definition.get("objective_tier")
+        not in {"core", "related", "non_core"}
+        or not isinstance(definition.get("objective_tier_label"), str)
+        or not isinstance(definition.get("objective_segment"), str)
+        or not isinstance(definition.get("objective_reason"), str)
     ):
         return False
 
@@ -6195,6 +6296,11 @@ def build_public_research_opportunities_payload(
                 "reason": "公开全市场模式不读取或推断账户、持仓和现金，禁止生成仓位数量。",
             },
             "external_risk_gate": external_risk_gate,
+            "investment_objective": {
+                "id": INVESTMENT_OBJECTIVE["id"],
+                "label": INVESTMENT_OBJECTIVE["label"],
+                "description": INVESTMENT_OBJECTIVE["description"],
+            },
             "market_status": deepcopy(
                 market_status.get("data", {})
                 if isinstance(market_status, Mapping)
@@ -6228,7 +6334,9 @@ def build_public_research_opportunities_payload(
     return enforce_research_only_safety(payload)
 
 
-_PUBLIC_ACCOUNT_SINGLE_SYMBOL_CAP_PCT = 20.0
+_PUBLIC_ACCOUNT_SINGLE_SYMBOL_CAP_PCT = float(
+    PORTFOLIO_POLICY["hard_single_symbol_cap_pct"]
+)
 _ACCOUNT_HOLDING_CONTEXT_FIELDS = (
     "code",
     "name",
@@ -6412,6 +6520,13 @@ def _candidate_public_account_fit(
         equity * _PUBLIC_ACCOUNT_SINGLE_SYMBOL_CAP_PCT / 100,
         2,
     )
+    preferred_single_symbol_pct = float(
+        PORTFOLIO_POLICY["preferred_single_symbol_pct"]
+    )
+    preferred_single_symbol_amount = round(
+        equity * preferred_single_symbol_pct / 100,
+        2,
+    )
     post_trade_symbol_market_value = (
         round(existing_symbol_market_value + one_lot_amount, 2)
         if existing_symbol_market_value is not None and one_lot_amount is not None
@@ -6428,6 +6543,30 @@ def _candidate_public_account_fit(
         cash_affordable and within_single_symbol_cap
     )
 
+    guarded_price_plan = candidate.get("guarded_price_plan")
+    fee_aware_trade = (
+        guarded_price_plan.get("fee_aware_trade")
+        if isinstance(guarded_price_plan, Mapping)
+        else None
+    )
+    one_lot_planned_loss = _round_number(
+        fee_aware_trade.get("risk_amount")
+        if isinstance(fee_aware_trade, Mapping)
+        else None
+    )
+    per_position_loss_budget_pct = float(
+        PORTFOLIO_POLICY["per_position_loss_budget_pct"]
+    )
+    per_position_loss_budget_amount = round(
+        equity * per_position_loss_budget_pct / 100,
+        2,
+    )
+    within_per_position_loss_budget = (
+        one_lot_planned_loss <= per_position_loss_budget_amount
+        if one_lot_planned_loss is not None
+        else None
+    )
+
     blocking_reasons: List[str] = []
     if one_lot_amount is None or existing_symbol_market_value is None:
         blocking_reasons.append("account_fit_data_incomplete")
@@ -6436,6 +6575,8 @@ def _candidate_public_account_fit(
             blocking_reasons.append("insufficient_cash")
         if not within_single_symbol_cap:
             blocking_reasons.append("post_trade_symbol_cap")
+        if within_per_position_loss_budget is False:
+            blocking_reasons.append("one_lot_loss_budget")
 
     risk_flags = candidate.get("risk_flags")
     trend_recovery_required = bool(
@@ -6446,7 +6587,6 @@ def _candidate_public_account_fit(
             for flag in risk_flags
         )
     )
-    guarded_price_plan = candidate.get("guarded_price_plan")
     if (
         (
             not isinstance(guarded_price_plan, Mapping)
@@ -6485,6 +6625,8 @@ def _candidate_public_account_fit(
         "equity_value": round(equity, 2),
         "single_symbol_cap_pct": _PUBLIC_ACCOUNT_SINGLE_SYMBOL_CAP_PCT,
         "single_symbol_cap_amount": single_symbol_cap_amount,
+        "preferred_single_symbol_pct": preferred_single_symbol_pct,
+        "preferred_single_symbol_amount": preferred_single_symbol_amount,
         "existing_symbol_market_value": existing_symbol_market_value,
         "post_trade_symbol_market_value": post_trade_symbol_market_value,
         "one_lot_cash_usage_pct": (
@@ -6504,7 +6646,24 @@ def _candidate_public_account_fit(
         ),
         "cash_affordable": cash_affordable,
         "within_single_symbol_cap": within_single_symbol_cap,
+        "within_preferred_single_symbol": bool(
+            post_trade_symbol_market_value is not None
+            and post_trade_symbol_market_value <= preferred_single_symbol_amount
+        ),
+        "one_lot_planned_loss": one_lot_planned_loss,
+        "one_lot_planned_loss_pct": (
+            round(one_lot_planned_loss / equity * 100, 2)
+            if one_lot_planned_loss is not None and equity > 0
+            else None
+        ),
+        "per_position_loss_budget_pct": per_position_loss_budget_pct,
+        "per_position_loss_budget_amount": per_position_loss_budget_amount,
+        "within_per_position_loss_budget": within_per_position_loss_budget,
         "passes_account_size_checks": passes_account_size_checks,
+        "passes_account_risk_checks": bool(
+            passes_account_size_checks
+            and within_per_position_loss_budget is not False
+        ),
         "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
         "actionable": False,
         "suggested_lots": 0,
@@ -7634,6 +7793,27 @@ def _build_public_full_market_research_payload(
                 discovery_state.get("result"),
             ),
         ) from exc
+
+
+def run_public_full_market_research(
+    *,
+    external_risk_level: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run the account-independent full-market research workflow.
+
+    This is the public application entrypoint for callers that need the same
+    bounded Tencent/Sina research pipeline as the holdings CLI without parsing
+    CLI output or accessing account data.
+    """
+    context = build_opportunity_market_context()
+    return _build_public_full_market_research_payload(
+        context=context,
+        external_risk_level=external_risk_level,
+        database_status={
+            "status": "not_required",
+            "reason_code": "public_research_mode",
+        },
+    )
 
 
 def _cli_error_payload(

@@ -68,6 +68,8 @@ class FavoriteStock(BaseModel):
     notes: str = Field(default="", description="用户备注")
     alert_price_high: Optional[float] = Field(None, description="价格上限提醒")
     alert_price_low: Optional[float] = Field(None, description="价格下限提醒")
+    source: str = Field(default="manual", description="添加来源")
+    ai_metadata: Optional[Dict[str, Any]] = Field(None, description="AI候选来源元数据")
 
 
 class User(BaseModel):

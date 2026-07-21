@@ -63,8 +63,8 @@ def test_apply_net_reward_risk_gate_marks_low_rr_plan_non_actionable():
 @pytest.mark.parametrize(
     ("level", "expected_pct", "expected_amount"),
     [
-        ("green", 20.0, 20000.0),
-        ("yellow", 12.0, 12000.0),
+        ("green", 60.0, 60000.0),
+        ("yellow", 30.0, 30000.0),
         ("red", 0.0, 0.0),
         ("unknown", 0.0, 0.0),
         (None, 0.0, 0.0),
@@ -163,7 +163,7 @@ def test_size_candidate_fails_closed_for_rr_cash_and_symbol_caps():
         remaining_new_exposure=20000.0,
         remaining_initial_deploy=25000.0,
         remaining_loss_budget=750.0,
-        existing_symbol_market_value=19000.0,
+        existing_symbol_market_value=39000.0,
     )
 
     assert low_rr["suggested_lots"] == 0
@@ -174,7 +174,7 @@ def test_size_candidate_fails_closed_for_rr_cash_and_symbol_caps():
     assert "post_trade_symbol_cap" in symbol_full["failed_gates"]
 
 
-def test_size_candidate_enforces_35_percent_cash_and_50_percent_initial_caps():
+def test_size_candidate_enforces_40_percent_cash_and_initial_deploy_caps():
     candidate_cap = size_ashare_candidate(
         entry_price=20.0,
         stop_price=18.0,
@@ -183,7 +183,7 @@ def test_size_candidate_enforces_35_percent_cash_and_50_percent_initial_caps():
         cash_available=5000.0,
         original_cash=5000.0,
         remaining_new_exposure=20000.0,
-        remaining_initial_deploy=2500.0,
+        remaining_initial_deploy=4000.0,
         remaining_loss_budget=750.0,
         existing_symbol_market_value=0.0,
     )

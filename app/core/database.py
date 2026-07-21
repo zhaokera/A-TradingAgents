@@ -362,6 +362,11 @@ async def create_database_indexes(db):
         await market_quotes.create_index([("amount", -1)])
         await market_quotes.create_index([("updated_at", -1)])
 
+        # AI候选批次按用户读取最近结果，并在两周后自动清理。
+        ai_candidate_runs = db["ai_candidate_runs"]
+        await ai_candidate_runs.create_index([("user_id", 1), ("generated_at", -1)])
+        await ai_candidate_runs.create_index("expires_at", expireAfterSeconds=0)
+
         logger.info("✅ 数据库索引创建完成")
 
     except Exception as e:

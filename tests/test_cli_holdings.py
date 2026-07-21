@@ -2302,13 +2302,15 @@ def test_build_opportunities_payload_includes_cash_deployment_plan(monkeypatch):
     assert "mongo_market_breadth" in payload["meta"]["source"]
     assert "cninfo_dividend_calendar" in payload["meta"]["source"]
     assert payload["data"]["external_risk_gate"]["level"] == "green"
-    assert payload["data"]["external_risk_gate"]["max_new_exposure_amount"] == 2128.0
+    assert payload["data"]["external_risk_gate"]["max_new_exposure_amount"] == 6384.0
     assert plan["mode"] == "cash_ready"
     assert plan["cash_available"] == 10640.0
-    assert plan["initial_deploy_cap_pct"] == 50.0
-    assert plan["initial_deploy_cap_amount"] == 5320.0
-    assert plan["reserve_cash_pct"] == 50.0
-    assert plan["max_single_candidate_pct"] == 35.0
+    assert plan["initial_deploy_cap_pct"] == 60.0
+    assert plan["initial_deploy_cap_amount"] == 6384.0
+    assert plan["reserve_cash_pct"] == 40.0
+    assert plan["max_single_candidate_pct"] == 40.0
+    assert plan["preferred_single_candidate_pct"] == 35.0
+    assert plan["total_loss_budget"] == 212.8
     assert plan["candidate_lot_plan"][0]["code"] == "000066"
     assert plan["candidate_lot_plan"][0]["suggested_lots"] == 1
     assert plan["candidate_lot_plan"][0]["suggested_quantity"] == 100
@@ -2323,8 +2325,7 @@ def test_build_opportunities_payload_includes_cash_deployment_plan(monkeypatch):
     assert plan["candidate_lot_plan"][0]["entry_policy"]["technical_stop_price"] == 19.5
     assert plan["candidate_lot_plan"][0]["entry_policy"]["reference_invalidation_price"] == 18.18
     assert plan["candidate_lot_plan"][1]["code"] == "002261"
-    assert plan["candidate_lot_plan"][1]["suggested_lots"] == 0
-    assert "external_new_exposure_cap" in plan["candidate_lot_plan"][1]["failed_gates"]
+    assert plan["candidate_lot_plan"][1]["suggested_lots"] == 1
     assert plan["candidate_lot_plan"][1]["one_lot_amount"] == 3200.0
     assert plan["candidate_lot_plan"][1]["within_single_cap"] is True
     assert "不构成投资建议" in plan["note"]
@@ -2463,7 +2464,7 @@ def test_candidate_uses_fee_aware_pullback_when_breakout_rr_is_too_low(monkeypat
     }
 
 
-def test_deadline_objective_sizes_to_target_despite_soft_market_risk_gates(monkeypatch):
+def test_deadline_objective_cannot_bypass_hard_market_risk_gates(monkeypatch):
     patch_fresh_cli_market_context(
         monkeypatch,
         technical_plan={
@@ -2509,21 +2510,21 @@ def test_deadline_objective_sizes_to_target_despite_soft_market_risk_gates(monke
     lots = plan["candidate_lot_plan"]
 
     assert plan["mode"] == "deadline_target"
-    assert plan["effective_new_exposure_cap"] == 65000.0
-    assert plan["total_loss_budget"] == 3500.0
-    assert objective["status"] == "planned_target_met"
-    assert objective["target_met"] is True
-    assert 60.0 <= objective["projected_exposure_pct"] <= 65.0
-    assert sum(item["suggested_lots"] for item in lots) > 0
-    assert all("external_risk_gate" not in item["failed_gates"] for item in lots)
-    assert all("a_share_market_gate" not in item["failed_gates"] for item in lots)
+    assert plan["effective_new_exposure_cap"] == 0.0
+    assert plan["total_loss_budget"] == 2000.0
+    assert objective["status"] == "target_shortfall"
+    assert objective["target_met"] is False
+    assert objective["projected_exposure_pct"] == 0.0
+    assert sum(item["suggested_lots"] for item in lots) == 0
+    assert all("external_risk_gate" in item["failed_gates"] for item in lots)
+    assert all("a_share_market_gate" in item["failed_gates"] for item in lots)
     assert all(
-        item["risk_sizing"]["constraints"]["post_trade_symbol_cap_pct"] == 25.0
+        item["risk_sizing"]["constraints"]["post_trade_symbol_cap_pct"] == 40.0
         for item in lots
     )
 
 
-def test_deadline_objective_reference_trio_reaches_sixty_percent():
+def test_deadline_objective_treats_sixty_percent_as_cap_not_quota():
     candidates = []
     for code, name, entry, stop, target in (
         ("601688", "华泰证券", 20.32, 19.52, 22.01),
@@ -2564,27 +2565,31 @@ def test_deadline_objective_reference_trio_reaches_sixty_percent():
         candidates,
         {"quote_stale_risk": False, "is_late_session": False},
         external_risk_gate={
-            "level": "red",
-            "actionable": False,
-            "max_new_exposure_amount": 0.0,
+            "level": "green",
+            "actionable": True,
+            "max_new_exposure_amount": 6411.25,
         },
         a_share_market_gate={
-            "level": "red",
-            "new_position_allowed": False,
-            "max_new_exposure_multiplier": 0.0,
+            "level": "green",
+            "new_position_allowed": True,
+            "max_new_exposure_multiplier": 1.0,
         },
         actionable_equity={"value": 10685.41, "actionable": True},
         deployment_objective=objective,
     )
 
     lot_plan = plan["candidate_lot_plan"]
-    assert [item["suggested_lots"] for item in lot_plan] == [1, 1, 4]
-    assert plan["deployment_objective"]["status"] == "planned_target_met"
-    assert 60.0 <= plan["deployment_objective"]["projected_exposure_pct"] <= 65.0
-    assert plan["deployment_objective"]["planned_new_exposure"] == 6515.31
+    assert any(item["suggested_lots"] > 0 for item in lot_plan)
+    assert plan["deployment_objective"]["status"] == "target_shortfall"
+    assert plan["deployment_objective"]["projected_exposure_pct"] <= 60.0
+    assert all(
+        item["risk_sizing"].get("trade") is None
+        or item["risk_sizing"]["trade"]["risk_amount"] <= 106.86
+        for item in lot_plan
+    )
 
 
-def test_deadline_objective_current_saic_trio_fits_fee_aware_loss_budget():
+def test_deadline_objective_uses_unified_fee_aware_loss_budget():
     candidates = []
     for code, name, entry, stop, target in (
         ("601688", "华泰证券", 20.33, 19.52, 22.01),
@@ -2625,25 +2630,24 @@ def test_deadline_objective_current_saic_trio_fits_fee_aware_loss_budget():
         candidates,
         {"quote_stale_risk": False, "is_late_session": False},
         external_risk_gate={
-            "level": "red",
-            "actionable": False,
-            "max_new_exposure_amount": 0.0,
+            "level": "green",
+            "actionable": True,
+            "max_new_exposure_amount": 6411.25,
         },
         a_share_market_gate={
-            "level": "red",
-            "new_position_allowed": False,
-            "max_new_exposure_multiplier": 0.0,
+            "level": "green",
+            "new_position_allowed": True,
+            "max_new_exposure_multiplier": 1.0,
         },
         actionable_equity={"value": 10685.41, "actionable": True},
         deployment_objective=objective,
     )
 
     lot_plan = plan["candidate_lot_plan"]
-    assert [item["suggested_lots"] for item in lot_plan] == [1, 1, 2]
-    assert plan["total_loss_budget"] == 373.99
-    assert plan["deployment_objective"]["status"] == "planned_target_met"
-    assert plan["deployment_objective"]["planned_new_exposure"] == 6594.35
-    assert plan["remaining_loss_budget"] == 27.31
+    assert any(item["suggested_lots"] > 0 for item in lot_plan)
+    assert plan["total_loss_budget"] == 213.71
+    assert plan["deployment_objective"]["projected_exposure_pct"] <= 60.0
+    assert plan["remaining_loss_budget"] >= 0.0
 
 
 def test_opportunities_blocks_new_lots_when_a_share_market_regime_is_red(monkeypatch):
@@ -3298,8 +3302,8 @@ def test_opportunities_halves_external_exposure_cap_in_yellow_market(monkeypatch
     )
     plan = payload["data"]["brief"]["cash_deployment_plan"]
 
-    assert plan["external_new_exposure_amount"] == 2128.0
-    assert plan["market_adjusted_new_exposure_cap"] == 1064.0
+    assert plan["external_new_exposure_amount"] == 6384.0
+    assert plan["market_adjusted_new_exposure_cap"] == 3192.0
     assert plan["candidate_lot_plan"][0]["suggested_lots"] == 1
 
 
@@ -3599,8 +3603,8 @@ def test_opportunities_sum_duplicate_existing_symbol_exposure(monkeypatch):
 
     plan_item = payload["data"]["brief"]["cash_deployment_plan"]["candidate_lot_plan"][0]
     assert plan_item["risk_sizing"]["constraints"]["existing_symbol_market_value"] == 25344.0
-    assert plan_item["suggested_lots"] == 0
-    assert "post_trade_symbol_cap" in plan_item["failed_gates"]
+    assert plan_item["suggested_lots"] == 4
+    assert plan_item["risk_sizing"]["constraints"]["post_trade_symbol_cap_pct"] == 40.0
 
 
 def test_opportunities_sizes_all_candidates_but_keeps_top_three_action_focus(monkeypatch):
@@ -3747,20 +3751,13 @@ def test_opportunities_yellow_cap_and_account_loss_budget_fail_closed(monkeypatc
     )
     plan_item = payload["data"]["brief"]["cash_deployment_plan"]["candidate_lot_plan"][0]
 
-    assert payload["data"]["external_risk_gate"]["max_new_exposure_amount"] == 1276.8
+    assert payload["data"]["external_risk_gate"]["max_new_exposure_amount"] == 3192.0
     assert plan_item["suggested_lots"] == 0
-    assert "external_new_exposure_cap" in plan_item["failed_gates"]
     assert "account_loss_budget" in plan_item["failed_gates"]
-    assert plan_item["blocking_failed_gates"] == [
-        "external_new_exposure_cap",
-        "account_loss_budget",
-    ]
+    assert plan_item["blocking_failed_gates"] == ["account_loss_budget"]
     decision_row = payload["data"]["brief"]["candidate_decision_matrix"]["rows"][0]
-    assert "external_new_exposure_cap" in decision_row["failed_gates"]
-    assert decision_row["blocking_failed_gates"] == [
-        "external_new_exposure_cap",
-        "account_loss_budget",
-    ]
+    assert "account_loss_budget" in decision_row["failed_gates"]
+    assert decision_row["blocking_failed_gates"] == ["account_loss_budget"]
 
 
 def test_opportunities_rejects_invalid_external_risk_level():
@@ -4691,6 +4688,13 @@ def _make_public_research_discovery(status="ok", *, candidate_count=1):
                 "code": f"600{index:03d}",
                 "name": f"公开候选{index}",
                 "exchange": "sh",
+                "objective_id": "technology_new_quality_productive_forces",
+                "objective_label": "科技 + 新质生产力",
+                "objective_tier": "non_core",
+                "objective_tier_label": "非核心方向",
+                "objective_segment": "其他行业",
+                "objective_match_score": 0.0,
+                "objective_reason": "测试候选未匹配核心方向。",
                 "price": close,
                 "pct_change": 1.25 - index,
                 "amount": amount,
@@ -5954,9 +5958,9 @@ def test_public_research_account_context_preserves_zero_quantity_safety():
     ]
     second_fit = data["candidates"][1]["account_fit"]
     assert second_fit["cash_affordable"] is True
-    assert second_fit["within_single_symbol_cap"] is False
-    assert second_fit["passes_account_size_checks"] is False
-    assert "post_trade_symbol_cap" in second_fit["blocking_reasons"]
+    assert second_fit["within_single_symbol_cap"] is True
+    assert second_fit["passes_account_size_checks"] is True
+    assert "post_trade_symbol_cap" not in second_fit["blocking_reasons"]
     assert data["decision"]["actionable"] is False
     assert data["decision"]["suggested_lots"] == 0
     assert all(candidate["decision"]["suggested_lots"] == 0 for candidate in data["candidates"])
@@ -5968,7 +5972,7 @@ def test_public_research_account_context_preserves_zero_quantity_safety():
 @pytest.mark.parametrize(
     ("valuation_actionable", "expected_existing_value", "expected_reasons"),
     [
-        (True, 500.0, ["post_trade_symbol_cap", "public_research_only"]),
+        (True, 2500.0, ["post_trade_symbol_cap", "public_research_only"]),
         (False, None, ["account_fit_data_incomplete", "public_research_only"]),
     ],
 )
@@ -6000,7 +6004,7 @@ def test_public_account_fit_fails_closed_for_existing_symbol_valuation(
             "name": "东方财富",
             "market": "CN",
             "quantity": 100,
-            "market_value": 500.0,
+            "market_value": 2500.0,
             "valuation_actionable": valuation_actionable,
             "risk_flags": [],
             "is_reference_only": True,
@@ -6025,6 +6029,51 @@ def test_public_account_fit_fails_closed_for_existing_symbol_valuation(
     assert account_fit["passes_account_size_checks"] is False
     assert account_fit["blocking_reasons"] == expected_reasons
     assert payload["data"]["account"]["holding_count"] == 1
+
+
+def test_public_account_fit_reports_one_lot_stop_loss_budget():
+    public_payload = _make_public_command_payload({"status": "connected"})
+    public_payload["data"]["candidates"] = [
+        {
+            "code": "300059",
+            "name": "东方财富",
+            "one_lot_amount": 1_970.0,
+            "guarded_price_plan": {
+                "actionable": False,
+                "status": "ok",
+                "fee_aware_trade": {"risk_amount": 120.0},
+            },
+            "corporate_action": {"blocks_new_position": False},
+            "decision": {
+                "action": "observe",
+                "actionable": False,
+                "suggested_lots": 0,
+                "suggested_quantity": 0,
+            },
+        }
+    ]
+    mongo_payload = _make_connected_account_fallback_payload()
+    mongo_payload["data"]["external_risk_gate"] = {
+        "level": "green",
+        "actionable": True,
+    }
+    mongo_payload["data"]["a_share_market_gate"] = {
+        "level": "green",
+        "new_position_allowed": True,
+    }
+
+    payload = holdings_cli_module.build_account_context_public_research_payload(
+        public_payload,
+        mongo_payload,
+    )
+
+    account_fit = payload["data"]["candidates"][0]["account_fit"]
+    assert account_fit["within_single_symbol_cap"] is True
+    assert account_fit["one_lot_planned_loss"] == 120.0
+    assert account_fit["per_position_loss_budget_amount"] == 106.85
+    assert account_fit["within_per_position_loss_budget"] is False
+    assert account_fit["passes_account_risk_checks"] is False
+    assert "one_lot_loss_budget" in account_fit["blocking_reasons"]
 
 
 def test_public_account_fit_blocks_candidate_waiting_for_trend_recovery():
@@ -7357,6 +7406,15 @@ def test_public_research_payload_adapts_real_flat_discovery_evidence(
         "source": "public_full_market",
         "trade_date": "2026-07-17",
         "public_rank": 1,
+        "objective": {
+            "id": "technology_new_quality_productive_forces",
+            "label": "科技 + 新质生产力",
+            "tier": "non_core",
+            "tier_label": "非核心方向",
+            "segment": "其他行业",
+            "match_score": 0.0,
+            "reason": "测试候选未匹配核心方向。",
+        },
         "public": {
             "bucket": "strength",
             "score": 0.90,

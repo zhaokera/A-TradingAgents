@@ -10,6 +10,10 @@ from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from app.services.a_share_market_regime import MIN_BREADTH_UNIVERSE_SIZE
+from app.services.investment_policy import (
+    classify_investment_objective,
+    objective_tier_rank,
+)
 from app.services.public_market_breadth import (
     MIN_PUBLIC_SNAPSHOT_COVERAGE_RATIO,
 )
@@ -162,6 +166,7 @@ def _move_quality(bucket: str, pct_chg: float) -> float:
 
 def _ranking_key(item: Mapping[str, Any]) -> tuple:
     return (
+        objective_tier_rank(item.get("objective_tier")),
         -item["public_score"],
         -item["amount"],
         item["one_lot_amount"],
@@ -301,6 +306,7 @@ def rank_public_candidate_universe(
                 "one_lot_amount": round(one_lot_amount, 2),
                 "bucket": bucket,
                 "trade_date": benchmark_date,
+                **classify_investment_objective(code, name),
             }
         )
 
@@ -837,6 +843,7 @@ def verify_and_rank_tencent_candidates(
 
     rank_population.sort(
         key=lambda item: (
+            objective_tier_rank(item.get("objective_tier")),
             -item["tencent_score"],
             -item["tencent_amount"],
             item["amplitude"],

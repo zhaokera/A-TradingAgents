@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from app.services.public_candidate_discovery_service import (
     MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES,
 )
+from app.services.investment_policy import objective_tier_rank
 from app.services.public_candidate_earnings_risk import (
     EARNINGS_ACTUAL_SOURCE,
     EARNINGS_FORECAST_SOURCE,
@@ -1229,7 +1230,13 @@ def _technical_result_selection_key(
             quote_map[code].get("close") or quote_map[code].get("price")
         )
         one_lot_amount = price * 100 if price is not None else math.inf
-    return (-net_reward_risk, -tencent_score, one_lot_amount, code)
+    return (
+        objective_tier_rank(definition.get("objective_tier")),
+        -net_reward_risk,
+        -tencent_score,
+        one_lot_amount,
+        code,
+    )
 
 
 def _technical_closest_rejections(
