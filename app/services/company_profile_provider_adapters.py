@@ -8,6 +8,8 @@ safe error contract; an empty or unavailable provider returns no documents.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
 import inspect
 import re
 from datetime import datetime, timezone
@@ -36,6 +38,37 @@ class ProfileFetchResult(list):
         super().__init__(documents)
         self.display_only = [dict(item) for item in display_only]
         self.provider_errors = [dict(item) for item in provider_errors]
+
+
+class _ProviderExecutionContext:
+    """Track one provider call so a timed-out worker cannot overlap the next call."""
+
+    def __init__(self) -> None:
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.pending: set[concurrent.futures.Future[Any]] = set()
+        self.idle = asyncio.Event()
+        self.idle.set()
+
+    def has_pending(self) -> bool:
+        return bool(self.pending)
+
+    async def call(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        if self.pending:
+            raise _ProviderResponseError("provider_busy")
+        self.idle.clear()
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self.executor, functools.partial(function, *args, **kwargs)
+        )
+        self.pending.add(future)
+
+        def mark_done(done: concurrent.futures.Future[Any]) -> None:
+            self.pending.discard(done)
+            if not self.pending:
+                self.idle.set()
+
+        future.add_done_callback(mark_done)
+        return await asyncio.wait_for(asyncio.shield(future), timeout=PROVIDER_ENDPOINT_TIMEOUT_SECONDS)
 
 
 def _clean(value: Any) -> Any:
@@ -82,6 +115,7 @@ def _endpoint_error(source: str, endpoint: str, error: BaseException) -> dict[st
         "provider_error",
         "provider_permission_denied",
         "provider_unavailable",
+        "provider_busy",
     }:
         error_code = error.safe_error_code
     elif isinstance(error, (TimeoutError, asyncio.TimeoutError)):
@@ -179,7 +213,14 @@ def _document(code: str, source: str, endpoint: str, record_key: str, **fields: 
     return document
 
 
-async def _call_with_timeout(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _call_with_timeout(
+    function: Callable[..., Any],
+    *args: Any,
+    execution_context: _ProviderExecutionContext | None = None,
+    **kwargs: Any,
+) -> Any:
+    if execution_context is not None:
+        return await execution_context.call(function, *args, **kwargs)
     return await asyncio.wait_for(
         asyncio.to_thread(function, *args, **kwargs),
         timeout=PROVIDER_ENDPOINT_TIMEOUT_SECONDS,
@@ -199,6 +240,7 @@ async def _connected_provider(
     provider_factory: ProviderFactory,
     source: str,
     provider: Any = None,
+    execution_context: _ProviderExecutionContext | None = None,
 ) -> Any:
     try:
         provider = provider if provider is not None else provider_factory()
@@ -207,7 +249,9 @@ async def _connected_provider(
         if source == "baostock" and getattr(provider, "bs", None) is not None:
             return provider
         if source == "tushare" and callable(getattr(provider, "connect_sync", None)):
-            connected = await _call_with_timeout(provider.connect_sync)
+            connected = await _call_with_timeout(
+                provider.connect_sync, execution_context=execution_context
+            )
         else:
             connect = getattr(provider, "connect", None)
             if not callable(connect):
@@ -233,14 +277,29 @@ def _shared_fetcher(
 ) -> Callable[[str], Any]:
     factory = provider_factory or _default_factory(source)
     provider_holder: dict[str, Any] = {}
+    execution_holder: dict[str, _ProviderExecutionContext] = {}
     lock = asyncio.Lock()
+    busy = False
 
     async def fetch(code: str) -> Any:
+        nonlocal busy
         async with lock:
+            if busy:
+                return ProfileFetchResult(
+                    provider_errors=[
+                        {
+                            "source": source,
+                            "source_endpoint": "provider_busy",
+                            "error_code": "provider_busy",
+                        }
+                    ]
+                )
+            busy = True
             if "provider" not in provider_holder:
                 try:
                     provider_holder["provider"] = factory()
                 except Exception:
+                    busy = False
                     return ProfileFetchResult(
                         provider_errors=[
                             {
@@ -250,7 +309,26 @@ def _shared_fetcher(
                             }
                         ]
                     )
-            return await fetcher(code, provider=provider_holder["provider"])
+            execution_holder.setdefault("context", _ProviderExecutionContext())
+            execution_context = execution_holder["context"]
+        try:
+            return await fetcher(
+                code,
+                provider=provider_holder["provider"],
+                execution_context=execution_context,
+            )
+        finally:
+            if execution_context.has_pending():
+                async def release_when_idle() -> None:
+                    nonlocal busy
+                    await execution_context.idle.wait()
+                    async with lock:
+                        busy = False
+
+                asyncio.create_task(release_when_idle())
+            else:
+                async with lock:
+                    busy = False
 
     return fetch
 
@@ -340,12 +418,16 @@ async def fetch_tushare_profile(
     *,
     provider_factory: ProviderFactory | None = None,
     provider: Any = None,
+    execution_context: _ProviderExecutionContext | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch exact Tushare profile endpoints for one code."""
 
     try:
         provider = await _connected_provider(
-            provider_factory or _default_factory("tushare"), "tushare", provider
+            provider_factory or _default_factory("tushare"),
+            "tushare",
+            provider,
+            execution_context,
         )
     except _ProviderResponseError as exc:
         return ProfileFetchResult(
@@ -358,7 +440,9 @@ async def fetch_tushare_profile(
     for endpoint in ("stock_basic", "stock_company", "fina_mainbz"):
         try:
             endpoint_values[endpoint] = await _call_with_timeout(
-                getattr(api, endpoint), ts_code=ts_code
+                getattr(api, endpoint),
+                ts_code=ts_code,
+                execution_context=execution_context,
             )
         except Exception as exc:
             endpoint_errors.append(_endpoint_error("tushare", endpoint, exc))
@@ -405,12 +489,16 @@ async def fetch_baostock_profile(
     *,
     provider_factory: ProviderFactory | None = None,
     provider: Any = None,
+    execution_context: _ProviderExecutionContext | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch one BaoStock query_stock_basic source document."""
 
     try:
         provider = await _connected_provider(
-            provider_factory or _default_factory("baostock"), "baostock", provider
+            provider_factory or _default_factory("baostock"),
+            "baostock",
+            provider,
+            execution_context,
         )
     except _ProviderResponseError as exc:
         return ProfileFetchResult(
@@ -434,7 +522,7 @@ async def fetch_baostock_profile(
                 logout()
 
     try:
-        rows = await _call_with_timeout(query)
+        rows = await _call_with_timeout(query, execution_context=execution_context)
     except Exception as exc:
         return ProfileFetchResult(
             provider_errors=[_endpoint_error("baostock", "query_stock_basic", exc)]
@@ -467,12 +555,16 @@ async def fetch_akshare_profile(
     *,
     provider_factory: ProviderFactory | None = None,
     provider: Any = None,
+    execution_context: _ProviderExecutionContext | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch and parse AKShare's item/value company information frame."""
 
     try:
         provider = await _connected_provider(
-            provider_factory or _default_factory("akshare"), "akshare", provider
+            provider_factory or _default_factory("akshare"),
+            "akshare",
+            provider,
+            execution_context,
         )
     except _ProviderResponseError as exc:
         return ProfileFetchResult(
@@ -483,7 +575,9 @@ async def fetch_akshare_profile(
     if not callable(method):
         return ProfileFetchResult()
     try:
-        frame = await _call_with_timeout(method, symbol=_code(code))
+        frame = await _call_with_timeout(
+            method, symbol=_code(code), execution_context=execution_context
+        )
     except Exception as exc:
         return ProfileFetchResult(
             provider_errors=[
