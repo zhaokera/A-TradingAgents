@@ -17,6 +17,11 @@ from typing import Any, Callable, Iterable, Mapping
 ProviderFactory = Callable[[], Any]
 
 
+class _ProviderResponseError(Exception):
+    def __init__(self, safe_error_code: str = "provider_error") -> None:
+        self.safe_error_code = safe_error_code
+
+
 class ProfileFetchResult(list):
     """List-compatible source documents with non-document adapter outcomes."""
 
@@ -72,7 +77,12 @@ def _code_mismatch(source: str, endpoint: str, returned_code: Any) -> dict[str, 
 
 
 def _endpoint_error(source: str, endpoint: str, error: BaseException) -> dict[str, Any]:
-    if isinstance(error, TimeoutError):
+    if getattr(error, "safe_error_code", None) in {
+        "provider_error",
+        "provider_permission_denied",
+    }:
+        error_code = error.safe_error_code
+    elif isinstance(error, TimeoutError):
         error_code = "provider_timeout"
     elif isinstance(error, PermissionError):
         error_code = "provider_permission_denied"
@@ -305,6 +315,8 @@ async def fetch_tushare_profile(code: str, *, provider_factory: ProviderFactory 
 def _baostock_rows(result: Any) -> list[dict[str, Any]]:
     if hasattr(result, "to_dict"):
         return _rows(result)
+    if str(getattr(result, "error_code", "0")) != "0":
+        raise _ProviderResponseError()
     fields = list(getattr(result, "fields", []) or [])
     rows = []
     while getattr(result, "error_code", "0") == "0" and result.next():
