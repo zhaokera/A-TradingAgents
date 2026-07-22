@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -292,6 +294,45 @@ def test_future_retrieval_and_report_period_are_not_valid_evidence():
     }
 
 
+def test_future_source_updated_at_is_display_only():
+    profile = select_evidence_profile(
+        "000001",
+        [
+            evidence_doc(
+                "tushare",
+                "stock_basic",
+                source_updated_at=NOW + timedelta(seconds=1),
+                industry="future update",
+            )
+        ],
+        now=NOW,
+    )
+
+    assert profile["industry"] is None
+    assert profile["data_quality"]["display_only"][0]["reason"] == "future_source_updated_at"
+
+
+def test_future_report_period_inside_revenue_mapping_items_is_display_only():
+    profile = select_evidence_profile(
+        "000001",
+        [
+            evidence_doc(
+                "tushare",
+                "fina_mainbz",
+                revenue_composition={
+                    "items": [
+                        {"item": "future item", "report_period": "2027-03-31"}
+                    ]
+                },
+            )
+        ],
+        now=NOW,
+    )
+
+    assert profile["revenue_composition"] is None
+    assert profile["data_quality"]["display_only"][0]["reason"] == "future_report_period"
+
+
 def test_invalid_or_unproven_documents_are_display_only():
     profile = select_evidence_profile(
         "000001",
@@ -364,10 +405,10 @@ async def test_refresh_persists_source_documents_and_structured_errors():
     assert result["000001"]["data_quality"]["provider_errors"] == [
         {
             "source": "baostock",
-            "error_code": "provider_error",
-            "message": "provider timeout",
+            "error_code": "provider_timeout",
+            "message": "Provider request timed out.",
         },
-        {"source": "akshare", "error_code": "provider_error", "message": "keep"},
+        {"source": "akshare", "error_code": "provider_error", "message": "Provider request failed."},
     ]
     assert len(collection.updated) == 1
     saved = collection.updated[0]["$set"]
@@ -375,6 +416,37 @@ async def test_refresh_persists_source_documents_and_structured_errors():
     assert saved["source_documents"] == [fresh]
     fetchers["tushare"].assert_awaited_once_with("000001")
     fetchers["baostock"].assert_awaited_once_with("000001")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exception", "error_code", "safe_message"),
+    [
+        (TimeoutError("timeout secret"), "provider_timeout", "Provider request timed out."),
+        (PermissionError("permission secret"), "provider_permission_denied", "Provider access denied."),
+        (ValueError("generic secret"), "provider_error", "Provider request failed."),
+    ],
+)
+async def test_provider_errors_are_safe_but_originals_are_logged(
+    exception, error_code, safe_message, caplog
+):
+    fetcher = AsyncMock(side_effect=exception)
+    service = CompanyProfileEnrichmentService(
+        db=FakeDatabase(FakeCollection([])), provider_fetchers={"tushare": fetcher}
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app.services.company_profile_enrichment_service"):
+        profile = (await service.resolve_many(["000001"], refresh=True))["000001"]
+
+    assert profile["data_quality"]["provider_errors"] == [
+        {
+            "source": "tushare",
+            "error_code": error_code,
+            "message": safe_message,
+        }
+    ]
+    assert str(exception) not in repr(profile)
+    assert str(exception) in caplog.text
 
 
 @pytest.mark.asyncio
@@ -422,7 +494,85 @@ async def test_provider_error_never_invents_fallback_business_prose():
 
     assert profile["main_business"] is None
     assert profile["main_business_evidence"] is None
-    assert profile["data_quality"]["provider_errors"][0]["error_code"] == "provider_error"
+    assert profile["data_quality"]["provider_errors"][0]["error_code"] == "provider_timeout"
+
+
+@pytest.mark.asyncio
+async def test_cached_errors_and_display_only_are_sorted_for_both_refresh_modes():
+    cached = {
+        "code": "000001",
+        "source_documents": [],
+        "data_quality": {
+            "provider_errors": [
+                {"source": "akshare", "error_code": "provider_error", "message": "old ak"},
+                {"source": "tushare", "error_code": "provider_error", "message": "old ts"},
+            ],
+            "display_only": [
+                {"reason": "unknown_provider_sector", "source": "tushare", "raw_taxonomy_value": "z"},
+                {"reason": "unknown_provider_sector", "source": "tushare", "raw_taxonomy_value": "a"},
+            ],
+        },
+    }
+    outputs = []
+    for refresh in (False, True):
+        collection = FakeCollection([cached])
+        service = CompanyProfileEnrichmentService(db=FakeDatabase(collection))
+        outputs.append((await service.resolve_many(["000001"], refresh=refresh))["000001"])
+
+    assert outputs[0]["data_quality"]["provider_errors"] == [
+        {"source": "tushare", "error_code": "provider_error", "message": "Provider request failed."},
+        {"source": "akshare", "error_code": "provider_error", "message": "Provider request failed."},
+    ]
+    assert outputs[0]["data_quality"]["display_only"] == outputs[1]["data_quality"]["display_only"]
+    assert outputs[0]["data_quality"]["provider_errors"] == outputs[1]["data_quality"]["provider_errors"]
+
+
+@pytest.mark.asyncio
+async def test_slower_refresh_cannot_overwrite_newer_generation():
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    slow_doc = evidence_doc("tushare", "stock_basic", industry="slow generation")
+    fast_doc = evidence_doc("tushare", "stock_basic", industry="fast generation")
+
+    async def slow_fetch(_code):
+        slow_started.set()
+        await release_slow.wait()
+        return [slow_doc]
+
+    async def fast_fetch(_code):
+        return [fast_doc]
+
+    collection = FakeCollection([])
+    slow_service = CompanyProfileEnrichmentService(
+        db=FakeDatabase(collection), provider_fetchers={"tushare": slow_fetch}
+    )
+    fast_service = CompanyProfileEnrichmentService(
+        db=FakeDatabase(collection), provider_fetchers={"tushare": fast_fetch}
+    )
+
+    slow_task = asyncio.create_task(slow_service.resolve_many(["000001"], refresh=True))
+    await slow_started.wait()
+    fast_result = await fast_service.resolve_many(["000001"], refresh=True)
+    release_slow.set()
+    slow_result = await slow_task
+
+    assert fast_result["000001"]["industry"] == "fast generation"
+    assert slow_result["000001"]["industry"] == "fast generation"
+    assert collection.rows[0]["source_documents"][0]["industry"] == "fast generation"
+
+
+@pytest.mark.asyncio
+async def test_cache_query_isolated_by_code():
+    collection = FakeCollection(
+        [{"code": "000002", "source_documents": [evidence_doc("tushare", "stock_basic", industry="other")]}]
+    )
+    service = CompanyProfileEnrichmentService(db=FakeDatabase(collection))
+
+    result = await service.resolve_many(["000001"], refresh=False)
+
+    assert result["000001"]["industry"] is None
+    assert collection.queries[-1] == {"code": {"$in": ["000001"]}}
 
 
 class FakeCursor:
@@ -435,14 +585,36 @@ class FakeCursor:
 
 class FakeCollection:
     def __init__(self, rows):
-        self.rows = rows
+        self.rows = [dict(row) for row in rows]
         self.updated = []
+        self.queries = []
 
     def find(self, query):
-        return FakeCursor(self.rows)
+        self.queries.append(query)
+        codes = set(query.get("code", {}).get("$in", []))
+        return FakeCursor([row for row in self.rows if row.get("code") in codes])
 
     async def update_one(self, query, update, upsert=False):
         self.updated.append(update)
+        code = update["$set"]["code"]
+        existing = next((row for row in self.rows if row.get("code") == code), None)
+        if existing is not None:
+            if "$or" in query:
+                allowed = False
+                for condition in query["$or"]:
+                    clause = condition.get("refresh_started_at", {})
+                    if clause.get("$exists") is False and "refresh_started_at" not in existing:
+                        allowed = True
+                    if "$lte" in clause and existing.get("refresh_started_at") is not None:
+                        allowed = allowed or existing["refresh_started_at"] <= clause["$lte"]
+                if not allowed:
+                    return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
+            existing.update(update["$set"])
+            return SimpleNamespace(matched_count=1, modified_count=1, upserted_id=None)
+        if upsert:
+            self.rows.append(dict(update["$set"]))
+            return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=code)
+        return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
 
 
 class FakeDatabase:

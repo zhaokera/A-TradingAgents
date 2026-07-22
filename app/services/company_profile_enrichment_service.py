@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from app.core.database import get_mongo_db
 
+
+logger = logging.getLogger(__name__)
 
 SOURCE_PRIORITY = {"tushare": 0, "baostock": 1, "akshare": 2}
 NORMALIZATION_VERSION = "cn-sector-v1"
@@ -18,6 +21,11 @@ ALLOWED_ENDPOINTS = {
     "tushare": {"stock_basic", "stock_company", "fina_mainbz"},
     "baostock": {"query_stock_basic"},
     "akshare": {"stock_individual_info_em"},
+}
+SAFE_PROVIDER_ERROR_MESSAGES = {
+    "provider_timeout": "Provider request timed out.",
+    "provider_permission_denied": "Provider access denied.",
+    "provider_error": "Provider request failed.",
 }
 
 # Provider taxonomies are deliberately broad. Unknown values are retained as
@@ -146,6 +154,41 @@ def _source_metadata(document: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in metadata.items() if value is not None}
 
 
+def _safe_provider_error(error: Mapping[str, Any]) -> dict[str, Any]:
+    error_code = str(error.get("error_code") or "provider_error")
+    if error_code not in SAFE_PROVIDER_ERROR_MESSAGES:
+        error_code = "provider_error"
+    result = {
+        "source": str(error.get("source") or "").lower(),
+        "error_code": error_code,
+        "message": SAFE_PROVIDER_ERROR_MESSAGES[error_code],
+    }
+    if error.get("source_endpoint") is not None:
+        result["source_endpoint"] = error["source_endpoint"]
+    return result
+
+
+def _provider_error_sort_key(error: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        SOURCE_PRIORITY.get(str(error.get("source") or "").lower(), 99),
+        str(error.get("source_endpoint") or ""),
+        str(error.get("error_code") or ""),
+        str(error.get("message") or ""),
+    )
+
+
+def _sort_provider_errors(errors: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    normalized = [_safe_provider_error(error) for error in errors or []]
+    return sorted(normalized, key=_provider_error_sort_key)
+
+
+def _is_duplicate_key_error(error: BaseException) -> bool:
+    return getattr(error, "code", None) == 11000 or error.__class__.__name__ in {
+        "DuplicateKeyError",
+        "DuplicateKeyException",
+    }
+
+
 def _provenance_reason(
     document: Mapping[str, Any], expected_code: str | None = None
 ) -> str | None:
@@ -193,17 +236,13 @@ def _revenue_candidate(document: Mapping[str, Any]) -> dict[str, Any] | None:
     raw = document.get("revenue_composition")
     if isinstance(raw, Mapping):
         items = raw.get("items") or []
-        period = document.get("report_period") or raw.get("report_period")
     elif isinstance(raw, (list, tuple)):
         items = raw
-        period = document.get("report_period")
     else:
         return None
     if not isinstance(items, (list, tuple)):
         return None
-    if period is None:
-        periods = [item.get("report_period") for item in items if isinstance(item, Mapping)]
-        period = next((value for value in periods if value is not None), None)
+    period = _document_report_period(document)
     normalized_period = _report_period(period)
     period_date = _report_period_date(period)
     if not normalized_period or period_date is None:
@@ -231,18 +270,22 @@ def _revenue_candidate(document: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _document_report_period(document: Mapping[str, Any]) -> Any:
     raw = document.get("revenue_composition")
+    periods = [document.get("report_period")]
+    items = []
     if isinstance(raw, Mapping):
-        period = document.get("report_period") or raw.get("report_period")
-    else:
-        period = document.get("report_period")
-    if period is not None:
-        return period
-    if isinstance(raw, (list, tuple)):
-        return next(
-            (item.get("report_period") for item in raw if isinstance(item, Mapping)),
-            None,
-        )
-    return None
+        periods.append(raw.get("report_period"))
+        items = raw.get("items") or []
+    elif isinstance(raw, (list, tuple)):
+        items = raw
+    periods.extend(
+        item.get("report_period")
+        for item in items
+        if isinstance(item, Mapping)
+    )
+    valid_periods = [period for period in periods if _report_period_date(period) is not None]
+    if valid_periods:
+        return max(valid_periods, key=lambda period: (_timestamp(period), str(period)))
+    return next((period for period in periods if _clean_text(period)), None)
 
 
 def _display_only_metadata(
@@ -258,6 +301,7 @@ def _display_only_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
         str(item.get("source_record_key") or ""),
         str(item.get("reason") or ""),
         str(item.get("raw_taxonomy_value") or ""),
+        json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
     )
 
 
@@ -275,7 +319,12 @@ def _valid(document: Mapping[str, Any], now: datetime, max_age: timedelta) -> bo
     if _provenance_reason(document) is not None:
         return False
     retrieved_at = _parse_datetime(document.get("retrieved_at"))
-    return retrieved_at is not None and timedelta(0) <= now - retrieved_at <= max_age
+    source_updated_at = _parse_datetime(document.get("source_updated_at"))
+    return (
+        retrieved_at is not None
+        and (source_updated_at is None or source_updated_at <= now)
+        and timedelta(0) <= now - retrieved_at <= max_age
+    )
 
 
 def select_evidence_profile(
@@ -297,9 +346,11 @@ def select_evidence_profile(
         if retrieved_at and retrieved_at > as_of:
             display_only.append(_display_only_metadata(document, "future_retrieved_at"))
             continue
+        source_updated_at = _parse_datetime(document.get("source_updated_at"))
+        if source_updated_at and source_updated_at > as_of:
+            display_only.append(_display_only_metadata(document, "future_source_updated_at"))
+            continue
         candidates.append(document)
-
-    display_only.sort(key=_display_only_sort_key)
 
     field_candidates: dict[str, list[dict[str, Any]]] = {
         "industry": [],
@@ -354,6 +405,8 @@ def select_evidence_profile(
             revenue = _revenue_candidate(document)
             if revenue and as_of - _report_period_date(revenue["report_period"]) <= REVENUE_MAX_AGE:
                 revenue_candidates.append(revenue)
+
+    display_only = _merge_display_only(display_only)
 
     selected: dict[str, dict[str, Any] | None] = {}
     for field, field_values in field_candidates.items():
@@ -496,6 +549,10 @@ class CompanyProfileEnrichmentService:
             if retrieved_at and retrieved_at > now:
                 display_only.append(_display_only_metadata(document, "future_retrieved_at"))
                 continue
+            source_updated_at = _parse_datetime(document.get("source_updated_at"))
+            if source_updated_at and source_updated_at > now:
+                display_only.append(_display_only_metadata(document, "future_source_updated_at"))
+                continue
             report_period = _document_report_period(document)
             report_period_date = _report_period_date(report_period)
             if report_period_date and report_period_date > now:
@@ -555,6 +612,13 @@ class CompanyProfileEnrichmentService:
                 quality.get("provider_errors") or row.get("provider_errors") or []
             )
             grouped[code]["display_only"].extend(quality.get("display_only") or [])
+        for code in codes:
+            grouped[code]["provider_errors"] = _sort_provider_errors(
+                grouped[code]["provider_errors"]
+            )
+            grouped[code]["display_only"] = _merge_display_only(
+                grouped[code]["display_only"]
+            )
         return grouped
 
     async def _refresh_code(
@@ -564,7 +628,7 @@ class CompanyProfileEnrichmentService:
             "cache", code, cached.get("source_documents") or [], now
         )
         display_only = _merge_display_only(cached.get("display_only") or [], display_only)
-        errors = list(cached.get("provider_errors") or [])
+        errors = _sort_provider_errors(cached.get("provider_errors") or [])
         for source in sorted(
             (value for value in self.provider_fetchers if value in SOURCE_PRIORITY),
             key=lambda value: SOURCE_PRIORITY[value],
@@ -585,21 +649,21 @@ class CompanyProfileEnrichmentService:
                 documents = self._merge_documents(documents, fresh_documents)
                 display_only = _merge_display_only(display_only, fresh_display_only)
             except Exception as exc:  # provider failures are part of the result contract
+                if isinstance(exc, TimeoutError):
+                    error_code = "provider_timeout"
+                elif isinstance(exc, PermissionError):
+                    error_code = "provider_permission_denied"
+                else:
+                    error_code = "provider_error"
+                logger.exception("provider fetch failed source=%s code=%s", source, code)
                 errors.append(
                     {
                         "source": source,
-                        "error_code": "provider_error",
-                        "message": str(exc),
+                        "error_code": error_code,
+                        "message": SAFE_PROVIDER_ERROR_MESSAGES[error_code],
                     }
                 )
-        errors.sort(
-            key=lambda item: (
-                SOURCE_PRIORITY.get(str(item.get("source") or ""), 99),
-                str(item.get("source_endpoint") or ""),
-                str(item.get("error_code") or ""),
-                str(item.get("message") or ""),
-            )
-        )
+        errors = _sort_provider_errors(errors)
         return documents, errors, display_only
 
     async def resolve_many(self, codes: Iterable[str], refresh: bool = False) -> dict[str, dict[str, Any]]:
@@ -617,26 +681,50 @@ class CompanyProfileEnrichmentService:
             provider_errors = cached[code]["provider_errors"]
             display_only = cached[code]["display_only"]
             if refresh:
+                refresh_started_at = datetime.now(timezone.utc)
                 documents, provider_errors, display_only = await self._refresh_code(
                     code, cached[code], now
                 )
-                await collection.update_one(
-                    {"code": code},
-                    {
-                        "$set": {
+                write = {
+                    "$set": {
+                        "code": code,
+                        "source_documents": documents,
+                        "data_quality": {
+                            "provider_errors": provider_errors,
+                            "display_only": display_only,
+                        },
+                        "updated_at": now,
+                        "refresh_started_at": refresh_started_at,
+                    }
+                }
+                try:
+                    write_result = await collection.update_one(
+                        {
                             "code": code,
-                            "source_documents": documents,
-                            "data_quality": {
-                                "provider_errors": provider_errors,
-                                "display_only": display_only,
-                            },
-                            "updated_at": now,
-                        }
-                    },
-                    upsert=True,
-                )
+                            "$or": [
+                                {"refresh_started_at": {"$exists": False}},
+                                {"refresh_started_at": {"$lte": refresh_started_at}},
+                            ],
+                        },
+                        write,
+                        upsert=True,
+                    )
+                except Exception as exc:
+                    if not _is_duplicate_key_error(exc):
+                        raise
+                    logger.warning("cache refresh lost conditional insert code=%s", code)
+                    write_result = None
+                matched_count = getattr(write_result, "matched_count", None)
+                upserted_id = getattr(write_result, "upserted_id", None)
+                if matched_count == 0 and upserted_id is None:
+                    winning_cache = await self._read_cache(collection, [code])
+                    documents = winning_cache[code]["source_documents"]
+                    provider_errors = winning_cache[code]["provider_errors"]
+                    display_only = winning_cache[code]["display_only"]
             profile = select_evidence_profile(code, documents, now=now)
-            profile["data_quality"]["provider_errors"] = list(provider_errors)
+            profile["data_quality"]["provider_errors"] = _sort_provider_errors(
+                provider_errors
+            )
             profile["data_quality"]["display_only"] = _merge_display_only(
                 profile["data_quality"].get("display_only") or [], display_only
             )
