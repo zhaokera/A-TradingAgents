@@ -551,7 +551,7 @@ async def test_non_positive_valuation_or_mismatched_denominator_blocks_allocatio
 
 
 @pytest.mark.asyncio
-async def test_existing_same_symbol_value_is_included_in_hard_cap():
+async def test_existing_same_symbol_is_included_in_pairwise_correlation_checks():
     base = [0.01, -0.01] * 30
     service = PortfolioDiversificationService(
         history_loader=HistoryLoader({"600001": bars_from_returns(base)})
@@ -574,14 +574,142 @@ async def test_existing_same_symbol_value_is_included_in_hard_cap():
     )
 
     allocation = result["allocations"][0]
+    assert allocation["status"] == "wait"
+    assert allocation["reason_codes"] == ["correlation_limit"]
+    assert allocation["correlation_audit"]["compared_symbols"] == ["600001"]
+
+
+@pytest.mark.asyncio
+async def test_new_symbol_allocation_rechecks_hard_single_symbol_cap():
+    service = PortfolioDiversificationService(history_loader=HistoryLoader({}))
+
+    result = await service.allocate(
+        [candidate("600001", quantity=1_000)],
+        holdings=[],
+        total_assets=10_000,
+        available_cash=10_000,
+        policy=policy(hard_single_symbol_cap_pct=30),
+        market_phase="pre_open",
+        as_of=NOW,
+    )
+
+    allocation = result["allocations"][0]
     assert allocation["status"] == "allocated"
-    assert allocation["quantity"] == 100
-    assert allocation["symbol_exposure_audit"] == {
-        "before_amount": 2_000.0,
-        "after_amount": 3_000.0,
-        "after_pct": 30.0,
-        "cap_pct": 30.0,
+    assert allocation["quantity"] == 300
+    assert allocation["symbol_exposure_audit"]["after_pct"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_correlation_value_immediately_above_cap_is_blocked(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.portfolio_diversification_service.calculate_return_correlation",
+        lambda *_args: {
+            "basis": "empirical_qfq_60_sessions",
+            "overlap": 60,
+            "value": 0.800000000001,
+        },
+    )
+    rows = bars_from_returns([0.01, -0.01] * 30)
+    service = PortfolioDiversificationService(
+        history_loader=HistoryLoader({"600000": rows, "600001": rows})
+    )
+
+    result = await service.allocate(
+        [candidate("600001", theme="新能源", industry="软件开发")],
+        holdings=[holding(valuation_phase="pre_open")],
+        total_assets=10_000,
+        available_cash=10_000,
+        policy=policy(),
+        market_phase="pre_open",
+        as_of=NOW,
+    )
+
+    assert result["allocations"][0]["reason_codes"] == ["correlation_limit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["", "ABC", "6000017"])
+async def test_invalid_candidate_code_cannot_be_allocated(code):
+    service = PortfolioDiversificationService(history_loader=HistoryLoader({}))
+
+    result = await service.allocate(
+        [candidate(code)],
+        holdings=[],
+        total_assets=10_000,
+        available_cash=10_000,
+        policy=policy(),
+        market_phase="pre_open",
+        as_of=NOW,
+    )
+
+    assert result["allocations"][0]["reason_codes"] == ["candidate_code_invalid"]
+
+
+@pytest.mark.asyncio
+async def test_missing_rank_orders_by_score_then_code_independent_of_input_order():
+    service = PortfolioDiversificationService(history_loader=HistoryLoader({}))
+    first = candidate("600002", rank=None, rank_score=90, theme="新能源", sector="工业", industry="电池")
+    second = candidate("600001", rank=None, rank_score=90, theme="高端装备", sector="原材料", industry="机械设备")
+    kwargs = {
+        "holdings": [],
+        "total_assets": 100_000,
+        "available_cash": 100_000,
+        "policy": policy(),
+        "market_phase": "pre_open",
+        "as_of": NOW,
     }
+
+    forward = await service.allocate([first, second], **kwargs)
+    reverse = await service.allocate([second, first], **kwargs)
+
+    assert [item["code"] for item in forward["allocations"]] == ["600001", "600002"]
+    assert [item["code"] for item in reverse["allocations"]] == ["600001", "600002"]
+
+
+@pytest.mark.asyncio
+async def test_utc_as_of_uses_shanghai_date_for_completed_session_cutoff():
+    base = [0.01, -0.01, 0.01, -0.01] * 15
+    orthogonal = [0.01, 0.01, -0.01, -0.01] * 15
+    exact = [0.8 * left + 0.6 * right for left, right in zip(base, orthogonal)]
+    start = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    service = PortfolioDiversificationService(
+        history_loader=HistoryLoader(
+            {
+                "600000": bars_from_returns(base, start=start),
+                "600001": bars_from_returns(exact, start=start),
+            }
+        )
+    )
+
+    result = await service.allocate(
+        [candidate("600001", theme="新能源", industry="软件开发")],
+        holdings=[holding(valuation_phase="pre_open")],
+        total_assets=10_000,
+        available_cash=10_000,
+        policy=policy(),
+        market_phase="pre_open",
+        as_of=datetime(2026, 7, 21, 16, 30, tzinfo=timezone.utc),
+    )
+
+    allocation = result["allocations"][0]
+    assert allocation["correlation_basis"] == "empirical_qfq_60_sessions"
+    assert allocation["correlation_overlap"] == 60
+
+
+def test_correlation_calculation_does_not_round_before_threshold_check():
+    base = [0.01, -0.01, 0.01, -0.01] * 15
+    orthogonal = [0.01, 0.01, -0.01, -0.01] * 15
+    slightly_high = [
+        0.8000000000004 * left + 0.5999999999994667 * right
+        for left, right in zip(base, orthogonal)
+    ]
+
+    result = calculate_return_correlation(
+        bars_from_returns(base),
+        bars_from_returns(slightly_high),
+    )
+
+    assert result["value"] > 0.80
 
 
 @pytest.mark.asyncio

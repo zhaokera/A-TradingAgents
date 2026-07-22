@@ -154,7 +154,7 @@ def calculate_return_correlation(left_bars: Any, right_bars: Any) -> Dict[str, A
     return {
         "basis": "empirical_qfq_60_sessions",
         "overlap": overlap,
-        "value": round(value, 12),
+        "value": value,
         "sessions_requested": CORRELATION_SESSION_COUNT,
         **ratio_audit,
     }
@@ -332,7 +332,7 @@ class PortfolioDiversificationService:
         items: List[Dict[str, Any]] = []
         for compared in comparisons:
             compared_code = _normalize_code(compared.get("code"))
-            if not compared_code or compared_code == code:
+            if not compared_code:
                 continue
             compared_history = await self._history(
                 compared_code,
@@ -378,7 +378,7 @@ class PortfolioDiversificationService:
             (
                 item
                 for item in items
-                if float(item["value"]) > PAIRWISE_CORRELATION_CAP + 1e-12
+                if float(item["value"]) > PAIRWISE_CORRELATION_CAP
             ),
             None,
         )
@@ -431,6 +431,7 @@ class PortfolioDiversificationService:
         effective_as_of = as_of or datetime.now(timezone.utc)
         if effective_as_of.tzinfo is None:
             effective_as_of = effective_as_of.replace(tzinfo=SHANGHAI_TIMEZONE)
+        effective_as_of = effective_as_of.astimezone(SHANGHAI_TIMEZONE)
         raw_holdings = [dict(item) for item in holdings if isinstance(item, Mapping)]
         holding_audits = [
             self._holding_audit(
@@ -494,7 +495,7 @@ class PortfolioDiversificationService:
             rank = _finite_number(candidate.get("rank"))
             score = _finite_number(candidate.get("rank_score"))
             return (
-                rank if rank is not None else float(index + 1),
+                rank if rank is not None else float("inf"),
                 -(score if score is not None else 0.0),
                 _normalize_code(candidate.get("code")),
                 index,
@@ -579,6 +580,10 @@ class PortfolioDiversificationService:
 
             if not policy_valid:
                 base.update(reason="invalid_portfolio_policy", reason_codes=["invalid_portfolio_policy"])
+                allocations.append(base)
+                continue
+            if re.fullmatch(r"\d{6}", code) is None:
+                base.update(reason="candidate_code_invalid", reason_codes=["candidate_code_invalid"])
                 allocations.append(base)
                 continue
             if holding_blocker:
