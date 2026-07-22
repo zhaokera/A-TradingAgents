@@ -526,6 +526,18 @@ class CompanyProfileEnrichmentService:
             self.db = get_mongo_db()
         return self.db
 
+    async def ensure_indexes(self) -> Any:
+        """Ensure the cache has one authoritative document per normalized code."""
+
+        db = await self._get_db()
+        collection = db["stock_company_profiles"]
+        result = collection.create_index(
+            [("code", 1)], unique=True, name="stock_company_profiles_code_unique"
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
     @staticmethod
     def _documents_from_fetch(
         source: str, code: str, result: Any, now: datetime
@@ -623,12 +635,13 @@ class CompanyProfileEnrichmentService:
 
     async def _refresh_code(
         self, code: str, cached: Mapping[str, Any], now: datetime
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], datetime]:
         documents, display_only = self._documents_from_fetch(
             "cache", code, cached.get("source_documents") or [], now
         )
         display_only = _merge_display_only(cached.get("display_only") or [], display_only)
         errors = _sort_provider_errors(cached.get("provider_errors") or [])
+        validation_now = now
         for source in sorted(
             (value for value in self.provider_fetchers if value in SOURCE_PRIORITY),
             key=lambda value: SOURCE_PRIORITY[value],
@@ -643,8 +656,9 @@ class CompanyProfileEnrichmentService:
                 result = fetcher(code)
                 if inspect.isawaitable(result):
                     result = await result
+                validation_now = datetime.now(timezone.utc)
                 fresh_documents, fresh_display_only = self._documents_from_fetch(
-                    source, code, result, now
+                    source, code, result, validation_now
                 )
                 documents = self._merge_documents(documents, fresh_documents)
                 display_only = _merge_display_only(display_only, fresh_display_only)
@@ -656,6 +670,7 @@ class CompanyProfileEnrichmentService:
                 else:
                     error_code = "provider_error"
                 logger.exception("provider fetch failed source=%s code=%s", source, code)
+                validation_now = datetime.now(timezone.utc)
                 errors.append(
                     {
                         "source": source,
@@ -664,7 +679,7 @@ class CompanyProfileEnrichmentService:
                     }
                 )
         errors = _sort_provider_errors(errors)
-        return documents, errors, display_only
+        return documents, errors, display_only, validation_now
 
     async def resolve_many(self, codes: Iterable[str], refresh: bool = False) -> dict[str, dict[str, Any]]:
         normalized_codes = list(dict.fromkeys(_normalise_code(code) for code in codes if code))
@@ -673,6 +688,7 @@ class CompanyProfileEnrichmentService:
             return {}
         db = await self._get_db()
         collection = db["stock_company_profiles"]
+        await self.ensure_indexes()
         cached = await self._read_cache(collection, normalized_codes)
         now = datetime.now(timezone.utc)
         results = {}
@@ -682,7 +698,7 @@ class CompanyProfileEnrichmentService:
             display_only = cached[code]["display_only"]
             if refresh:
                 refresh_started_at = datetime.now(timezone.utc)
-                documents, provider_errors, display_only = await self._refresh_code(
+                documents, provider_errors, display_only, validation_now = await self._refresh_code(
                     code, cached[code], now
                 )
                 write = {
@@ -697,6 +713,7 @@ class CompanyProfileEnrichmentService:
                         "refresh_started_at": refresh_started_at,
                     }
                 }
+                lost_write = False
                 try:
                     write_result = await collection.update_one(
                         {
@@ -713,15 +730,19 @@ class CompanyProfileEnrichmentService:
                     if not _is_duplicate_key_error(exc):
                         raise
                     logger.warning("cache refresh lost conditional insert code=%s", code)
+                    lost_write = True
                     write_result = None
                 matched_count = getattr(write_result, "matched_count", None)
                 upserted_id = getattr(write_result, "upserted_id", None)
-                if matched_count == 0 and upserted_id is None:
+                if lost_write or (matched_count == 0 and upserted_id is None):
                     winning_cache = await self._read_cache(collection, [code])
                     documents = winning_cache[code]["source_documents"]
                     provider_errors = winning_cache[code]["provider_errors"]
                     display_only = winning_cache[code]["display_only"]
-            profile = select_evidence_profile(code, documents, now=now)
+                    validation_now = datetime.now(timezone.utc)
+            profile = select_evidence_profile(
+                code, documents, now=validation_now if refresh else now
+            )
             profile["data_quality"]["provider_errors"] = _sort_provider_errors(
                 provider_errors
             )

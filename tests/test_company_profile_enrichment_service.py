@@ -543,7 +543,7 @@ async def test_slower_refresh_cannot_overwrite_newer_generation():
     async def fast_fetch(_code):
         return [fast_doc]
 
-    collection = FakeCollection([])
+    collection = FakeCollection([], raise_duplicate_on_conditional_miss=True)
     slow_service = CompanyProfileEnrichmentService(
         db=FakeDatabase(collection), provider_fetchers={"tushare": slow_fetch}
     )
@@ -560,6 +560,32 @@ async def test_slower_refresh_cannot_overwrite_newer_generation():
     assert fast_result["000001"]["industry"] == "fast generation"
     assert slow_result["000001"]["industry"] == "fast generation"
     assert collection.rows[0]["source_documents"][0]["industry"] == "fast generation"
+    assert collection.indexes == [
+        ([ ("code", 1) ], True, "stock_company_profiles_code_unique"),
+        ([ ("code", 1) ], True, "stock_company_profiles_code_unique"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_validates_timestamps_after_provider_fetch_completes():
+    async def delayed_fetch(_code):
+        await asyncio.sleep(0.01)
+        return [
+            evidence_doc(
+                "tushare",
+                "stock_basic",
+                retrieved_at=datetime.now(timezone.utc),
+                industry="created during fetch",
+            )
+        ]
+
+    service = CompanyProfileEnrichmentService(
+        db=FakeDatabase(FakeCollection([])), provider_fetchers={"tushare": delayed_fetch}
+    )
+
+    result = await service.resolve_many(["000001"], refresh=True)
+
+    assert result["000001"]["industry"] == "created during fetch"
 
 
 @pytest.mark.asyncio
@@ -584,10 +610,16 @@ class FakeCursor:
 
 
 class FakeCollection:
-    def __init__(self, rows):
+    def __init__(self, rows, raise_duplicate_on_conditional_miss=False):
         self.rows = [dict(row) for row in rows]
         self.updated = []
         self.queries = []
+        self.indexes = []
+        self.raise_duplicate_on_conditional_miss = raise_duplicate_on_conditional_miss
+
+    async def create_index(self, keys, unique=False, name=None):
+        self.indexes.append((keys, unique, name))
+        return name
 
     def find(self, query):
         self.queries.append(query)
@@ -608,6 +640,8 @@ class FakeCollection:
                     if "$lte" in clause and existing.get("refresh_started_at") is not None:
                         allowed = allowed or existing["refresh_started_at"] <= clause["$lte"]
                 if not allowed:
+                    if self.raise_duplicate_on_conditional_miss:
+                        raise DuplicateKeyError()
                     return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
             existing.update(update["$set"])
             return SimpleNamespace(matched_count=1, modified_count=1, upserted_id=None)
@@ -615,6 +649,10 @@ class FakeCollection:
             self.rows.append(dict(update["$set"]))
             return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=code)
         return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
+
+
+class DuplicateKeyError(Exception):
+    pass
 
 
 class FakeDatabase:
