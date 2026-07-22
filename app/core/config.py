@@ -168,6 +168,7 @@ class Settings(BaseSettings):
     # 缓存配置
     CACHE_TTL: int = Field(default=3600)  # 1小时
     SCREENING_CACHE_TTL: int = Field(default=1800)  # 30分钟
+    A_SHARE_CALENDAR_CACHE_MAX_AGE_HOURS: int = Field(default=168, ge=1)
 
     # 安全配置
     BCRYPT_ROUNDS: int = Field(default=12)
