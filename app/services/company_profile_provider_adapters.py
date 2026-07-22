@@ -71,6 +71,20 @@ def _code_mismatch(source: str, endpoint: str, returned_code: Any) -> dict[str, 
     }
 
 
+def _endpoint_error(source: str, endpoint: str, error: BaseException) -> dict[str, Any]:
+    if isinstance(error, TimeoutError):
+        error_code = "provider_timeout"
+    elif isinstance(error, PermissionError):
+        error_code = "provider_permission_denied"
+    else:
+        error_code = "provider_error"
+    return {
+        "source": source,
+        "source_endpoint": endpoint,
+        "error_code": error_code,
+    }
+
+
 def _ts_code(code: str) -> str:
     text = str(code or "").strip().upper()
     if "." in text:
@@ -262,19 +276,7 @@ async def fetch_tushare_profile(code: str, *, provider_factory: ProviderFactory 
                 getattr(api, endpoint), ts_code=ts_code
             )
         except Exception as exc:
-            if isinstance(exc, TimeoutError):
-                error_code = "provider_timeout"
-            elif isinstance(exc, PermissionError):
-                error_code = "provider_permission_denied"
-            else:
-                error_code = "provider_error"
-            endpoint_errors.append(
-                {
-                    "source": "tushare",
-                    "source_endpoint": endpoint,
-                    "error_code": error_code,
-                }
-            )
+            endpoint_errors.append(_endpoint_error("tushare", endpoint, exc))
     documents = []
     display_only = []
     for endpoint, mapper in (
@@ -332,7 +334,12 @@ async def fetch_baostock_profile(code: str, *, provider_factory: ProviderFactory
             if callable(logout):
                 logout()
 
-    rows = await asyncio.to_thread(query)
+    try:
+        rows = await asyncio.to_thread(query)
+    except Exception as exc:
+        return ProfileFetchResult(
+            provider_errors=[_endpoint_error("baostock", "query_stock_basic", exc)]
+        )
     if not rows:
         return ProfileFetchResult()
     row = rows[0]
@@ -364,7 +371,14 @@ async def fetch_akshare_profile(code: str, *, provider_factory: ProviderFactory 
     method = getattr(raw, "stock_individual_info_em", None) if raw is not None else None
     if not callable(method):
         return ProfileFetchResult()
-    frame = await asyncio.to_thread(method, symbol=_code(code))
+    try:
+        frame = await asyncio.to_thread(method, symbol=_code(code))
+    except Exception as exc:
+        return ProfileFetchResult(
+            provider_errors=[
+                _endpoint_error("akshare", "stock_individual_info_em", exc)
+            ]
+        )
     values = {}
     for row in _rows(frame):
         item = _clean(row.get("item"))
