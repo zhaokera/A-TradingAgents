@@ -293,29 +293,67 @@ class FakeDailyDecisions:
 
 
 class FakeJobLocks:
-    def __init__(self):
+    def __init__(self, *, steal_on_renew=False):
         self.rows = {}
         self._guard = asyncio.Lock()
+        self.steal_on_renew = steal_on_renew
 
     async def find_one_and_update(self, query, update, upsert=False, return_document=None):
         async with self._guard:
             key = query["_id"]
             existing = self.rows.get(key)
-            owner = update["$set"]["owner"]
+            owner = update["$set"].get("owner") or query.get("owner")
             now = update["$set"]["updated_at"]
-            allowed = existing is None or existing.get("lease_until") <= now or existing.get("owner") == owner
+            if self.steal_on_renew and "fence" in query and existing:
+                self.steal_on_renew = False
+                existing["owner"] = "newer-worker"
+                existing["fence"] = int(existing.get("fence") or 0) + 1
+            if "fence" in query:
+                allowed = bool(
+                    existing
+                    and existing.get("owner") == owner
+                    and existing.get("fence") == query.get("fence")
+                    and existing.get("lease_until")
+                    > query["lease_until"]["$gt"]
+                )
+            else:
+                allowed = bool(
+                    existing is None
+                    or existing.get("lease_until") <= now
+                    or existing.get("owner") == owner
+                )
             if not allowed:
                 return None
             row = {**(existing or {"_id": key}), **update["$set"]}
+            for field, increment in (update.get("$inc") or {}).items():
+                row[field] = int(row.get(field) or 0) + int(increment)
+            for field, floor in (update.get("$max") or {}).items():
+                row[field] = max(int(row.get(field) or 0), int(floor))
             self.rows[key] = row
             return deepcopy(row)
 
     async def update_one(self, query, update):
         async with self._guard:
             row = self.rows.get(query["_id"])
-            if row and row.get("owner") == query.get("owner"):
+            if self.steal_on_renew and "lease_until" in query and row:
+                self.steal_on_renew = False
+                row["owner"] = "newer-worker"
+                row["fence"] = int(row.get("fence") or 0) + 1
+            lease_query = query.get("lease_until")
+            lease_valid = not isinstance(lease_query, dict) or row.get(
+                "lease_until"
+            ) > lease_query.get("$gt")
+            matches = bool(
+                row
+                and row.get("owner") == query.get("owner")
+                and (
+                    "fence" not in query or row.get("fence") == query.get("fence")
+                )
+                and lease_valid
+            )
+            if matches:
                 row.update(update["$set"])
-        return SimpleNamespace(modified_count=1)
+        return SimpleNamespace(modified_count=1 if matches else 0)
 
 
 class FakeDuplicateKeyError(Exception):
@@ -323,13 +361,20 @@ class FakeDuplicateKeyError(Exception):
 
 
 class FakeDatabase:
-    def __init__(self, *, fail_insert=False, duplicate_once=False, insert_delay=0.0):
+    def __init__(
+        self,
+        *,
+        fail_insert=False,
+        duplicate_once=False,
+        insert_delay=0.0,
+        steal_lease_on_renew=False,
+    ):
         self.decisions = FakeDailyDecisions(
             fail_insert=fail_insert,
             duplicate_once=duplicate_once,
             insert_delay=insert_delay,
         )
-        self.locks = FakeJobLocks()
+        self.locks = FakeJobLocks(steal_on_renew=steal_lease_on_renew)
 
     def __getitem__(self, name):
         return {"daily_decisions": self.decisions, "job_locks": self.locks}[name]
@@ -421,9 +466,14 @@ async def test_every_wait_reason_beats_live_buy(reason_code):
     [
         ({"actionability": "invalidated"}, "plan_invalidated"),
         ({"actionability": "expired"}, "plan_expired"),
+        ({"plan_expires_at": "2026-07-22T09:59:59+08:00"}, "plan_expired"),
         ({"actionability": "target_reached"}, "target_reached"),
         (
             {"risk_flags": [{"code": "suspension", "severity": "high"}]},
+            "blocking_event",
+        ),
+        (
+            {"risk_flags": [{"code": "corporate_action", "severity": "error"}]},
             "blocking_event",
         ),
         ({"market_regime": "red"}, "market_red"),
@@ -489,6 +539,16 @@ async def test_missing_or_stale_live_quote_remains_condition_order(trade_at):
 
 
 @pytest.mark.asyncio
+async def test_live_quote_without_positive_price_remains_condition_order():
+    candidate = _candidate(reference_price=None)
+    packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
+
+    item = packet["condition_order"][0]
+    assert "live_quote_recheck_required" in item["reason_codes"]
+    assert not packet["buy_now"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "candidate_updates",
     [
@@ -540,6 +600,12 @@ async def test_item_contract_and_half_up_normalization_are_complete():
     assert set(item["plans"]) == {"short", "swing", "position"}
     assert item["profile"]["provider_sector_evidence"]["source_endpoint"] == "stock_basic"
     assert packet["effective_policy"]["fee_policy_version"] == "cn_a_v1"
+    assert packet["effective_policy"]["provider_versions"] == {
+        "company_profile": "company-profile-adapters-v1",
+        "market_quote": "tencent-quote-v1",
+        "trading_calendar": "a-share-calendar-v1",
+    }
+    assert item["versions"]["provider_versions"] == packet["effective_policy"]["provider_versions"]
 
 
 def test_canonical_hash_excludes_only_explicit_volatile_paths():
@@ -580,6 +646,12 @@ def test_canonical_hash_excludes_only_explicit_volatile_paths():
     volatile["profile"]["industry_evidence"]["retrieved_at"] = "two"
     assert material_hash(volatile) == baseline
 
+    unrelated_retrieval = deepcopy(packet)
+    unrelated_retrieval["metadata"] = {"retrieved_at": "material-one"}
+    unrelated_changed = deepcopy(unrelated_retrieval)
+    unrelated_changed["metadata"]["retrieved_at"] = "material-two"
+    assert material_hash(unrelated_changed) != material_hash(unrelated_retrieval)
+
     material_paths = [
         ("quote", "trade_at"),
         ("profile", "industry_evidence", "source_updated_at"),
@@ -611,6 +683,38 @@ async def test_plan_id_and_material_hash_are_stable_for_same_material():
     assert first["buy_now"][0]["plan_id"] == second["buy_now"][0]["plan_id"]
     assert first["material_hash"] == second["material_hash"]
     assert first["decision_id"] == second["decision_id"]
+
+
+@pytest.mark.asyncio
+async def test_request_and_briefing_build_times_do_not_create_new_revision():
+    db = FakeDatabase()
+    service = _service(db=db)
+    first = await service.today("user-1", now=NOW)
+    service.briefing_service.payload["as_of"] = "2026-07-22T10:00:30+08:00"
+    second = await service.today(
+        "user-1",
+        now=NOW.replace(second=30),
+    )
+
+    assert first["decision_id"] == second["decision_id"]
+    assert len(db.decisions.rows) == 1
+    assert "classified_at" not in first["market_session"]
+    assert first["briefing_as_of"] == "2026-07-22T09:55:00+08:00"
+
+
+@pytest.mark.asyncio
+async def test_missing_candidate_generated_time_never_falls_back_to_build_time():
+    db = FakeDatabase()
+    run = _run()
+    run.pop("generated_at")
+    run["candidates"] = []
+    service = _service(db=db, run=run)
+    first = await service.today("user-1", now=NOW)
+    service.briefing_service.payload["as_of"] = "2026-07-22T10:01:00+08:00"
+    second = await service.today("user-1", now=NOW.replace(minute=1))
+
+    assert first["decision_id"] == second["decision_id"]
+    assert first["briefing_as_of"] is None
 
 
 @pytest.mark.asyncio
@@ -725,6 +829,41 @@ async def test_unknown_unallocated_state_fails_closed_to_wait():
 async def test_persistence_failure_never_returns_unaudited_packet():
     with pytest.raises(DecisionPersistenceError):
         await _service(db=FakeDatabase(fail_insert=True)).today("user-1", now=NOW)
+
+
+@pytest.mark.asyncio
+async def test_lost_lease_fence_prevents_stale_worker_insert():
+    db = FakeDatabase(steal_lease_on_renew=True)
+    service = _service(db=db)
+    packet = await service._compose_packet("user-1", refresh=True, now=NOW)
+
+    with pytest.raises(DecisionPersistenceError, match="decision_lease_lost"):
+        await service._persist_packet(packet, recompute=None)
+
+    assert db.decisions.rows == []
+
+
+@pytest.mark.asyncio
+async def test_revision_reservation_remains_ordered_after_lease_takeover():
+    db = FakeDatabase()
+    service = _service(db=db)
+    packet = await service._compose_packet("user-1", refresh=True, now=NOW)
+    old_fence = await service._acquire_lease(packet, "old-worker")
+    assert old_fence == 1
+    old_revision = await service._reserve_revision(
+        packet, "old-worker", old_fence
+    )
+    lock_id = next(iter(db.locks.rows))
+    db.locks.rows[lock_id]["lease_until"] = datetime.now(timezone.utc)
+
+    new_fence = await service._acquire_lease(packet, "new-worker")
+    new_revision = await service._reserve_revision(
+        packet, "new-worker", new_fence
+    )
+
+    assert new_fence > old_fence
+    assert old_revision == 1
+    assert new_revision == 2
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,11 @@ from app.services.stock_master_data_service import StockMasterDataService
 RULE_VERSION = "decision-v1"
 TAXONOMY_VERSION = "cn-sector-v1"
 DEFAULT_FEE_POLICY_VERSION = "cn_a_v1"
+PROVIDER_VERSIONS = {
+    "company_profile": "company-profile-adapters-v1",
+    "market_quote": "tencent-quote-v1",
+    "trading_calendar": "a-share-calendar-v1",
+}
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 LIVE_PHASES = frozenset({"live_am", "live_pm"})
 VALID_PHASES = frozenset(
@@ -168,7 +173,18 @@ def _canonical_sanitise(value: Any, path: tuple[str, ...] = ()) -> Any:
             key = str(raw_key)
             if not path and key in _TOP_LEVEL_VOLATILE_FIELDS:
                 continue
-            if key == "retrieved_at":
+            if key == "retrieved_at" and any(
+                segment.endswith("_evidence")
+                or segment
+                in {
+                    "evidence",
+                    "revenue_composition",
+                    "profile_conflicts",
+                    "provider_errors",
+                    "display_only",
+                }
+                for segment in path
+            ):
                 continue
             if key == "quote_checked_at" and any(
                 segment in {"quote", "transport"} for segment in path
@@ -238,14 +254,33 @@ def _is_blocking_flag(flag: Mapping[str, Any]) -> bool:
     return str(flag.get("severity") or flag.get("level") or "").lower() in {
         "critical",
         "high",
+        "error",
         "blocking",
         "block",
+        "blocker",
+        "blocked",
     } or str(flag.get("code") or "").lower() in {
         "blocking_event",
         "suspension",
+        "suspended",
+        "delisted",
         "delisting_risk",
         "regulatory_investigation",
+        "corporate_action",
+        "corporate_action_blocked",
+        "technical_deep_check_timeout",
+        "earnings_risk_blocked",
+        "notice_risk_blocked",
     }
+
+
+def _plan_has_expired(value: Any, now: datetime) -> bool:
+    if not value:
+        return False
+    try:
+        return _as_shanghai(value) <= _as_shanghai(now)
+    except (TypeError, ValueError):
+        return False
 
 
 def _profile_complete(profile: Mapping[str, Any]) -> bool:
@@ -474,6 +509,7 @@ class DailyDecisionService:
         candidate: Mapping[str, Any],
         *,
         market: Mapping[str, Any],
+        now: datetime,
     ) -> list[str]:
         reasons = DailyDecisionService._explicit_reason_codes(candidate)
         plan = candidate.get("price_plan")
@@ -481,7 +517,11 @@ class DailyDecisionService:
         actionability = str(candidate.get("actionability") or "")
         if actionability == "invalidated" or plan.get("entry_status") == "invalidated":
             reasons.append("plan_invalidated")
-        if candidate.get("plan_expired") is True or actionability == "expired":
+        if (
+            candidate.get("plan_expired") is True
+            or actionability == "expired"
+            or _plan_has_expired(candidate.get("plan_expires_at"), now)
+        ):
             reasons.append("plan_expired")
         performance = candidate.get("performance")
         if actionability == "target_reached" or (
@@ -680,6 +720,7 @@ class DailyDecisionService:
             or TAXONOMY_VERSION,
             "fee_policy_version": policy.get("fee_policy_version")
             or DEFAULT_FEE_POLICY_VERSION,
+            "provider_versions": deepcopy(PROVIDER_VERSIONS),
         }
 
         market = briefing.get("market")
@@ -709,7 +750,7 @@ class DailyDecisionService:
                 now=now,
                 session=session,
             )
-            avoid_reasons = self._avoid_reasons(candidate, market=market)
+            avoid_reasons = self._avoid_reasons(candidate, market=market, now=now)
             wait_reasons = self._wait_reasons(
                 candidate,
                 session=session,
@@ -719,6 +760,8 @@ class DailyDecisionService:
             )
             plan = candidate.get("price_plan")
             plan = dict(plan) if isinstance(plan, Mapping) else {}
+            quote_price = _finite_decimal(quote.get("price"))
+            has_live_price = quote_price is not None and quote_price > 0
             if avoid_reasons:
                 bucket = "avoid"
                 reasons = avoid_reasons
@@ -728,6 +771,7 @@ class DailyDecisionService:
             elif (
                 phase in LIVE_PHASES
                 and quote_status.get("actionable") is True
+                and has_live_price
                 and plan.get("price_condition_met") is True
                 and allocation.get("status") == "allocated"
             ):
@@ -736,7 +780,9 @@ class DailyDecisionService:
             else:
                 bucket = "condition_order"
                 reasons = ["valid_allocated_plan"]
-                if phase in LIVE_PHASES and quote_status.get("actionable") is not True:
+                if phase in LIVE_PHASES and (
+                    quote_status.get("actionable") is not True or not has_live_price
+                ):
                     reasons.append("live_quote_recheck_required")
                 elif phase not in LIVE_PHASES:
                     reasons.append("live_quote_recheck_required")
@@ -825,12 +871,13 @@ class DailyDecisionService:
                         if isinstance(profile.get("provider_sector_evidence"), Mapping)
                         else None
                     ),
+                    "provider_versions": deepcopy(PROVIDER_VERSIONS),
                 },
                 "plan_id": plan_id,
             }
             bucket_items[bucket].append(_normalise_numbers(item))
 
-        def item_order(item: Mapping[str, Any]) -> tuple[float, float, str]:
+        def item_order(item: Mapping[str, Any]) -> tuple[Decimal, Decimal, str]:
             identity = item.get("identity")
             identity = identity if isinstance(identity, Mapping) else {}
             allocation = item.get("allocation")
@@ -840,8 +887,8 @@ class DailyDecisionService:
             )
             score = _finite_decimal(identity.get("rank_score")) or Decimal(0)
             return (
-                float(rank) if rank is not None else math.inf,
-                -float(score),
+                rank if rank is not None else Decimal("Infinity"),
+                -score,
                 _normalise_code(identity.get("code")),
             )
 
@@ -871,6 +918,8 @@ class DailyDecisionService:
         profile_conflicts.sort(key=quality_key)
 
         local_now = _as_shanghai(now)
+        stable_session = deepcopy(dict(session))
+        stable_session.pop("classified_at", None)
         packet: Dict[str, Any] = {
             "decision_id": f"decision_{uuid.uuid4().hex}",
             "user_id": str(user_id),
@@ -880,8 +929,8 @@ class DailyDecisionService:
             "as_of": local_now.isoformat(),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "candidate_run_id": candidate_run.get("run_id"),
-            "briefing_as_of": briefing.get("as_of"),
-            "market_session": deepcopy(dict(session)),
+            "briefing_as_of": candidate_run.get("generated_at"),
+            "market_session": stable_session,
             "account": deepcopy(account),
             "market": deepcopy(market),
             "portfolio_constraints": {
@@ -909,7 +958,9 @@ class DailyDecisionService:
         packet["material_hash"] = material_hash(packet)
         return packet
 
-    async def _acquire_lease(self, packet: Mapping[str, Any], owner: str) -> bool:
+    async def _acquire_lease(
+        self, packet: Mapping[str, Any], owner: str
+    ) -> Optional[int]:
         db = await self._get_db()
         now = datetime.now(timezone.utc)
         lock_id = (
@@ -917,6 +968,16 @@ class DailyDecisionService:
             f"{packet['market_phase']}"
         )
         try:
+            latest = await db["daily_decisions"].find_one(
+                {
+                    "user_id": packet["user_id"],
+                    "decision_date": packet["decision_date"],
+                    "market_phase": packet["market_phase"],
+                },
+                {"revision": 1},
+                sort=[("revision", -1)],
+            )
+            revision_floor = int((latest or {}).get("revision") or 0)
             document = await db["job_locks"].find_one_and_update(
                 {
                     "_id": lock_id,
@@ -932,18 +993,58 @@ class DailyDecisionService:
                         "lease_until": now + timedelta(seconds=self.lease_seconds),
                         "updated_at": now,
                         "user_id": packet["user_id"],
-                    }
+                    },
+                    "$inc": {"fence": 1},
+                    "$max": {"next_revision": revision_floor},
                 },
                 upsert=True,
                 return_document=ReturnDocument.AFTER,
             )
         except self.duplicate_key_errors:
-            return False
+            return None
         except Exception as exc:
             raise DecisionPersistenceError("decision_persistence_failed") from exc
-        return bool(document and document.get("owner") == owner)
+        if not document or document.get("owner") != owner:
+            return None
+        fence = int(document.get("fence") or 0)
+        return fence if fence > 0 else None
 
-    async def _release_lease(self, packet: Mapping[str, Any], owner: str) -> None:
+    async def _reserve_revision(
+        self, packet: Mapping[str, Any], owner: str, fence: int
+    ) -> Optional[int]:
+        db = await self._get_db()
+        now = datetime.now(timezone.utc)
+        lock_id = (
+            f"daily-decision:{packet['user_id']}:{packet['decision_date']}:"
+            f"{packet['market_phase']}"
+        )
+        try:
+            document = await db["job_locks"].find_one_and_update(
+                {
+                    "_id": lock_id,
+                    "owner": owner,
+                    "fence": fence,
+                    "lease_until": {"$gt": now},
+                },
+                {
+                    "$set": {
+                        "lease_until": now
+                        + timedelta(seconds=self.lease_seconds),
+                        "updated_at": now,
+                    },
+                    "$inc": {"next_revision": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as exc:
+            raise DecisionPersistenceError("decision_persistence_failed") from exc
+        if not document or document.get("owner") != owner:
+            return None
+        return int(document.get("next_revision") or 0) or None
+
+    async def _release_lease(
+        self, packet: Mapping[str, Any], owner: str, fence: int
+    ) -> None:
         db = await self._get_db()
         lock_id = (
             f"daily-decision:{packet['user_id']}:{packet['decision_date']}:"
@@ -951,7 +1052,7 @@ class DailyDecisionService:
         )
         try:
             await db["job_locks"].update_one(
-                {"_id": lock_id, "owner": owner},
+                {"_id": lock_id, "owner": owner, "fence": fence},
                 {
                     "$set": {
                         "lease_until": datetime.now(timezone.utc),
@@ -989,9 +1090,12 @@ class DailyDecisionService:
             return existing
 
         owner = uuid.uuid4().hex
+        fence: Optional[int] = None
         saw_contention = False
         for _ in range(self.lease_wait_attempts):
-            if await self._acquire_lease(packet, owner):
+            acquired_fence = await self._acquire_lease(packet, owner)
+            if acquired_fence is not None:
+                fence = acquired_fence
                 break
             saw_contention = True
             await asyncio.sleep(self.lease_wait_seconds)
@@ -1003,9 +1107,11 @@ class DailyDecisionService:
                 return existing
         else:
             raise DecisionPersistenceError("decision_persistence_failed")
+        if fence is None:
+            raise DecisionPersistenceError("decision_persistence_failed")
 
         if saw_contention and recompute is not None:
-            await self._release_lease(packet, owner)
+            await self._release_lease(packet, owner, fence)
             recomputed = await recompute()
             return await self._persist_packet(recomputed, recompute=None)
 
@@ -1014,23 +1120,22 @@ class DailyDecisionService:
             if existing:
                 return existing
             db = await self._get_db()
-            latest = await db["daily_decisions"].find_one(
-                {
-                    "user_id": packet["user_id"],
-                    "decision_date": packet["decision_date"],
-                    "market_phase": packet["market_phase"],
-                },
-                {"revision": 1},
-                sort=[("revision", -1)],
-            )
+            revision = await self._reserve_revision(packet, owner, fence)
+            if revision is None:
+                if recompute is None:
+                    raise DecisionPersistenceError("decision_lease_lost")
+                recomputed = await recompute()
+                return await self._persist_packet(recomputed, recompute=None)
             document = deepcopy(packet)
             document["decision_id"] = f"decision_{uuid.uuid4().hex}"
-            document["revision"] = int((latest or {}).get("revision") or 0) + 1
+            document["revision"] = revision
             document["persisted_at"] = datetime.now(timezone.utc)
             document["persistence"] = {
                 "collection": "daily_decisions",
                 "mode": "append_only",
                 "lease_owner": owner,
+                "lease_fence": fence,
+                "reserved_revision": revision,
             }
             try:
                 await db["daily_decisions"].insert_one(document)
@@ -1038,17 +1143,15 @@ class DailyDecisionService:
                 winner = await self._find_existing_hash(packet)
                 if winner:
                     return winner
-                latest = await db["daily_decisions"].find_one(
-                    {
-                        "user_id": packet["user_id"],
-                        "decision_date": packet["decision_date"],
-                        "market_phase": packet["market_phase"],
-                    },
-                    {"revision": 1},
-                    sort=[("revision", -1)],
-                )
+                retry_revision = await self._reserve_revision(packet, owner, fence)
+                if retry_revision is None:
+                    if recompute is None:
+                        raise DecisionPersistenceError("decision_lease_lost")
+                    recomputed = await recompute()
+                    return await self._persist_packet(recomputed, recompute=None)
                 document["decision_id"] = f"decision_{uuid.uuid4().hex}"
-                document["revision"] = int((latest or {}).get("revision") or 0) + 1
+                document["revision"] = retry_revision
+                document["persistence"]["reserved_revision"] = retry_revision
                 await db["daily_decisions"].insert_one(document)
             return _serialize_mongo(document)
         except DecisionPersistenceError:
@@ -1056,7 +1159,7 @@ class DailyDecisionService:
         except Exception as exc:
             raise DecisionPersistenceError("decision_persistence_failed") from exc
         finally:
-            await self._release_lease(packet, owner)
+            await self._release_lease(packet, owner, fence)
 
     async def today(
         self,
@@ -1098,8 +1201,8 @@ class DailyDecisionService:
                 .find({"user_id": normalized_user_id})
                 .sort(
                     [
-                        ("persisted_at", -1),
                         ("decision_date", -1),
+                        ("created_at", -1),
                         ("revision", -1),
                     ]
                 )
