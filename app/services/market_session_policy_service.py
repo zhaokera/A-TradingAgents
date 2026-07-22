@@ -93,7 +93,7 @@ class MarketSessionPolicyService:
                 self.quote_max_age_seconds if buy_now_allowed else 0
             ),
             "timezone": "Asia/Shanghai",
-            "classified_at": local_now.isoformat(timespec="seconds"),
+            "classified_at": local_now.isoformat(),
             "calendar_source": calendar.get("source"),
             "calendar_verified_at": calendar.get("verified_at"),
             "calendar_authoritative": authoritative,
@@ -141,6 +141,18 @@ class MarketSessionPolicyService:
 
         if phase == "calendar_unknown":
             return {**result, "status": "calendar_unknown"}
+        if phase == "post_close":
+            is_final_close = bool(
+                source == "tencent"
+                and trade_at is not None
+                and trade_at.date() == local_now.date()
+                and trade_at.time().replace(tzinfo=None) >= time(15, 0)
+                and age_seconds is not None
+                and age_seconds >= 0
+            )
+            if is_final_close:
+                return {**result, "status": "final_close_observation"}
+            return {**result, "status": "not_live_session"}
         if phase not in LIVE_PHASES:
             return {**result, "status": "not_live_session"}
         if source != "tencent":
