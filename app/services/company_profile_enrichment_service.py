@@ -373,6 +373,13 @@ def select_evidence_profile(
             -_timestamp(item.get("report_period")),
             str(item.get("source_endpoint") or ""),
             str(item.get("source_record_key") or ""),
+            json.dumps(
+                item.get("items"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
         )
     )
     selected_revenue = winning_revenue_candidates[0] if winning_revenue_candidates else None

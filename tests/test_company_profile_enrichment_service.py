@@ -188,6 +188,33 @@ def test_revenue_source_priority_precedes_report_period_and_conflicts_are_determ
     ]
 
 
+def test_same_key_revenue_documents_are_input_order_independent():
+    first_document = evidence_doc(
+        "tushare",
+        "fina_mainbz",
+        source_record_key="ts:same-key",
+        report_period="2026-03-31",
+        revenue_composition=[{"item": "alpha", "revenue": 1}],
+    )
+    second_document = evidence_doc(
+        "tushare",
+        "fina_mainbz",
+        source_record_key="ts:same-key",
+        report_period="2026-03-31",
+        revenue_composition=[{"item": "beta", "revenue": 2}],
+    )
+
+    forward = select_evidence_profile(
+        "000001", [first_document, second_document], now=NOW
+    )
+    reversed_order = select_evidence_profile(
+        "000001", [second_document, first_document], now=NOW
+    )
+
+    assert forward["revenue_composition"] == reversed_order["revenue_composition"]
+    assert forward["data_quality"]["profile_conflicts"] == reversed_order["data_quality"]["profile_conflicts"]
+
+
 def test_missing_or_mismatched_document_code_and_record_key_are_display_only():
     profile = select_evidence_profile(
         "000001",
