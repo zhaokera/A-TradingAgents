@@ -190,6 +190,14 @@ def _item(plan_id="plan-a", *, code="000977", strategy="pullback", entry=63, sto
     return {
         "plan_id": plan_id,
         "identity": {"code": code, "objective_segment": "数字科技"},
+        "profile": {"industry": "计算机设备", "provider_sector": "信息技术"},
+        "reason_codes": ["valid_allocated_plan"],
+        "calibration_features": {
+            "objective_match": 1.0,
+            "reward_risk": 0.8,
+            "evidence_completeness": 1.0,
+            "actionability": 0.75,
+        },
         "plans": {"short": {"entry_strategy": strategy, "entry_price": entry, "stop_price": stop, "target_price": target}},
         "allocation": {"status": "allocated", "quantity": quantity, "amount": entry * quantity},
         "invalidation": {"stop_price": stop, "plan_expires_at": "2026-07-24T15:00:00+08:00"},
@@ -205,6 +213,7 @@ def _decision(decision_id="decision-1", revision=1, *, bucket="condition_order",
         "revision": revision,
         "as_of": at.isoformat(),
         "market_phase": phase,
+        "market": {"domestic_regime": "green", "macro_regime": "neutral"},
         "buy_now": [],
         "condition_order": [],
         "wait": [],
@@ -250,6 +259,15 @@ async def test_registration_reuses_plan_and_uses_latest_preceding_trigger_contex
     assert outcome["trigger_context_decision_id"] == "decision-2"
     assert outcome["trigger_context_action_bucket"] == "buy_now"
     assert outcome["trigger_context_market_phase"] == "live_am"
+    assert outcome["status"] == "active"
+    assert outcome["objective_segment"] == "数字科技"
+    assert outcome["industry"] == "计算机设备"
+    assert set(outcome["calibration_features"]) == {
+        "objective_match",
+        "reward_risk",
+        "evidence_completeness",
+        "actionability",
+    }
 
 
 @pytest.mark.asyncio
@@ -460,6 +478,40 @@ def test_commission_above_minimum_and_missing_or_misaligned_benchmark_alpha():
 
 
 @pytest.mark.asyncio
+async def test_benchmark_entry_is_snapshotted_and_reused_at_exit():
+    db = Database()
+    service = DecisionTrackingService(db=db)
+    await service.register_decision(_decision())
+
+    entered = await service.observe(
+        "plan-a",
+        _bar(T0930, open=63, high=63.5, low=62.5, close=63.2),
+        benchmark_observations=[
+            {"at": (T0930 + timedelta(minutes=1)).isoformat(), "price": 4000}
+        ],
+    )
+    assert entered["benchmark_entry_price"] == 4000
+
+    closed = await service.observe(
+        "plan-a",
+        _bar(
+            T0930 + timedelta(minutes=1),
+            open=64,
+            high=67.5,
+            low=63.5,
+            close=67,
+        ),
+        benchmark_observations=[
+            {"at": (T0930 + timedelta(minutes=2)).isoformat(), "price": 4040}
+        ],
+    )
+
+    assert closed["status"] == "closed_target"
+    assert closed["benchmark_return_pct"] == pytest.approx(1.0)
+    assert closed["alpha_pct"] == pytest.approx(closed["net_return_pct"] - 1.0)
+
+
+@pytest.mark.asyncio
 async def test_configured_fee_policy_is_snapshotted_on_every_transition():
     db = Database()
     service = DecisionTrackingService(
@@ -628,7 +680,7 @@ async def test_poller_processes_closed_previous_minute_before_current_tick():
     seen = []
 
     class Tracker:
-        async def observe(self, plan_id, observation):
+        async def observe(self, plan_id, observation, **_kwargs):
             seen.append(observation["kind"])
 
     async def fetch(codes):
@@ -691,7 +743,7 @@ async def test_poller_fails_closed_on_quote_error_or_lost_fence():
     seen = []
 
     class Tracker:
-        async def observe(self, plan_id, observation):
+        async def observe(self, plan_id, observation, **_kwargs):
             seen.append(observation)
 
     async def stealing_fetch(codes):

@@ -360,6 +360,18 @@ class FakeDuplicateKeyError(Exception):
     pass
 
 
+class FakeTrackingService:
+    def __init__(self, *, fail=False):
+        self.packets = []
+        self.fail = fail
+
+    async def register_decision(self, packet):
+        if self.fail:
+            raise RuntimeError("tracking unavailable")
+        self.packets.append(deepcopy(packet))
+        return []
+
+
 class FakeDatabase:
     def __init__(
         self,
@@ -384,13 +396,14 @@ def _matches(row, query):
     return all(row.get(key) == value for key, value in query.items())
 
 
-def _service(*, phase="live_am", run=None, briefing=None, profiles=None, db=None):
+def _service(*, phase="live_am", run=None, briefing=None, profiles=None, db=None, tracking=None):
     return DailyDecisionService(
         briefing_service=FakeBriefingService(briefing),
         candidate_service=FakeCandidateService(run),
         market_session_policy=FakeSessionPolicy(phase),
         profile_resolver=FakeProfileResolver(profiles),
         diversification_service=FakeDiversificationService(),
+        tracking_service=tracking or FakeTrackingService(),
         db=db or FakeDatabase(),
         duplicate_key_errors=(FakeDuplicateKeyError,),
     )
@@ -414,6 +427,14 @@ async def test_all_market_phases_are_exhaustively_bucketed(phase, expected_bucke
 
     assert sum(len(packet[name]) for name in ("avoid", "wait", "buy_now", "condition_order")) == 1
     assert packet[expected_bucket][0]["identity"]["code"] == "000977"
+
+
+@pytest.mark.asyncio
+async def test_daily_decision_explicitly_identifies_software_baseline_authority():
+    packet = await _service().today("user-1", now=NOW)
+
+    assert packet["authority"] == "software_baseline"
+    assert packet["is_final_decision"] is False
 
 
 @pytest.mark.asyncio
@@ -587,6 +608,7 @@ async def test_item_contract_and_half_up_normalization_are_complete():
         "identity",
         "action",
         "reason_codes",
+        "calibration_features",
         "quote",
         "plans",
         "profile",
@@ -597,6 +619,12 @@ async def test_item_contract_and_half_up_normalization_are_complete():
         "versions",
         "plan_id",
     } <= set(item)
+    assert set(item["calibration_features"]) == {
+        "objective_match",
+        "reward_risk",
+        "evidence_completeness",
+        "actionability",
+    }
     assert set(item["plans"]) == {"short", "swing", "position"}
     assert item["profile"]["provider_sector_evidence"]["source_endpoint"] == "stock_basic"
     assert packet["effective_policy"]["fee_policy_version"] == "cn_a_v1"
@@ -606,6 +634,25 @@ async def test_item_contract_and_half_up_normalization_are_complete():
         "trading_calendar": "a-share-calendar-v1",
     }
     assert item["versions"]["provider_versions"] == packet["effective_policy"]["provider_versions"]
+
+
+@pytest.mark.asyncio
+async def test_persisted_snapshot_is_registered_for_tracking_before_return():
+    tracking = FakeTrackingService()
+
+    packet = await _service(tracking=tracking).today("user-1", now=NOW)
+
+    assert len(tracking.packets) == 1
+    assert tracking.packets[0]["decision_id"] == packet["decision_id"]
+    assert tracking.packets[0]["revision"] == packet["revision"]
+
+
+@pytest.mark.asyncio
+async def test_tracking_failure_never_returns_a_disconnected_decision():
+    service = _service(tracking=FakeTrackingService(fail=True))
+
+    with pytest.raises(DecisionPersistenceError, match="decision_tracking_failed"):
+        await service.today("user-1", now=NOW)
 
 
 def test_canonical_hash_excludes_only_explicit_volatile_paths():

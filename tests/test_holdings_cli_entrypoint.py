@@ -23,7 +23,7 @@ def test_pyproject_declares_installable_holdings_cli_contract():
     setuptools = config["tool"]["setuptools"]
 
     assert any(dependency.lower().startswith("typer") for dependency in project["dependencies"])
-    assert project["scripts"]["holdings"] == "app.services.holdings_cli:main"
+    assert project["scripts"]["holdings"] == "cli.agent:holdings_main"
     assert {"main", "holdings_cli"}.issubset(set(setuptools["py-modules"]))
     assert {"tradingagents*", "app*", "cli*"}.issubset(
         set(setuptools["packages"]["find"]["include"])
@@ -91,7 +91,18 @@ def test_built_wheel_runs_both_cli_entrypoints_outside_checkout(tmp_path):
     outside_dir.mkdir()
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
-    environment["PYTHONPATH"] = site.getsitepackages()[0]
+    installed_site = subprocess.run(
+        [str(installed_python), "-c", "import site; print(site.getsitepackages()[0])"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    ).stdout.strip()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [installed_site, site.getsitepackages()[0]]
+    )
+    environment["A_TRADINGAGENTS_SESSION_FILE"] = str(outside_dir / "session.json")
+    environment.pop("A_TRADINGAGENTS_PASSWORD", None)
     for key in (
         "MONGODB_HOST",
         "MONGODB_PORT",
@@ -153,9 +164,9 @@ def test_built_wheel_runs_both_cli_entrypoints_outside_checkout(tmp_path):
         timeout=15,
         check=False,
     )
-    assert missing_config.returncode == 4
+    assert missing_config.returncode == 3
     assert missing_config.stdout == ""
-    assert json.loads(missing_config.stderr)["error"]["code"] == "mongo_config_required"
+    assert json.loads(missing_config.stderr)["error"]["code"] == "authentication_required"
 
 
 def test_cli_mongo_configuration_accepts_repo_env_file(tmp_path):

@@ -362,10 +362,166 @@ async def create_database_indexes(db):
         await market_quotes.create_index([("amount", -1)])
         await market_quotes.create_index([("updated_at", -1)])
 
-        # AI候选批次按用户读取最近结果，并在两周后自动清理。
+        # AI候选保留跟踪窗口；后台任务单独短期清理。
         ai_candidate_runs = db["ai_candidate_runs"]
         await ai_candidate_runs.create_index([("user_id", 1), ("generated_at", -1)])
         await ai_candidate_runs.create_index("expires_at", expireAfterSeconds=0)
+        ai_candidate_jobs = db["ai_candidate_jobs"]
+        await ai_candidate_jobs.create_index([("user_id", 1), ("created_at", -1)])
+        await ai_candidate_jobs.create_index("expires_at", expireAfterSeconds=0)
+
+        await db["job_locks"].create_index([("lease_until", 1)])
+        await db["market_risk_snapshots"].create_index(
+            "expires_at", expireAfterSeconds=86400
+        )
+        await db["a_share_trade_calendar"].create_index([("updated_at", -1)])
+
+        # 可审计决策快照：同一市场阶段的修订号和材料哈希都必须唯一。
+        daily_decisions = db["daily_decisions"]
+        await daily_decisions.create_index(
+            [
+                ("user_id", 1),
+                ("decision_date", 1),
+                ("market_phase", 1),
+                ("revision", 1),
+            ],
+            unique=True,
+            name="uq_daily_decision_revision",
+        )
+        await daily_decisions.create_index(
+            [
+                ("user_id", 1),
+                ("decision_date", 1),
+                ("market_phase", 1),
+                ("material_hash", 1),
+            ],
+            unique=True,
+            name="uq_daily_decision_material",
+        )
+        await daily_decisions.create_index(
+            [("user_id", 1), ("created_at", -1)],
+            name="ix_daily_decision_history",
+        )
+
+        # Codex 受约束决策链：研究包、提案、校验和人工确认均为追加式审计记录。
+        decision_research_packets = db["decision_research_packets"]
+        await decision_research_packets.create_index(
+            [("research_packet_id", 1)],
+            unique=True,
+            name="uq_decision_research_packet_id",
+        )
+        await decision_research_packets.create_index(
+            [("user_id", 1), ("source_baseline_id", 1)],
+            unique=True,
+            name="uq_decision_research_baseline",
+        )
+        await decision_research_packets.create_index(
+            [("user_id", 1), ("created_at", -1)],
+            name="ix_decision_research_history",
+        )
+
+        codex_decision_proposals = db["codex_decision_proposals"]
+        await codex_decision_proposals.create_index(
+            [("proposal_id", 1)],
+            unique=True,
+            name="uq_codex_decision_proposal_id",
+        )
+        await codex_decision_proposals.create_index(
+            [("user_id", 1), ("proposal_hash", 1)],
+            unique=True,
+            name="uq_codex_decision_proposal_hash",
+        )
+        await codex_decision_proposals.create_index(
+            [("user_id", 1), ("created_at", -1)],
+            name="ix_codex_decision_proposal_history",
+        )
+
+        decision_validations = db["decision_validations"]
+        await decision_validations.create_index(
+            [("validation_id", 1)],
+            unique=True,
+            name="uq_decision_validation_id",
+        )
+        await decision_validations.create_index(
+            [("user_id", 1), ("proposal_id", 1), ("validated_at", -1)],
+            name="ix_decision_validation_history",
+        )
+
+        decision_confirmations = db["decision_confirmations"]
+        await decision_confirmations.create_index(
+            [("confirmation_id", 1)],
+            unique=True,
+            name="uq_decision_confirmation_id",
+        )
+        await decision_confirmations.create_index(
+            [("user_id", 1), ("confirmation_hash", 1)],
+            unique=True,
+            name="uq_decision_confirmation_hash",
+        )
+        await decision_confirmations.create_index(
+            [("user_id", 1), ("proposal_id", 1), ("confirmed_at", -1)],
+            name="ix_decision_confirmation_history",
+        )
+
+        decision_plans = db["decision_plans"]
+        await decision_plans.create_index(
+            [("plan_id", 1)],
+            unique=True,
+            name="uq_decision_plan_id",
+        )
+        await decision_plans.create_index(
+            [("latest_state", 1), ("plan_expires_at", 1), ("user_id", 1)],
+            name="ix_decision_plan_active",
+        )
+
+        decision_outcomes = db["decision_outcomes"]
+        await decision_outcomes.create_index(
+            [("plan_id", 1), ("observation_sequence", 1)],
+            unique=True,
+            name="uq_decision_outcome_sequence",
+        )
+        await decision_outcomes.create_index(
+            [
+                ("user_id", 1),
+                ("metric_basis", 1),
+                ("status", 1),
+                ("exit_at", -1),
+            ],
+            name="ix_decision_outcome_performance",
+        )
+
+        decision_minute_bars = db["decision_minute_bars"]
+        await decision_minute_bars.create_index(
+            [("code", 1), ("interval_start", 1), ("source", 1)],
+            unique=True,
+            name="uq_decision_minute_bar",
+        )
+        await decision_minute_bars.create_index(
+            [("is_closed", 1), ("interval_start", -1)],
+            name="ix_decision_minute_bar_recovery",
+        )
+
+        stock_company_profiles = db["stock_company_profiles"]
+        await stock_company_profiles.create_index(
+            [("code", 1)],
+            unique=True,
+            name="stock_company_profiles_code_unique",
+        )
+        await stock_company_profiles.create_index(
+            [("code", 1), ("updated_at", -1)],
+            name="ix_stock_company_profile_selection",
+        )
+
+        calibration_versions = db["decision_calibration_versions"]
+        await calibration_versions.create_index(
+            [("user_id", 1), ("proposal_id", 1)],
+            unique=True,
+            name="uq_decision_calibration_proposal",
+        )
+        await calibration_versions.create_index(
+            [("user_id", 1), ("active", 1), ("created_at", -1)],
+            name="ix_decision_calibration_active",
+        )
 
         logger.info("✅ 数据库索引创建完成")
 
