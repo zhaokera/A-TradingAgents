@@ -181,7 +181,7 @@ OSError: [Errno 98] Address already in use
 # 查看端口占用
 lsof -i :8000
 # 修改端口
-export PORT=8001
+export PORT=8331
 python -m app
 ```
 

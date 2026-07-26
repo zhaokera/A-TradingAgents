@@ -10,6 +10,12 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, status
 
+from app.services.holding_price_guardrails import (
+    assess_report_freshness,
+    resolve_guarded_price_plan,
+)
+from app.services.holding_risk_sizing import apply_net_reward_risk_gate
+
 
 _OPENAI_COMPATIBLE_DEFAULTS = {
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -438,6 +444,7 @@ async def _latest_report_context(code: str) -> Dict[str, Any]:
             "analysis_id": doc.get("analysis_id"),
             "task_id": doc.get("task_id"),
             "analysis_date": doc.get("analysis_date"),
+            "created_at": doc.get("created_at"),
             "model_info": doc.get("model_info"),
             "recommendation": doc.get("recommendation") or "",
             "decision": doc.get("decision") if isinstance(doc.get("decision"), dict) else {},
@@ -485,20 +492,106 @@ def _build_prompt(holding: Dict[str, Any], report_context: Dict[str, Any]) -> st
     )
 
 
+def apply_holding_price_guardrails(
+    advice: Dict[str, Any],
+    holding: Dict[str, Any],
+    *,
+    report_plan: Optional[Dict[str, Any]] = None,
+    report_freshness: Optional[Dict[str, Any]] = None,
+    historical_price_plan_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Prevent report, generated, or persisted prices from bypassing current gates."""
+    guarded_advice = dict(advice or {})
+    price_fields = (
+        "stop_loss_price",
+        "suggested_buy_price",
+        "suggested_sell_price",
+        "target_price",
+    )
+    if historical_price_plan_key:
+        guarded_advice.setdefault(
+            historical_price_plan_key,
+            {
+                field_name: _coerce_float(guarded_advice.get(field_name))
+                for field_name in price_fields
+            },
+        )
+
+    freshness = report_freshness or assess_report_freshness(
+        None,
+        as_of=holding.get("guardrail_as_of"),
+    )
+    quote_snapshot = holding.get("quote_snapshot") if isinstance(holding.get("quote_snapshot"), dict) else {}
+    quote_freshness = quote_snapshot.get("freshness") if isinstance(quote_snapshot.get("freshness"), dict) else {}
+    technical_plan = (
+        holding.get("technical_price_plan")
+        if isinstance(holding.get("technical_price_plan"), dict)
+        else {}
+    )
+    if not quote_freshness.get("actionable"):
+        technical_plan = {
+            **technical_plan,
+            "actionable": False,
+            "status": technical_plan.get("status") or "quote_not_actionable",
+        }
+
+    guarded_plan = resolve_guarded_price_plan(
+        manual_plan={
+            "stop_loss_price": holding.get("manual_stop_loss_price"),
+            "suggested_buy_price": holding.get("manual_buy_price"),
+            "suggested_sell_price": holding.get("manual_sell_price"),
+            "target_price": holding.get("manual_target_price"),
+        },
+        report_plan=report_plan or {},
+        technical_plan=technical_plan,
+        report_freshness=freshness,
+    )
+    guarded_plan = apply_net_reward_risk_gate(guarded_plan)
+    active_plan = bool(guarded_plan.get("actionable"))
+    for field_name in price_fields:
+        guarded_advice[field_name] = guarded_plan.get(field_name) if active_plan else None
+    guarded_advice.update(
+        {
+            "report_freshness": freshness,
+            "quote_freshness": quote_freshness,
+            "price_plan_guardrail": guarded_plan,
+            "historical_report_price_plan": guarded_plan.get("historical_report_price_plan", {}),
+            "price_plan_actionable": guarded_plan.get("actionable", False),
+            "price_plan_status": guarded_plan.get("status"),
+        }
+    )
+    return guarded_advice
+
+
 async def build_holding_report_advice(holding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Build holding advice from the latest saved analysis report only."""
     report_context = await _latest_report_context(str(holding.get("code", "")))
     report_meta = report_context.get("report") or {}
+    if not report_meta:
+        return None
+
     report_recommendation = report_meta.get("recommendation") or ""
     report_decision = report_meta.get("decision") or {}
     report_price_plan = report_meta.get("price_plan") if isinstance(report_meta.get("price_plan"), dict) else {}
-    if report_recommendation or report_decision:
+    if report_recommendation or report_decision or report_price_plan:
         advice = parse_report_recommendation(
             report_recommendation,
             current_price=holding.get("current_price"),
             decision=report_decision,
             price_plan=report_price_plan,
         )
+        report_freshness = assess_report_freshness(
+            report_meta.get("analysis_date") or report_meta.get("created_at"),
+            as_of=holding.get("guardrail_as_of"),
+            benchmark_session_dates=holding.get("benchmark_session_dates"),
+        )
+        advice = apply_holding_price_guardrails(
+            advice,
+            holding,
+            report_plan=report_price_plan,
+            report_freshness=report_freshness,
+        )
+
         model_info = str(report_meta.get("model_info") or "analysis_report")
         advice.update(
             {
@@ -549,4 +642,8 @@ async def build_holding_ai_advice(holding: Dict[str, Any]) -> Dict[str, Any]:
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    return advice
+    return apply_holding_price_guardrails(
+        advice,
+        holding,
+        historical_price_plan_key="historical_model_price_plan",
+    )

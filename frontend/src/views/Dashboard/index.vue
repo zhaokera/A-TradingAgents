@@ -15,32 +15,25 @@
     </div>
 
     <el-row :gutter="16" class="dashboard-metrics">
-      <el-col :xs="24" :sm="12" :lg="6">
+      <el-col :xs="24" :sm="12" :lg="8">
         <div class="metric-card">
           <div class="metric-label">分析任务</div>
           <div class="metric-value">{{ userStats.totalAnalyses }}</div>
           <div class="metric-meta">最近任务总数</div>
         </div>
       </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
+      <el-col :xs="24" :sm="12" :lg="8">
         <div class="metric-card">
           <div class="metric-label">已完成</div>
           <div class="metric-value">{{ userStats.successfulAnalyses }}</div>
           <div class="metric-meta">可查看报告</div>
         </div>
       </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
+      <el-col :xs="24" :sm="12" :lg="8">
         <div class="metric-card">
           <div class="metric-label">自选股</div>
           <div class="metric-value">{{ favoriteStocks.length }}</div>
           <div class="metric-meta">当前关注</div>
-        </div>
-      </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
-        <div class="metric-card">
-          <div class="metric-label">模拟账户</div>
-          <div class="metric-value">¥{{ formatMoney(paperEquityCny) }}</div>
-          <div class="metric-meta">A股账户总资产</div>
         </div>
       </el-col>
     </el-row>
@@ -163,79 +156,6 @@
           </div>
         </el-card>
 
-        <!-- 模拟交易账户 -->
-        <el-card class="paper-trading-card" style="margin-top: 24px;">
-          <template #header>
-            <div class="card-header">
-              <span>模拟交易账户</span>
-              <el-button type="text" size="small" @click="goToPaperTrading">
-                查看详情 <el-icon><ArrowRight /></el-icon>
-              </el-button>
-            </div>
-          </template>
-
-          <div v-if="paperAccount" class="paper-account-info">
-            <!-- A股账户 -->
-            <div class="account-section">
-              <div class="account-section-title">🇨🇳 A股账户</div>
-              <div class="account-item">
-                <div class="account-label">现金</div>
-                <div class="account-value">¥{{ formatMoney(getCurrencyAmount(paperAccount.cash, 'CNY')) }}</div>
-              </div>
-              <div class="account-item">
-                <div class="account-label">持仓市值</div>
-                <div class="account-value">¥{{ formatMoney(getCurrencyAmount(paperAccount.positions_value, 'CNY')) }}</div>
-              </div>
-              <div class="account-item">
-                <div class="account-label">总资产</div>
-                <div class="account-value primary">¥{{ formatMoney(getCurrencyAmount(paperAccount.equity, 'CNY')) }}</div>
-              </div>
-            </div>
-
-            <!-- 港股账户 -->
-            <div class="account-section" v-if="typeof paperAccount.cash !== 'number' && paperAccount.cash?.HKD !== undefined">
-              <div class="account-section-title">🇭🇰 港股账户</div>
-              <div class="account-item">
-                <div class="account-label">现金</div>
-                <div class="account-value">HK${{ formatMoney(getCurrencyAmount(paperAccount.cash, 'HKD')) }}</div>
-              </div>
-              <div class="account-item">
-                <div class="account-label">持仓市值</div>
-                <div class="account-value">HK${{ formatMoney(getCurrencyAmount(paperAccount.positions_value, 'HKD')) }}</div>
-              </div>
-              <div class="account-item">
-                <div class="account-label">总资产</div>
-                <div class="account-value primary">HK${{ formatMoney(getCurrencyAmount(paperAccount.equity, 'HKD')) }}</div>
-              </div>
-            </div>
-
-            <!-- 美股账户 -->
-            <div class="account-section" v-if="typeof paperAccount.cash !== 'number' && paperAccount.cash?.USD !== undefined">
-              <div class="account-section-title">🇺🇸 美股账户</div>
-              <div class="account-item">
-                <div class="account-label">现金</div>
-                <div class="account-value">${{ formatMoney(getCurrencyAmount(paperAccount.cash, 'USD')) }}</div>
-              </div>
-              <div class="account-item">
-                <div class="account-label">持仓市值</div>
-                <div class="account-value">${{ formatMoney(getCurrencyAmount(paperAccount.positions_value, 'USD')) }}</div>
-              </div>
-              <div class="account-item">
-                <div class="account-label">总资产</div>
-                <div class="account-value primary">${{ formatMoney(getCurrencyAmount(paperAccount.equity, 'USD')) }}</div>
-              </div>
-            </div>
-          </div>
-
-          <div v-else class="empty-state">
-            <el-icon class="empty-icon"><InfoFilled /></el-icon>
-            <p>暂无账户信息</p>
-            <el-button type="primary" size="small" @click="goToPaperTrading">
-              查看模拟交易
-            </el-button>
-          </div>
-        </el-card>
-
         <!-- 多数据源同步 -->
         <MultiSourceSyncCard style="margin-top: 24px;" />
       </el-col>
@@ -244,7 +164,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { ArrowRight, InfoFilled, Odometer, Refresh } from '@element-plus/icons-vue'
@@ -254,7 +174,6 @@ import MultiSourceSyncCard from '@/components/Dashboard/MultiSourceSyncCard.vue'
 import { favoritesApi } from '@/api/favorites'
 import { analysisApi } from '@/api/analysis'
 import { newsApi } from '@/api/news'
-import { paperApi, type PaperAccountSummary } from '@/api/paper'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -276,20 +195,7 @@ const favoriteStocks = ref<any[]>([])
 // 市场快讯数据
 const marketNews = ref<any[]>([])
 
-// 模拟交易账户数据
-const paperAccount = ref<PaperAccountSummary | null>(null)
 const dashboardLoading = ref(false)
-
-const getCurrencyAmount = (
-  amount: number | { CNY: number; HKD: number; USD: number } | undefined,
-  currency: 'CNY' | 'HKD' | 'USD',
-  fallback = 0
-): number => {
-  if (typeof amount === 'number') return amount
-  return amount?.[currency] ?? fallback
-}
-
-const paperEquityCny = computed(() => getCurrencyAmount(paperAccount.value?.equity, 'CNY'))
 
 
 
@@ -460,41 +366,17 @@ const loadMarketNews = async () => {
   }
 }
 
-// 加载模拟交易账户信息
-const loadPaperAccount = async () => {
-  try {
-    const response = await paperApi.getAccount()
-    if (response.success && response.data) {
-      paperAccount.value = response.data.account
-    }
-  } catch (error) {
-    console.error('加载模拟交易账户失败:', error)
-    paperAccount.value = null
-  }
-}
-
 const reloadDashboard = async () => {
   dashboardLoading.value = true
   try {
     await Promise.all([
       loadFavoriteStocks(),
       loadRecentAnalyses(),
-      loadMarketNews(),
-      loadPaperAccount()
+      loadMarketNews()
     ])
   } finally {
     dashboardLoading.value = false
   }
-}
-
-// 跳转到模拟交易页面
-const goToPaperTrading = () => {
-  router.push('/paper')
-}
-
-// 格式化金额
-const formatMoney = (value: number) => {
-  return value.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 }
 
 // 生命周期
@@ -701,87 +583,6 @@ onMounted(async () => {
       padding-top: 12px;
       border-top: 1px solid var(--el-border-color-lighter);
       margin-top: 12px;
-    }
-  }
-
-  .paper-trading-card {
-    .card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .paper-account-info {
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-
-      .account-section {
-        border: 1px solid var(--el-border-color-lighter);
-        border-radius: 8px;
-        padding: 12px;
-        background-color: var(--el-fill-color-blank);
-
-        .account-section-title {
-          font-size: 14px;
-          font-weight: 600;
-          color: var(--el-text-color-primary);
-          margin-bottom: 12px;
-          padding-bottom: 8px;
-          border-bottom: 1px solid var(--el-border-color-lighter);
-        }
-      }
-
-      .account-item {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 8px 0;
-
-        .account-label {
-          font-size: 13px;
-          color: var(--el-text-color-regular);
-        }
-
-        .account-value {
-          font-size: 15px;
-          font-weight: 600;
-          color: var(--el-text-color-primary);
-
-          &.primary {
-            color: var(--el-color-primary);
-            font-size: 16px;
-          }
-
-          &.price-up {
-            color: #f56c6c;
-          }
-
-          &.price-down {
-            color: #67c23a;
-          }
-
-          &.price-neutral {
-            color: var(--el-text-color-regular);
-          }
-        }
-      }
-    }
-
-    .empty-state {
-      text-align: center;
-      padding: 20px 0;
-
-      .empty-icon {
-        font-size: 48px;
-        color: var(--el-text-color-placeholder);
-        margin-bottom: 12px;
-      }
-
-      p {
-        color: var(--el-text-color-secondary);
-        margin-bottom: 16px;
-      }
     }
   }
 }

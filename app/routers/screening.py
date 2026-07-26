@@ -7,6 +7,12 @@ from app.routers.auth_db import get_current_user
 
 from app.services.screening_service import ScreeningService, ScreeningParams
 from app.services.enhanced_screening_service import get_enhanced_screening_service
+from app.services.ai_candidate_service import (
+    AICandidateRunNotFoundError,
+    InvalidAICandidateSelectionError,
+    ai_candidate_service,
+)
+from app.services.holdings_cli import CLIError
 from app.models.screening import (
     ScreeningCondition, ScreeningRequest as NewScreeningRequest,
     ScreeningResponse as NewScreeningResponse, FieldInfo, BASIC_FIELDS_INFO
@@ -39,9 +45,83 @@ class ScreeningResponse(BaseModel):
     total: int
     items: List[dict]
 
+
+class AICandidateRunRequest(BaseModel):
+    max_candidates: int = Field(default=5, ge=1, le=10)
+
+
+class AddAICandidatesRequest(BaseModel):
+    codes: List[str] = Field(default_factory=list, min_length=1, max_length=10)
+
 # 服务实例
 svc = ScreeningService()
 enhanced_svc = get_enhanced_screening_service()
+
+
+@router.post("/ai-candidates/run", response_model=dict)
+async def run_ai_candidates(
+    request: AICandidateRunRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Run the bounded public-market research pipeline and persist the batch."""
+    try:
+        result = await ai_candidate_service.run(
+            str(user["id"]),
+            max_candidates=request.max_candidates,
+        )
+        return {
+            "success": True,
+            "data": result,
+            "message": "AI候选分析完成",
+        }
+    except CLIError as exc:
+        logger.warning(
+            "AI candidate research unavailable: code=%s stage=%s",
+            exc.code,
+            exc.stage,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+                "stage": exc.stage,
+            },
+        ) from exc
+
+
+@router.get("/ai-candidates/latest", response_model=dict)
+async def get_latest_ai_candidates(user: dict = Depends(get_current_user)):
+    result = await ai_candidate_service.latest(str(user["id"]))
+    return {
+        "success": True,
+        "data": result,
+        "message": "ok",
+    }
+
+
+@router.post("/ai-candidates/{run_id}/favorites", response_model=dict)
+async def add_ai_candidates_to_favorites(
+    run_id: str,
+    request: AddAICandidatesRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Add only server-persisted candidates from the current user's run."""
+    try:
+        result = await ai_candidate_service.add_to_favorites(
+            str(user["id"]),
+            run_id,
+            request.codes,
+        )
+        return {
+            "success": True,
+            "data": result,
+            "message": "自选股更新完成",
+        }
+    except AICandidateRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="AI候选批次不存在") from exc
+    except InvalidAICandidateSelectionError as exc:
+        raise HTTPException(status_code=400, detail="候选股票不属于该批次") from exc
 
 
 @router.get("/fields", response_model=FieldConfigResponse)

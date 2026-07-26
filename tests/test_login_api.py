@@ -4,7 +4,7 @@ import json
 
 async def test_login_api():
     """测试登录API是否正常工作"""
-    url = "http://localhost:8001/api/auth/login"
+    url = "http://localhost:8331/api/auth/login"
     
     # 测试数据
     login_data = {

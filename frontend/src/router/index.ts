@@ -101,6 +101,30 @@ const routes: RouteRecordRaw[] = [
       }
     ]
   },
+  {
+    path: '/decision',
+    name: 'DecisionWorkspace',
+    component: () => import('@/layouts/BasicLayout.vue'),
+    meta: {
+      title: '决策工作台',
+      icon: 'DataAnalysis',
+      requiresAuth: true,
+      transition: 'fade',
+      fluidContent: true
+    },
+    children: [
+      {
+        path: '',
+        name: 'DecisionWorkspaceHome',
+        component: () => import('@/views/Decision/index.vue'),
+        meta: {
+          title: '决策工作台',
+          requiresAuth: true,
+          fluidContent: true
+        }
+      }
+    ]
+  },
 
   {
     path: '/favorites',
@@ -342,29 +366,6 @@ const routes: RouteRecordRaw[] = [
       transition: 'fade'
     }
   },
-  {
-    path: '/paper',
-    name: 'PaperTrading',
-    component: () => import('@/layouts/BasicLayout.vue'),
-    meta: {
-      title: '模拟交易',
-      icon: 'CreditCard',
-      requiresAuth: true,
-      transition: 'slide-up'
-    },
-    children: [
-      {
-        path: '',
-        name: 'PaperTradingHome',
-        component: () => import('@/views/PaperTrading/index.vue'),
-        meta: {
-          title: '模拟交易',
-          requiresAuth: true
-        }
-      }
-    ]
-  },
-
   {
     path: '/:pathMatch(.*)*',
     name: 'NotFound',

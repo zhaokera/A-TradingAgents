@@ -41,11 +41,10 @@
       <template #title>股票筛选</template>
     </el-menu-item>
 
-    <el-menu-item index="/paper">
-      <el-icon><CreditCard /></el-icon>
-      <template #title>模拟交易</template>
+    <el-menu-item index="/decision">
+      <el-icon><DataAnalysis /></el-icon>
+      <template #title>决策工作台</template>
     </el-menu-item>
-
 
     <!-- 分析报告已移至“股票分析”子菜单，保留注释便于追踪 -->
     <!--
@@ -108,13 +107,13 @@ import {
   Wallet,
   TrendCharts,
   Search,
+  DataAnalysis,
   List,
   /* Document 移除：不再使用顶级分析报告菜单图标 */
   User,
   Tools,
   Management,
-  InfoFilled,
-  CreditCard
+  InfoFilled
 } from '@element-plus/icons-vue'
 
 const route = useRoute()

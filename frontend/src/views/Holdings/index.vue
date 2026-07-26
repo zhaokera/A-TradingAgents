@@ -10,9 +10,13 @@
           <el-icon><Edit /></el-icon>
           设置总资产
         </el-button>
+        <el-button :loading="reportSubmitting" @click="generateTodayReports">
+          <el-icon><Document /></el-icon>
+          生成今日报告
+        </el-button>
         <el-button type="primary" :loading="loading" @click="loadHoldings">
           <el-icon><Refresh /></el-icon>
-          刷新分析
+          刷新价格
         </el-button>
       </div>
     </div>
@@ -167,7 +171,7 @@
             <el-table-column label="操作" width="120">
               <template #default="{ row }">
                 <div class="table-actions">
-                  <el-button link type="warning" @click.stop="openPlanDialog(row)">计划</el-button>
+                  <el-button link type="warning" @click.stop="openPlanDialog(row)">价格</el-button>
                   <el-button link type="primary" @click.stop="editHolding(row)">编辑</el-button>
                   <el-button link type="danger" @click.stop="deleteHolding(row)">删除</el-button>
                 </div>
@@ -234,7 +238,7 @@
         <section class="detail-section">
           <div class="section-title section-title--with-action">
             <span>价格计划</span>
-            <el-button size="small" type="warning" plain @click="openPlanDialog(selectedHolding)">编辑计划</el-button>
+            <el-button size="small" type="warning" plain @click="openPlanDialog(selectedHolding)">编辑价格</el-button>
           </div>
           <div class="detail-plan-list">
             <div v-for="plan in pricePlanRows(selectedHolding)" :key="plan.key" class="detail-plan-item">
@@ -399,7 +403,7 @@
         <div class="dialog-footer">
           <el-button @click="planDialogVisible = false">取消</el-button>
           <el-button type="primary" :loading="planSaving" @click="savePricePlan">
-            保存计划
+            保存价格计划
           </el-button>
         </div>
       </template>
@@ -443,10 +447,12 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Edit, Plus, Refresh } from '@element-plus/icons-vue'
+import { Document, Edit, Plus, Refresh } from '@element-plus/icons-vue'
 import { holdingsApi, type HoldingItem, type HoldingPayload, type HoldingSettings } from '@/api/holdings'
+import { analysisApi, type SingleAnalysisRequest } from '@/api/analysis'
 import { stocksApi } from '@/api/stocks'
 import { buildPricePlanRows, type PricePlanSource } from './pricePlan'
+import { normalizeMarketForAnalysis } from '@/utils/market'
 
 const router = useRouter()
 const holdings = ref<HoldingItem[]>([])
@@ -455,6 +461,7 @@ const loading = ref(false)
 const saving = ref(false)
 const settingsSaving = ref(false)
 const planSaving = ref(false)
+const reportSubmitting = ref(false)
 const nameLoading = ref(false)
 const formDialogVisible = ref(false)
 const settingsDialogVisible = ref(false)
@@ -620,6 +627,133 @@ const loadHoldings = async () => {
     }
   } finally {
     loading.value = false
+  }
+}
+
+const formatLocalDate = (date = new Date()) => {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+const activePriceFrom = (...values: Array<number | null | undefined>) => {
+  for (const value of values) {
+    if (value !== null && value !== undefined && Number(value) > 0) {
+      return Number(value)
+    }
+  }
+  return undefined
+}
+
+const buildHoldingReportRequest = (holding: HoldingItem, analysisDate: string): SingleAnalysisRequest => {
+  const stopLossPrice = activePriceFrom(
+    holding.manual_stop_loss_price,
+    holding.ai_advice?.stop_loss_price
+  )
+  const takeProfitPrice = activePriceFrom(
+    holding.manual_target_price,
+    holding.ai_advice?.target_price,
+    holding.manual_sell_price,
+    holding.ai_advice?.suggested_sell_price
+  )
+  const planText = [
+    `策略：${strategyText(holding.strategy)}`,
+    holding.price_plan_notes ? `价格计划：${holding.price_plan_notes}` : '',
+    holding.notes ? `持仓备注：${holding.notes}` : ''
+  ].filter(Boolean).join('\n')
+
+  return {
+    symbol: holding.code,
+    stock_code: holding.code,
+    parameters: {
+      market_type: normalizeMarketForAnalysis(holding.market),
+      analysis_date: analysisDate,
+      research_depth: '全面',
+      selected_analysts: ['market', 'fundamentals', 'news', 'social'],
+      include_sentiment: true,
+      include_risk: true,
+      language: 'zh-CN',
+      holding: {
+        cost_price: Number(holding.cost_price),
+        shares: Number(holding.quantity),
+        take_profit_price: takeProfitPrice,
+        stop_loss_price: stopLossPrice,
+        plan: planText || strategyText(holding.strategy)
+      }
+    }
+  }
+}
+
+const generateTodayReports = async () => {
+  const reportTargets = holdings.value.filter(item => item.code)
+  if (reportTargets.length === 0) {
+    ElMessage.warning('请先新增持仓')
+    return
+  }
+  if (reportTargets.length > 10) {
+    ElMessage.warning('一次最多生成 10 只持仓的报告，请先精简持仓列表')
+    return
+  }
+
+  const analysisDate = formatLocalDate()
+  try {
+    await ElMessageBox.confirm(
+      `将为 ${reportTargets.length} 只持仓生成 ${analysisDate} 的全面分析报告，并刷新当前价格。报告完成后，持仓页会从最新报告提取关键价格区间。`,
+      '生成今日报告',
+      {
+        confirmButtonText: '开始生成',
+        cancelButtonText: '取消',
+        type: 'info'
+      }
+    )
+  } catch {
+    return
+  }
+
+  reportSubmitting.value = true
+  try {
+    const results: Array<{ holding: HoldingItem; taskId?: string; error?: string }> = []
+    for (const holding of reportTargets) {
+      try {
+        const response = await analysisApi.startSingleAnalysis(buildHoldingReportRequest(holding, analysisDate))
+        const taskId = response?.data?.task_id
+        if (!taskId) {
+          throw new Error('任务ID为空')
+        }
+        results.push({ holding, taskId })
+      } catch (error: any) {
+        results.push({ holding, error: error?.message || '提交失败' })
+      }
+    }
+
+    await loadHoldings()
+
+    const successCount = results.filter(item => item.taskId).length
+    const failedItems = results.filter(item => item.error)
+    if (successCount > 0) {
+      ElMessage.success(`已提交 ${successCount} 个今日持仓报告任务`)
+    }
+    if (failedItems.length > 0) {
+      ElMessage.warning(`${failedItems.length} 个持仓报告提交失败`)
+    }
+
+    if (successCount > 0) {
+      ElMessageBox.confirm(
+        `今日持仓报告任务已提交 ${successCount} 个。报告会在任务完成后进入分析报告列表。`,
+        '提交成功',
+        {
+          confirmButtonText: '去任务中心',
+          cancelButtonText: '留在当前页',
+          type: failedItems.length > 0 ? 'warning' : 'success',
+          distinguishCancelAndClose: true
+        }
+      ).then(() => {
+        router.push({ path: '/tasks', query: { tab: 'running' } })
+      }).catch(() => {})
+    }
+  } finally {
+    reportSubmitting.value = false
   }
 }
 

@@ -111,8 +111,18 @@ async def get_quote(
     db = get_mongo_db()
     code6 = normalized_code
 
-    # 行情
+    # 行情：优先腾讯实时直连，失败再回退 Mongo 缓存
+    tencent_quote = None
+    try:
+        from app.services.tencent_quote_service import get_tencent_quote_service
+
+        tencent_quote = await get_tencent_quote_service().get_quote(code6)
+    except Exception as e:
+        logger.warning(f"⚠️ 腾讯实时行情获取失败: {code6} - {e}")
+
     q = await db["market_quotes"].find_one({"code": code6}, {"_id": 0})
+    if tencent_quote:
+        q = {**(q or {}), **tencent_quote}
 
     # 🔥 调试日志：查看查询结果
     logger.info(f"🔍 查询 market_quotes: code={code6}")
@@ -190,7 +200,7 @@ async def get_quote(
 
     data = {
         "code": code6,
-        "name": (b or {}).get("name"),
+        "name": (b or {}).get("name") or (q or {}).get("name"),
         "market": (b or {}).get("market"),
         "price": close,
         "change_percent": pct,
@@ -207,6 +217,7 @@ async def get_quote(
         "amplitude_date": amplitude_date,  # 🔥 新增：振幅数据日期
         "trade_date": (q or {}).get("trade_date"),
         "updated_at": (q or {}).get("updated_at"),
+        "source": (q or {}).get("source") or (q or {}).get("data_source"),
     }
 
     return ok(data)
@@ -747,4 +758,3 @@ async def get_news(code: str, days: int = 30, limit: int = 50, include_announcem
                 "items": []
             }
             return ok(data)
-

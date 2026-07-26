@@ -183,7 +183,7 @@ netstat -ano | findstr :8000  # Windows
 lsof -i :8000                 # Linux/macOS
 
 # 修改端口
-export PORT=8001
+export PORT=8331
 python -m app
 ```
 

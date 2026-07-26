@@ -58,6 +58,7 @@ dependencies = [
     "openai>=1.0.0,<2.0.0",
 
     # 数据处理和分析
+    "numpy>=2.0.0",
     "pandas>=2.3.0",
     "plotly>=5.0.0",
 
@@ -84,6 +85,7 @@ dependencies = [
     "streamlit>=1.28.0",
     "toml>=0.10.2",
     "tqdm>=4.67.1",
+    "typer>=0.16.0,<1.0.0",
     "typing-extensions>=4.14.0",
 ]
 
@@ -91,8 +93,17 @@ dependencies = [
 qianfan = ["qianfan>=0.4.20"]
 
 [project.scripts]
-tradingagents = "main:main"
+agentctl = "cli.agent:main"
+tradingagents = "cli.agent:main"
+holdings = "cli.agent:holdings_main"
+
+[tool.setuptools]
+py-modules = ["main", "holdings_cli"]
+include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*"]
+include = ["tradingagents*", "app*", "cli*"]
 exclude = ["tests*", "docs*", "scripts*", "data*", "logs*", "reports*", "results*", "eval_results*", "upstream_contribution*"]
+
+[tool.setuptools.package-data]
+app = ["LICENSE"]

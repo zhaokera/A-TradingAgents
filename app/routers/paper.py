@@ -206,7 +206,20 @@ async def _get_last_price(code: str, market: str) -> Optional[float]:
 
     # A股：从数据库获取
     if market == "CN":
-        # 1. 尝试从 market_quotes 获取
+        # 1. 优先使用腾讯单股实时行情
+        try:
+            from app.services.tencent_quote_service import get_tencent_quote_service
+
+            quote = await get_tencent_quote_service().get_quote(code)
+            if quote:
+                price = quote.get("close") or quote.get("price") or quote.get("current_price")
+                if price and float(price) > 0:
+                    logger.debug(f"✅ 从腾讯实时行情获取价格: {code} = {price}")
+                    return float(price)
+        except Exception as e:
+            logger.warning(f"⚠️ 腾讯实时行情获取失败 {code}: {e}")
+
+        # 2. 尝试从 market_quotes 获取
         q = await db["market_quotes"].find_one(
             {"$or": [{"code": code}, {"symbol": code}]},
             {"_id": 0, "close": 1}
@@ -220,7 +233,7 @@ async def _get_last_price(code: str, market: str) -> Optional[float]:
             except Exception as e:
                 logger.warning(f"⚠️ market_quotes 价格转换失败 {code}: {e}")
 
-        # 2. 回退到 stock_basic_info 的 current_price
+        # 3. 回退到 stock_basic_info 的 current_price
         basic_info = await db["stock_basic_info"].find_one(
             {"$or": [{"code": code}, {"symbol": code}]},
             {"_id": 0, "current_price": 1}

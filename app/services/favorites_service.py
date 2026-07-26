@@ -48,6 +48,8 @@ class FavoritesService:
             "notes": favorite.get("notes", ""),
             "alert_price_high": favorite.get("alert_price_high"),
             "alert_price_low": favorite.get("alert_price_low"),
+            "source": favorite.get("source") or "manual",
+            "ai_metadata": favorite.get("ai_metadata"),
             # 行情占位，稍后填充
             "current_price": None,
             "change_percent": None,
@@ -160,7 +162,10 @@ class FavoritesService:
         tags: List[str] = None,
         notes: str = "",
         alert_price_high: Optional[float] = None,
-        alert_price_low: Optional[float] = None
+        alert_price_low: Optional[float] = None,
+        *,
+        source: str = "manual",
+        ai_metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """添加股票到自选股（兼容字符串ID与ObjectId）"""
         import logging
@@ -180,7 +185,9 @@ class FavoritesService:
                 "tags": tags or [],
                 "notes": notes,
                 "alert_price_high": alert_price_high,
-                "alert_price_low": alert_price_low
+                "alert_price_low": alert_price_low,
+                "source": "ai_screening" if source == "ai_screening" else "manual",
+                "ai_metadata": ai_metadata if source == "ai_screening" else None,
             }
 
             logger.info(f"🔧 [add_favorite] 自选股数据构建完成: {favorite_stock}")
@@ -232,6 +239,19 @@ class FavoritesService:
         except Exception as e:
             logger.error(f"❌ [add_favorite] 添加自选股异常: {type(e).__name__}: {str(e)}", exc_info=True)
             raise
+
+    async def get_favorite_codes(self, user_id: str) -> set[str]:
+        """Return normalized favorite codes without quote enrichment."""
+        db = await self._get_db()
+        doc = await db.user_favorites.find_one(
+            {"user_id": user_id},
+            {"favorites.stock_code": 1, "_id": 0},
+        )
+        return {
+            str(item.get("stock_code") or "").strip()
+            for item in (doc or {}).get("favorites", [])
+            if str(item.get("stock_code") or "").strip()
+        }
 
     async def remove_favorite(self, user_id: str, stock_code: str) -> bool:
         """从自选股中移除股票（兼容字符串ID与ObjectId）"""

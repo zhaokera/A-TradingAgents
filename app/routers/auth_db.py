@@ -7,8 +7,9 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from app.core.config import settings
 from app.services.auth_service import AuthService
 from app.services.user_service import user_service
 from app.models.user import UserCreate, UserUpdate
@@ -37,20 +38,41 @@ router = APIRouter()
 class LoginRequest(BaseModel):
     username: str
     password: str
+    session_days: Optional[int] = Field(default=None, ge=7, le=30)
 
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
+    refresh_expires_in: Optional[int] = None
     user: dict
 
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
+    session_days: Optional[int] = Field(default=None, ge=7, le=30)
 
 class RefreshTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
+    refresh_expires_in: Optional[int] = None
+
+
+def _token_lifetimes(session_days: Optional[int]) -> tuple[int, int]:
+    """Return access and refresh lifetimes in seconds.
+
+    Browser clients keep the configured access-token lifetime. Automation
+    clients may explicitly request a 7-30 day access session; the refresh token
+    is always at least as long as that session.
+    """
+
+    access_seconds = (
+        session_days * 24 * 60 * 60
+        if session_days is not None
+        else settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+    refresh_days = max(settings.REFRESH_TOKEN_EXPIRE_DAYS, session_days or 0)
+    return access_seconds, refresh_days * 24 * 60 * 60
 
 class ChangePasswordRequest(BaseModel):
     old_password: str
@@ -165,9 +187,16 @@ async def login(payload: LoginRequest, request: Request):
             )
             raise HTTPException(status_code=401, detail="用户名或密码错误")
 
-        # 生成 token
-        token = AuthService.create_access_token(sub=user.username)
-        refresh_token = AuthService.create_access_token(sub=user.username, expires_delta=60*60*24*7)  # 7天有效期
+        # CLI 可显式申请 7-30 天会话；Web 登录继续使用系统默认时长。
+        access_expires_in, refresh_expires_in = _token_lifetimes(payload.session_days)
+        token = AuthService.create_access_token(
+            sub=user.username,
+            expires_delta=access_expires_in,
+        )
+        refresh_token = AuthService.create_access_token(
+            sub=user.username,
+            expires_delta=refresh_expires_in,
+        )
 
         # 记录登录成功日志
         await log_operation(
@@ -175,7 +204,10 @@ async def login(payload: LoginRequest, request: Request):
             username=user.username,
             action_type=ActionType.USER_LOGIN,
             action="用户登录",
-            details={"login_method": "password"},
+            details={
+                "login_method": "password",
+                "session_days": payload.session_days,
+            },
             success=True,
             duration_ms=int((time.time() - start_time) * 1000),
             ip_address=ip_address,
@@ -187,7 +219,8 @@ async def login(payload: LoginRequest, request: Request):
             "data": {
                 "access_token": token,
                 "refresh_token": refresh_token,
-                "expires_in": 60 * 60,
+                "expires_in": access_expires_in,
+                "refresh_expires_in": refresh_expires_in,
                 "user": {
                     "id": str(user.id),
                     "username": user.username,
@@ -243,9 +276,16 @@ async def refresh_token(payload: RefreshTokenRequest):
 
         logger.debug(f"✅ Token验证成功，用户: {token_data.sub}")
 
-        # 生成新的tokens
-        new_token = AuthService.create_access_token(sub=token_data.sub)
-        new_refresh_token = AuthService.create_access_token(sub=token_data.sub, expires_delta=60*60*24*7)
+        # 保持 CLI 请求的长会话；普通 Web 刷新仍使用系统默认时长。
+        access_expires_in, refresh_expires_in = _token_lifetimes(payload.session_days)
+        new_token = AuthService.create_access_token(
+            sub=token_data.sub,
+            expires_delta=access_expires_in,
+        )
+        new_refresh_token = AuthService.create_access_token(
+            sub=token_data.sub,
+            expires_delta=refresh_expires_in,
+        )
 
         logger.debug(f"🎉 新token生成成功")
 
@@ -254,7 +294,8 @@ async def refresh_token(payload: RefreshTokenRequest):
             "data": {
                 "access_token": new_token,
                 "refresh_token": new_refresh_token,
-                "expires_in": 60 * 60
+                "expires_in": access_expires_in,
+                "refresh_expires_in": refresh_expires_in,
             },
             "message": "Token刷新成功"
         }

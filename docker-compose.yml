@@ -12,7 +12,7 @@ services:
     image: tradingagents-backend:v1.0.0-preview
     container_name: tradingagents-backend
     ports:
-      - "8000:8000"
+      - "8331:8000"
     volumes:
       # 日志目录映射
       - ./logs:/app/logs
@@ -74,7 +74,7 @@ services:
     environment:
       TZ: "Asia/Shanghai"
       # 后端API地址
-      VITE_API_BASE_URL: "http://localhost:8000"
+      VITE_API_BASE_URL: "http://localhost:8331"
     depends_on:
       backend:
         condition: service_healthy

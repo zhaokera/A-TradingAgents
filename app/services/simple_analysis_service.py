@@ -33,6 +33,7 @@ from app.services.memory_state_manager import get_memory_state_manager, TaskStat
 from app.services.redis_progress_tracker import RedisProgressTracker, get_progress_by_id
 from app.services.progress_log_handler import register_analysis_tracker, unregister_analysis_tracker
 from app.services.holding_analysis import build_holding_analysis, format_holding_analysis_markdown
+from app.services.report_metadata import resolve_report_analysis_date
 
 # 股票基础信息获取（用于补充显示名称）
 try:
@@ -647,7 +648,24 @@ class SimpleAnalysisService:
 
     def _resolve_current_price(self, code: Optional[str]) -> Optional[float]:
         """解析股票当前价，供持仓分析使用。"""
-        if not code or not _get_stock_info_safe:
+        if not code:
+            return None
+        try:
+            from app.services.tencent_quote_service import fetch_tencent_quote_sync
+
+            quote = fetch_tencent_quote_sync(code)
+            if quote:
+                for key in ("close", "price", "current_price"):
+                    value = quote.get(key)
+                    if value is None or value == "":
+                        continue
+                    price = float(value)
+                    if price > 0:
+                        return price
+        except Exception as e:
+            logger.warning(f"⚠️ 腾讯实时行情获取失败: {code} - {e}")
+
+        if not _get_stock_info_safe:
             return None
         try:
             info = _get_stock_info_safe(code)
@@ -2603,7 +2621,7 @@ class SimpleAnalysisService:
                 "stock_name": stock_name,  # 🔥 添加股票名称字段
                 "market_type": market_type,  # 🔥 添加市场类型字段
                 "model_info": result.get("model_info", "Unknown"),  # 🔥 添加模型信息字段
-                "analysis_date": timestamp.strftime('%Y-%m-%d'),
+                "analysis_date": resolve_report_analysis_date(result, generated_at=timestamp),
                 "timestamp": timestamp,
                 "status": "completed",
                 "source": "api",

@@ -1,4 +1,10 @@
+"""Command-line interfaces.
 
-# 导入统一日志系统
-from tradingagents.utils.logging_init import get_logger
-logger = get_logger("cli")
+Package import must stay side-effect free so JSON automation commands and
+``--help`` do not initialize LLM or database storage.
+"""
+
+import logging
+
+
+logger = logging.getLogger("cli")

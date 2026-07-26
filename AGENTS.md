@@ -4,7 +4,10 @@
 
 ## 项目定位
 
-TradingAgents-CN 是中文增强版多智能体股票分析平台。当前仓库不是单一 Python 包，而是三块并行系统：
+A-TradingAgents 是当前持续开发的多智能体股票分析与 Agent 管理平台，远端仓库为
+`zhaokera/A-TradingAgents`。本地目录暂时仍沿用 `TradingAgents-CN`，同时保留并参考
+TradingAgents-CN 的既有实现与版权说明；目录名和参考项目名都不代表当前产品名称。
+当前仓库不是单一 Python 包，而是三块并行系统：
 
 - `tradingagents/`: 核心多智能体库，基于 LangGraph/LangChain 组织分析师、研究员、交易员和风险讨论流程。
 - `app/`: FastAPI 后端，负责认证、任务、报告、配置、数据同步、缓存、SSE/WebSocket、定时任务和数据库访问。

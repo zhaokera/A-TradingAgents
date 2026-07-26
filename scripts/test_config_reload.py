@@ -17,7 +17,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # API 配置
-BASE_URL = "http://localhost:8001"
+BASE_URL = "http://localhost:8331"
 API_URL = f"{BASE_URL}/api/config/reload"
 
 # 测试用户的 token（需要先登录获取）
@@ -163,4 +163,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

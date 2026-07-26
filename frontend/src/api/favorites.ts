@@ -15,6 +15,29 @@ export interface FavoriteItem {
   current_price?: number | null
   change_percent?: number | null
   volume?: number | null
+  source?: 'manual' | 'ai_screening'
+  ai_metadata?: {
+    run_id?: string
+    generated_at?: string
+    reason_summary?: string
+    reference_price?: number | null
+    price_plan?: {
+      observation_zone?: number[] | null
+      entry_price?: number | null
+      breakout_price?: number | null
+      stop_price?: number | null
+      target_price?: number | null
+      status?: string
+    }
+    objective_id?: string
+    objective_label?: string
+    objective_tier?: 'core' | 'related' | 'non_core'
+    objective_tier_label?: string
+    objective_segment?: string
+    horizon?: string
+    source?: string
+    is_reference_only?: boolean
+  } | null
 }
 
 export interface AddFavoriteReq {
@@ -79,4 +102,3 @@ export const favoritesApi = {
       message: string
     }>('/api/favorites/sync-realtime', { data_source })
 }
-

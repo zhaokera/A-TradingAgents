@@ -119,6 +119,30 @@
         </el-table-column>
 
         <el-table-column prop="stock_name" label="股票名称" width="150" />
+        <el-table-column label="来源" width="150">
+          <template #default="{ row }">
+            <div v-if="row.source === 'ai_screening'" class="ai-source-cell">
+              <el-tooltip
+                :content="row.ai_metadata?.reason_summary || '由 AI 研究候选加入'"
+                placement="top"
+              >
+                <el-tag type="success" effect="plain" size="small" class="ai-source-tag">
+                  <el-icon><MagicStick /></el-icon>
+                  AI 添加
+                </el-tag>
+              </el-tooltip>
+              <el-tag
+                v-if="row.ai_metadata?.objective_tier_label"
+                :type="getObjectiveTagType(row.ai_metadata?.objective_tier)"
+                effect="plain"
+                size="small"
+              >
+                {{ row.ai_metadata.objective_tier_label }}
+              </el-tag>
+            </div>
+            <span v-else class="manual-source">手动</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="market" label="市场" width="80">
           <template #default="{ row }">
             {{ row.market || 'A股' }}
@@ -508,7 +532,8 @@ import {
   Search,
   Refresh,
   Plus,
-  Download
+  Download,
+  MagicStick
 } from '@element-plus/icons-vue'
 import { favoritesApi } from '@/api/favorites'
 import { tagsApi } from '@/api/tags'
@@ -1170,6 +1195,12 @@ const getChangeClass = (changePercent: number) => {
   return ''
 }
 
+const getObjectiveTagType = (tier?: string): 'success' | 'warning' | 'info' => {
+  if (tier === 'core') return 'success'
+  if (tier === 'related') return 'warning'
+  return 'info'
+}
+
 
 const formatPrice = (value: any): string => {
   const n = Number(value)
@@ -1200,6 +1231,24 @@ onMounted(() => {
 <style lang="scss" scoped>
 .favorites {
   min-height: calc(100vh - 104px);
+
+  .ai-source-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .ai-source-cell {
+    display: flex;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .manual-source {
+    color: var(--el-text-color-secondary);
+    font-size: 13px;
+  }
 
   .page-header {
     margin-bottom: 12px;
