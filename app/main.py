@@ -337,6 +337,16 @@ async def lifespan(app: FastAPI):
             )
             logger.info(f"⏱ 实时行情入库任务已启动: 每 {settings.QUOTES_INGEST_INTERVAL_SECONDS}s")
 
+        decision_runtime = DecisionSchedulerRuntime(
+            max_symbols=settings.DECISION_TRACKING_MAX_SYMBOLS
+        )
+        decision_jobs = await register_decision_scheduler_jobs(
+            scheduler,
+            config=settings,
+            runtime=decision_runtime,
+        )
+        logger.info("Decision scheduler configuration: %s", decision_jobs)
+
         # Tushare统一数据同步任务配置
         logger.info("🔄 配置Tushare统一数据同步任务...")
 

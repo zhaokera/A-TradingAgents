@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import math
+from typing import Any, Dict, Mapping, Optional
 
 
 INVESTMENT_OBJECTIVE: Dict[str, Any] = {
@@ -173,3 +174,153 @@ def classify_investment_objective(
 
 def objective_tier_rank(value: Any) -> int:
     return OBJECTIVE_TIER_ORDER.get(str(value or "non_core"), 2)
+
+
+def build_dynamic_portfolio_policy(
+    *,
+    total_assets: Any,
+    current_exposure_pct: Any = 0,
+    market_regime: str = "green",
+) -> Dict[str, Any]:
+    """Build account-aware concentration limits for candidate sizing."""
+
+    try:
+        assets = max(0.0, float(total_assets or 0))
+    except (TypeError, ValueError):
+        assets = 0.0
+    try:
+        exposure = min(100.0, max(0.0, float(current_exposure_pct or 0)))
+    except (TypeError, ValueError):
+        exposure = 0.0
+
+    if assets <= 20_000:
+        preferred_single, hard_single = 35.0, 45.0
+    elif assets <= 100_000:
+        preferred_single, hard_single = 25.0, 35.0
+    elif assets <= 500_000:
+        preferred_single, hard_single = 20.0, 30.0
+    else:
+        preferred_single, hard_single = 15.0, 25.0
+
+    normalized_regime = str(market_regime or "green").strip().lower()
+    exposure_caps = {
+        "green": 60.0,
+        "yellow": 30.0,
+        "red": 0.0,
+    }
+    new_exposure_cap = exposure_caps.get(normalized_regime, 30.0)
+    available_new_exposure = max(0.0, new_exposure_cap - exposure)
+
+    return {
+        **INVESTMENT_OBJECTIVE["portfolio"],
+        "policy_source": "dynamic_account_risk",
+        "market_regime": (
+            normalized_regime if normalized_regime in exposure_caps else "unknown"
+        ),
+        "total_assets": round(assets, 2),
+        "current_exposure_pct": round(exposure, 2),
+        "new_exposure_cap_pct": new_exposure_cap,
+        "available_new_exposure_pct": round(available_new_exposure, 2),
+        "reserve_cash_pct": round(100.0 - new_exposure_cap, 2),
+        "preferred_single_symbol_pct": preferred_single,
+        "hard_single_symbol_cap_pct": hard_single,
+    }
+
+
+def calculate_candidate_position_sizing(
+    *,
+    entry_price: Any,
+    stop_price: Any,
+    total_assets: Any,
+    available_cash: Any,
+    current_symbol_value: Any = 0,
+    policy: Optional[Mapping[str, Any]] = None,
+    lot_size: int = 100,
+) -> Dict[str, Any]:
+    """Size an A-share candidate from account, concentration and loss limits."""
+
+    try:
+        entry = float(entry_price)
+        stop = float(stop_price)
+        assets = float(total_assets)
+        cash = max(0.0, float(available_cash or 0))
+        existing_value = max(0.0, float(current_symbol_value or 0))
+    except (TypeError, ValueError):
+        return {"status": "unavailable", "reason": "invalid_account_or_price_data"}
+    values = (entry, stop, assets, cash, existing_value)
+    if (
+        not all(math.isfinite(value) for value in values)
+        or entry <= 0
+        or stop <= 0
+        or stop >= entry
+        or assets <= 0
+        or lot_size <= 0
+    ):
+        return {"status": "unavailable", "reason": "invalid_account_or_price_data"}
+
+    effective_policy = dict(
+        policy or build_dynamic_portfolio_policy(total_assets=assets)
+    )
+    stop_distance_pct = (entry - stop) / entry * 100
+    loss_budget_pct = float(
+        effective_policy.get("per_position_loss_budget_pct", 1.0)
+    )
+    hard_cap_pct = float(
+        effective_policy.get("hard_single_symbol_cap_pct", 30.0)
+    )
+    preferred_pct = float(
+        effective_policy.get("preferred_single_symbol_pct", hard_cap_pct)
+    )
+    available_new_exposure_pct = float(
+        effective_policy.get("available_new_exposure_pct", 0.0)
+    )
+    if available_new_exposure_pct <= 0:
+        return {
+            "status": "market_blocked",
+            "reason": "market_regime_allows_no_new_exposure",
+            "lot_size": lot_size,
+            "suggested_quantity": 0,
+            "suggested_amount": 0.0,
+            "suggested_position_pct": 0.0,
+            "stop_distance_pct": round(stop_distance_pct, 2),
+        }
+
+    existing_symbol_pct = existing_value / assets * 100
+    symbol_room_pct = max(0.0, hard_cap_pct - existing_symbol_pct)
+    risk_cap_pct = loss_budget_pct / stop_distance_pct * 100
+    suggested_pct = max(
+        0.0,
+        min(
+            preferred_pct,
+            symbol_room_pct,
+            risk_cap_pct,
+            available_new_exposure_pct,
+            cash / assets * 100,
+        ),
+    )
+    amount_cap = min(cash, assets * suggested_pct / 100)
+    quantity = math.floor(amount_cap / entry / lot_size) * lot_size
+    if quantity <= 0:
+        return {
+            "status": "one_lot_unaffordable",
+            "reason": "account_or_risk_budget_below_one_lot",
+            "lot_size": lot_size,
+            "one_lot_amount": round(entry * lot_size, 2),
+            "suggested_position_pct": round(suggested_pct, 2),
+            "stop_distance_pct": round(stop_distance_pct, 2),
+        }
+
+    amount = round(quantity * entry, 2)
+    planned_loss = round(quantity * (entry - stop), 2)
+    return {
+        "status": "sized",
+        "lot_size": lot_size,
+        "suggested_quantity": quantity,
+        "suggested_amount": amount,
+        "suggested_position_pct": round(amount / assets * 100, 2),
+        "planned_loss_amount": planned_loss,
+        "planned_loss_pct_of_assets": round(planned_loss / assets * 100, 2),
+        "stop_distance_pct": round(stop_distance_pct, 2),
+        "risk_cap_pct": round(risk_cap_pct, 2),
+        "symbol_room_pct": round(symbol_room_pct, 2),
+    }
