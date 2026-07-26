@@ -709,7 +709,7 @@ class DecisionValidationService:
         }
         return result
 
-    async def _persist(self, validation: Mapping[str, Any]) -> Dict[str, Any]:
+    async def persist(self, validation: Mapping[str, Any]) -> Dict[str, Any]:
         db = await self._get_db()
         document = deepcopy(dict(validation))
         document["persisted_at"] = datetime.now(timezone.utc).isoformat()
@@ -767,7 +767,7 @@ class DecisionValidationService:
                         ),
                     ]
                 )
-                return await self._persist(result)
+                return await self.persist(result)
             packet = refreshed
         result = await self.validate_document(
             owner,
@@ -776,7 +776,7 @@ class DecisionValidationService:
             now=now,
             proposal_id=normalized_proposal_id,
         )
-        return await self._persist(result)
+        return await self.persist(result)
 
     async def get(
         self, user_id: str, validation_id: str

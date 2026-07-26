@@ -101,6 +101,30 @@ const routes: RouteRecordRaw[] = [
       }
     ]
   },
+  {
+    path: '/decision',
+    name: 'DecisionWorkspace',
+    component: () => import('@/layouts/BasicLayout.vue'),
+    meta: {
+      title: '决策工作台',
+      icon: 'DataAnalysis',
+      requiresAuth: true,
+      transition: 'fade',
+      fluidContent: true
+    },
+    children: [
+      {
+        path: '',
+        name: 'DecisionWorkspaceHome',
+        component: () => import('@/views/Decision/index.vue'),
+        meta: {
+          title: '决策工作台',
+          requiresAuth: true,
+          fluidContent: true
+        }
+      }
+    ]
+  },
 
   {
     path: '/favorites',

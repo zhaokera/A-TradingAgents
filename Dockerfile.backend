@@ -55,7 +55,7 @@ RUN mkdir -p /app/logs /app/data /app/config && \
     fc-cache -fv && \
     rm -rf /var/lib/apt/lists/*
 
-# 复制pyproject.toml和README.md（pip安装需要）
+# 复制项目元数据（pip 安装依赖需要）
 COPY pyproject.toml README.md ./
 
 # 安装Python依赖
@@ -70,11 +70,17 @@ RUN pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple && \
 
 # 复制后端代码和必需模块
 COPY app ./app
+COPY cli ./cli
 COPY tradingagents ./tradingagents
 COPY config ./config
 COPY scripts ./scripts
 COPY docs ./docs
 COPY install ./install
+COPY VERSION ./VERSION
+
+# 源码复制完成后安装项目本身，确保 console_scripts 能从任意工作目录导入。
+# 依赖已在前面的缓存层安装，这里禁止重复解析和下载。
+RUN pip install --no-deps .
 
 # 复制Docker环境配置文件
 COPY .env.docker ./.env

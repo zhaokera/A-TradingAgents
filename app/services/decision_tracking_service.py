@@ -46,6 +46,9 @@ ACTIVE_TERMINAL_STATES = frozenset(
     }
 )
 TRACKED_STATES = frozenset({"waiting_entry", "active"})
+CALIBRATION_FEATURES = frozenset(
+    {"objective_match", "reward_risk", "evidence_completeness", "actionability"}
+)
 
 
 class ObservationConflictError(RuntimeError):
@@ -290,6 +293,8 @@ class DecisionTrackingService:
             raise ValueError("decision_identity_required")
         decision_at = _parse_datetime(packet.get("as_of"))
         phase = str(packet.get("market_phase") or "")
+        market = packet.get("market")
+        market = market if isinstance(market, Mapping) else {}
         revision = int(packet.get("revision") or 0)
         db = await self._get_db()
         registered: list[Dict[str, Any]] = []
@@ -304,6 +309,9 @@ class DecisionTrackingService:
                 code = _normalise_code(identity.get("code"))
                 if not (code.isdigit() and len(code) == 6):
                     raise ValueError("plan_code_invalid")
+                seen_codes.add(code)
+                if bucket not in {"buy_now", "condition_order"}:
+                    continue
                 plan_id = stable_plan_id_from_item(
                     item,
                     user_id=user_id,
@@ -338,6 +346,7 @@ class DecisionTrackingService:
                             origin_phase=phase,
                             eligibility_at=decision_at,
                             reference=reference,
+                            market=market,
                         )
                     except ValueError:
                         if bucket in {"wait", "avoid"}:
@@ -363,7 +372,6 @@ class DecisionTrackingService:
                         {"plan_id": plan_id, "user_id": user_id}
                     )
                 )
-                seen_codes.add(code)
 
         for code in sorted(seen_codes):
             active_plan_ids = {
@@ -399,6 +407,7 @@ class DecisionTrackingService:
         origin_phase: str,
         eligibility_at: datetime,
         reference: Mapping[str, Any],
+        market: Mapping[str, Any],
     ) -> Dict[str, Any]:
         identity = item.get("identity")
         identity = identity if isinstance(identity, Mapping) else {}
@@ -422,6 +431,18 @@ class DecisionTrackingService:
             raise ValueError("quantity_invalid")
         quantity = int(raw_quantity)
         expires_at = _parse_datetime(invalidation.get("plan_expires_at"))
+        profile = item.get("profile")
+        profile = profile if isinstance(profile, Mapping) else {}
+        calibration = item.get("calibration_features")
+        calibration = calibration if isinstance(calibration, Mapping) else {}
+        calibration_features = {
+            key: float(_decimal(calibration.get(key), field=key))
+            for key in sorted(CALIBRATION_FEATURES)
+        }
+        reason_codes = item.get("reason_codes")
+        if isinstance(reason_codes, str):
+            reason_codes = [reason_codes]
+        reason_codes = sorted({str(value) for value in reason_codes or [] if str(value)})
         return {
             "plan_id": plan_id,
             "user_id": user_id,
@@ -436,6 +457,20 @@ class DecisionTrackingService:
             "eligibility_at": eligibility_at,
             "origin_action_bucket": origin_bucket,
             "origin_market_phase": origin_phase,
+            "horizon": "short",
+            "objective_segment": str(identity.get("objective_segment") or "unknown"),
+            "industry": str(profile.get("industry") or "unknown"),
+            "provider_sector": str(profile.get("provider_sector") or "unknown"),
+            "domestic_regime": str(
+                market.get("domestic_regime") or market.get("regime") or "unknown"
+            ),
+            "macro_regime": str(
+                market.get("macro_regime")
+                or market.get("global_regime")
+                or "unknown"
+            ),
+            "reason_codes": reason_codes,
+            "calibration_features": calibration_features,
             "decision_refs": [deepcopy(dict(reference))],
             "latest_state": "waiting_entry",
             "observation_sequence": 0,
@@ -487,10 +522,26 @@ class DecisionTrackingService:
             "observation_sequence": sequence,
             "prior_state": prior_state,
             "state": new_state,
+            "status": new_state,
             "observed_at": observed,
             "origin_decision_id": plan.get("origin_decision_id"),
             "origin_action_bucket": plan.get("origin_action_bucket"),
             "origin_market_phase": plan.get("origin_market_phase"),
+            "decision_id": plan.get("trigger_context_decision_id")
+            or plan.get("origin_decision_id"),
+            "action_bucket": plan.get("trigger_context_action_bucket")
+            or plan.get("origin_action_bucket"),
+            "market_phase": plan.get("trigger_context_market_phase")
+            or plan.get("origin_market_phase"),
+            "horizon": plan.get("horizon"),
+            "objective_segment": plan.get("objective_segment"),
+            "industry": plan.get("industry"),
+            "provider_sector": plan.get("provider_sector"),
+            "domestic_regime": plan.get("domestic_regime"),
+            "macro_regime": plan.get("macro_regime"),
+            "entry_strategy": plan.get("entry_strategy"),
+            "reason_codes": deepcopy(plan.get("reason_codes") or []),
+            "calibration_features": deepcopy(plan.get("calibration_features") or {}),
             "fee_policy": deepcopy(plan.get("fee_policy") or self.fee_policy),
             "metric_basis": METRIC_BASIS,
         }
@@ -510,6 +561,7 @@ class DecisionTrackingService:
             "trigger_context_decision_id",
             "trigger_context_action_bucket",
             "trigger_context_market_phase",
+            "benchmark_entry_price",
             "exit_at",
             "exit_raw_price",
             "exit_execution_price",
@@ -729,6 +781,9 @@ class DecisionTrackingService:
             entry_execution * quantity * float(plan["fee_policy"]["commission_rate"]),
         )
         context = self._trigger_context(plan, observed_at)
+        benchmark_entry_price = _aligned_benchmark_price(
+            benchmark_observations, observed_at
+        )
         active = await self.transition(
             plan["plan_id"],
             expected_sequence=int(plan.get("observation_sequence") or 0),
@@ -744,6 +799,7 @@ class DecisionTrackingService:
                 "mae_price": min(raw_fill, low),
                 "mfe_price": max(raw_fill, high),
                 "fill_rule": f"{strategy}_{'bar' if kind == 'minute_bar' else 'last_trade'}",
+                "benchmark_entry_price": benchmark_entry_price,
             },
         )
         if kind != "minute_bar":
@@ -826,6 +882,15 @@ class DecisionTrackingService:
         observed_at: datetime,
         benchmark_observations: Sequence[Mapping[str, Any]],
     ) -> Dict[str, Any]:
+        aligned_observations = list(benchmark_observations)
+        if plan.get("benchmark_entry_price") is not None:
+            aligned_observations.append(
+                {
+                    "at": _parse_datetime(plan["entry_at"]),
+                    "price": plan["benchmark_entry_price"],
+                    "interval": "intraday",
+                }
+            )
         metrics = calculate_trade_metrics(
             entry_raw_price=plan["entry_raw_price"],
             exit_raw_price=raw_exit,
@@ -835,7 +900,7 @@ class DecisionTrackingService:
             fee_policy=plan.get("fee_policy"),
             mae_price=plan.get("mae_price"),
             mfe_price=plan.get("mfe_price"),
-            benchmark_observations=benchmark_observations,
+            benchmark_observations=aligned_observations,
         )
         return await self.transition(
             plan["plan_id"],
@@ -1005,6 +1070,7 @@ class TrackingPoller:
         max_symbols: int,
         tracking_service: Optional[DecisionTrackingService] = None,
         aggregator: Optional[MinuteBarAggregator] = None,
+        benchmark_fetcher: Any = None,
         lock_seconds: int = 14,
     ) -> None:
         if max_symbols <= 0:
@@ -1015,6 +1081,9 @@ class TrackingPoller:
         self.max_symbols = max_symbols
         self.tracking_service = tracking_service or DecisionTrackingService(db=db)
         self.aggregator = aggregator or MinuteBarAggregator()
+        self.benchmark_fetcher = benchmark_fetcher
+        if self.benchmark_fetcher is None and hasattr(quote_fetcher, "get_quote"):
+            self.benchmark_fetcher = quote_fetcher.get_quote
         self.lock_seconds = lock_seconds
 
     async def _get_db(self) -> Any:
@@ -1052,6 +1121,31 @@ class TrackingPoller:
         if inspect.isawaitable(result):
             result = await result
         return result if isinstance(result, Mapping) else {}
+
+    async def _fetch_benchmark(self) -> list[Dict[str, Any]]:
+        if self.benchmark_fetcher is None:
+            return []
+        try:
+            result = self.benchmark_fetcher("sh000300")
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, Mapping):
+                return []
+            trade_at = result.get("trade_at")
+            price = result.get("price") or result.get("close")
+            if trade_at is None or price is None:
+                return []
+            return [
+                {
+                    "at": trade_at,
+                    "price": price,
+                    "interval": "intraday",
+                    "source": "tencent",
+                    "code": "000300",
+                }
+            ]
+        except Exception:
+            return []
 
     async def poll_once(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         local_now = _parse_datetime(now or datetime.now(SHANGHAI_TIMEZONE))
@@ -1116,6 +1210,7 @@ class TrackingPoller:
                 quotes = await self._fetch(symbols)
             except Exception:
                 return {"status": "quote_fetch_failed", "phase": phase, "fetched": 0}
+            benchmark_observations = await self._fetch_benchmark()
             owned = await db["job_locks"].find_one(
                 {
                     "_id": lock_id,
@@ -1161,13 +1256,21 @@ class TrackingPoller:
                         upsert=True,
                     )
                     for plan in plans:
-                        await self.tracking_service.observe(plan["plan_id"], bar)
+                        await self.tracking_service.observe(
+                            plan["plan_id"],
+                            bar,
+                            benchmark_observations=benchmark_observations,
+                        )
                     closed_bars += 1
                 plans = await db["decision_plans"].find(
                     {"code": code, "latest_state": {"$in": ["waiting_entry", "active"]}}
                 ).to_list(length=None)
                 for plan in plans:
-                    await self.tracking_service.observe(plan["plan_id"], quote)
+                    await self.tracking_service.observe(
+                        plan["plan_id"],
+                        quote,
+                        benchmark_observations=benchmark_observations,
+                    )
                 processed += 1
             return {
                 "status": "polled",

@@ -30,6 +30,8 @@ from app.core.database import init_db, close_db
 from app.core.logging_config import setup_logging
 from app.routers import auth_db as auth, analysis, screening, queue, sse, health, favorites, config, reports, database, operation_logs, tags, tushare_init, akshare_init, baostock_init, historical_data, multi_period_sync, financial_data, news_data, social_media, internal_messages, usage_statistics, model_capabilities, cache, logs, holdings
 from app.routers import sync as sync_router, multi_source_sync
+from app.routers import briefing
+from app.routers import decision
 from app.routers import stocks as stocks_router
 from app.routers import stock_data as stock_data_router
 from app.routers import stock_sync as stock_sync_router
@@ -40,6 +42,10 @@ from app.routers import scheduler as scheduler_router
 from app.services.basics_sync_service import get_basics_sync_service
 from app.services.multi_source_basics_sync_service import MultiSourceBasicsSyncService
 from app.services.scheduler_service import set_scheduler_instance
+from app.services.decision_scheduler_service import (
+    DecisionSchedulerRuntime,
+    register_decision_scheduler_jobs,
+)
 from app.worker.tushare_sync_service import (
     run_tushare_basic_info_sync,
     run_tushare_quotes_sync,
@@ -691,6 +697,8 @@ app.include_router(screening.router, prefix="/api/screening", tags=["screening"]
 app.include_router(queue.router, prefix="/api/queue", tags=["queue"])
 app.include_router(favorites.router, prefix="/api", tags=["favorites"])
 app.include_router(holdings.router, prefix="/api", tags=["holdings"])
+app.include_router(briefing.router, prefix="/api", tags=["briefing"])
+app.include_router(decision.router, prefix="/api", tags=["decision"])
 app.include_router(stocks_router.router, prefix="/api", tags=["stocks"])
 app.include_router(multi_market_stocks_router.router, prefix="/api", tags=["multi-market"])
 app.include_router(stock_data_router.router, tags=["stock-data"])

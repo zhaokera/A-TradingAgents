@@ -170,6 +170,25 @@ class Settings(BaseSettings):
     SCREENING_CACHE_TTL: int = Field(default=1800)  # 30分钟
     A_SHARE_CALENDAR_CACHE_MAX_AGE_HOURS: int = Field(default=168, ge=1)
 
+    # 可审计每日决策与影子交易跟踪独立开关。
+    DECISION_REFRESH_ENABLED: bool = Field(default=True)
+    DECISION_TRACKING_ENABLED: bool = Field(default=True)
+    DECISION_TRACKING_MAX_SYMBOLS: int = Field(default=50, ge=1, le=500)
+    # 决策权威默认保持现有软件基线；仅在明确配置后提升已校验的 Codex 提案。
+    DECISION_AUTHORITY_MODE: str = Field(
+        default="software_baseline",
+        pattern="^(software_baseline|codex_shadow|codex_validated)$",
+    )
+    # 指数红灯默认是需要 Codex 显式解释的软约束，而不是无条件归零。
+    MARKET_RED_BLOCKS_NEW_POSITIONS: bool = Field(default=False)
+    CODEX_DECISION_MAX_NEW_POSITIONS: int = Field(default=2, ge=0, le=10)
+    CODEX_DECISION_PRIMARY_POSITION_COUNT: int = Field(default=1, ge=0, le=3)
+    CODEX_DECISION_VALIDATION_TTL_SECONDS: int = Field(
+        default=60,
+        ge=10,
+        le=300,
+    )
+
     # 安全配置
     BCRYPT_ROUNDS: int = Field(default=12)
     SESSION_EXPIRE_HOURS: int = Field(default=24)

@@ -21,6 +21,7 @@ from pymongo.errors import DuplicateKeyError
 from app.core.database import get_mongo_db
 from app.services.ai_candidate_service import ai_candidate_service
 from app.services.daily_briefing_service import daily_briefing_service
+from app.services.decision_tracking_service import DecisionTrackingService
 from app.services.investment_policy import classify_investment_objective
 from app.services.market_session_policy_service import market_session_policy_service
 from app.services.portfolio_diversification_service import (
@@ -245,6 +246,49 @@ def _stable_plan_id(
     return f"plan_{digest}"
 
 
+def _calibration_features(
+    candidate: Mapping[str, Any],
+    profile: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    bucket: str,
+) -> Dict[str, float]:
+    objective_match = _finite_decimal(candidate.get("objective_match_score"))
+    objective_value = min(Decimal("1"), max(Decimal("0"), objective_match or Decimal("0")))
+
+    reward_risk = _finite_decimal(candidate.get("reward_risk_ratio"))
+    if reward_risk is None:
+        entry = _finite_decimal(plan.get("entry_price"))
+        stop = _finite_decimal(plan.get("stop_price"))
+        target = _finite_decimal(plan.get("target_price"))
+        if entry is not None and stop is not None and target is not None and entry > stop:
+            reward_risk = (target - entry) / (entry - stop)
+    reward_value = min(
+        Decimal("1"),
+        max(Decimal("0"), (reward_risk or Decimal("0")) / Decimal("3")),
+    )
+
+    quality = profile.get("data_quality")
+    quality = quality if isinstance(quality, Mapping) else {}
+    required_fields = ("provider_sector", "industry", "main_business")
+    present = sum(bool(profile.get(field)) for field in required_fields)
+    evidence_value = Decimal(present) / Decimal(len(required_fields))
+    if quality.get("complete") is True:
+        evidence_value = Decimal("1")
+
+    action_value = {
+        "buy_now": Decimal("1"),
+        "condition_order": Decimal("0.75"),
+        "wait": Decimal("0.25"),
+        "avoid": Decimal("0"),
+    }.get(bucket, Decimal("0"))
+    return {
+        "objective_match": float(objective_value),
+        "reward_risk": float(reward_value),
+        "evidence_completeness": float(evidence_value),
+        "actionability": float(action_value),
+    }
+
+
 def _dedupe_ordered(values: Iterable[str], order: Sequence[str]) -> list[str]:
     present = {str(value) for value in values if value}
     return [value for value in order if value in present]
@@ -425,6 +469,7 @@ class DailyDecisionService:
         market_session_policy: Any = None,
         profile_resolver: Any = None,
         diversification_service: Any = None,
+        tracking_service: Any = None,
         db: Any = None,
         duplicate_key_errors: tuple[type[BaseException], ...] = (DuplicateKeyError,),
         lease_seconds: int = 15,
@@ -441,6 +486,7 @@ class DailyDecisionService:
         self.diversification_service = (
             diversification_service or PortfolioDiversificationService()
         )
+        self.tracking_service = tracking_service or DecisionTrackingService(db=db)
         self.db = db
         self.duplicate_key_errors = duplicate_key_errors
         self.lease_seconds = lease_seconds
@@ -806,9 +852,16 @@ class DailyDecisionService:
                     "rank_score": candidate.get("rank_score"),
                     "objective_tier": candidate.get("objective_tier"),
                     "objective_segment": candidate.get("objective_segment"),
+                    "objective_match_score": candidate.get("objective_match_score"),
                 },
                 "action": bucket,
                 "reason_codes": reasons,
+                "calibration_features": _calibration_features(
+                    candidate,
+                    profile,
+                    plan,
+                    bucket,
+                ),
                 "quote": {
                     **quote,
                     "status": quote_status.get("status"),
@@ -942,6 +995,8 @@ class DailyDecisionService:
                 ),
             },
             "effective_policy": effective_policy,
+            "authority": "software_baseline",
+            "is_final_decision": False,
             "summary": {
                 f"{bucket}_count": len(bucket_items[bucket]) for bucket in BUCKETS
             },
@@ -1182,7 +1237,14 @@ class DailyDecisionService:
             )
 
         packet = await compose()
-        return await self._persist_packet(packet, recompute=compose)
+        snapshot = await self._persist_packet(packet, recompute=compose)
+        try:
+            registered = self.tracking_service.register_decision(snapshot)
+            if inspect.isawaitable(registered):
+                await registered
+        except Exception as exc:
+            raise DecisionPersistenceError("decision_tracking_failed") from exc
+        return snapshot
 
     async def history(self, user_id: str, limit: int = 20) -> list:
         """Read newest append-only snapshots for one authenticated user."""

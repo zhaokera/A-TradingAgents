@@ -58,6 +58,7 @@ dependencies = [
     "openai>=1.0.0,<2.0.0",
 
     # 数据处理和分析
+    "numpy>=2.0.0",
     "pandas>=2.3.0",
     "plotly>=5.0.0",
 
@@ -92,8 +93,9 @@ dependencies = [
 qianfan = ["qianfan>=0.4.20"]
 
 [project.scripts]
-tradingagents = "main:main"
-holdings = "app.services.holdings_cli:main"
+agentctl = "cli.agent:main"
+tradingagents = "cli.agent:main"
+holdings = "cli.agent:holdings_main"
 
 [tool.setuptools]
 py-modules = ["main", "holdings_cli"]
