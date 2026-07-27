@@ -743,7 +743,31 @@ class DailyDecisionService:
             for item in candidate_run.get("candidates", [])
             if isinstance(item, Mapping)
         ]
-        permission_prefilter_excluded: list[Dict[str, str]] = []
+        raw_run_permission_excluded = candidate_run.get(
+            "permission_prefilter_excluded"
+        )
+        raw_run_permission_excluded = (
+            raw_run_permission_excluded
+            if isinstance(raw_run_permission_excluded, list)
+            else []
+        )
+        permission_prefilter_excluded: list[Dict[str, str]] = [
+            {
+                "code": _normalise_code(item.get("code")),
+                "name": str(item.get("name") or item.get("code") or ""),
+                "board": str(item.get("board") or "A_SHARE"),
+                "reason_code": str(
+                    item.get("reason_code") or "governance_excluded"
+                ),
+            }
+            for item in raw_run_permission_excluded
+            if isinstance(item, Mapping)
+            and re.fullmatch(r"\d{6}", _normalise_code(item.get("code")))
+        ]
+        permission_audit_keys = {
+            (item["code"], item["reason_code"])
+            for item in permission_prefilter_excluded
+        }
         permitted_candidates: list[Dict[str, Any]] = []
         for candidate in raw_candidates:
             code = _normalise_code(candidate.get("code"))
@@ -752,18 +776,21 @@ class DailyDecisionService:
                 execution_capabilities,
             )
             if permission_reason:
-                permission_prefilter_excluded.append(
-                    {
-                        "code": code,
-                        "name": str(candidate.get("name") or code),
-                        "board": (
-                            "STAR"
-                            if code.startswith(("688", "689"))
-                            else "A_SHARE"
-                        ),
-                        "reason_code": permission_reason,
-                    }
-                )
+                audit_key = (code, permission_reason)
+                if audit_key not in permission_audit_keys:
+                    permission_prefilter_excluded.append(
+                        {
+                            "code": code,
+                            "name": str(candidate.get("name") or code),
+                            "board": (
+                                "STAR"
+                                if code.startswith(("688", "689"))
+                                else "A_SHARE"
+                            ),
+                            "reason_code": permission_reason,
+                        }
+                    )
+                    permission_audit_keys.add(audit_key)
                 continue
             permitted_candidates.append(candidate)
         raw_candidates = permitted_candidates
