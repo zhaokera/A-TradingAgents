@@ -7,12 +7,14 @@ to the holdings CLI surface while those builders are extracted incrementally.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 def run_candidate_research(
     *,
     external_risk_level: Optional[str] = None,
+    excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the shared, account-independent full-market research workflow."""
 
@@ -21,4 +23,6 @@ def run_candidate_research(
 
     return run_public_full_market_research(
         external_risk_level=external_risk_level,
+        excluded_code_reasons=excluded_code_reasons,
+        star_market_exclusion_reason=star_market_exclusion_reason,
     )

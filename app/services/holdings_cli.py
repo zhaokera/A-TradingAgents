@@ -4421,6 +4421,7 @@ _PUBLIC_CANDIDATE_DISCOVERY_SCALAR_FIELDS = (
     "earnings_selected_count",
     "earnings_report_period",
     "earnings_actual_report_period",
+    "permission_prefilter_excluded_count",
 )
 _PUBLIC_DISCOVERY_REJECTION_KEYS = {
     "amplitude_out_of_range",
@@ -4636,6 +4637,20 @@ def _sanitize_public_candidate_discovery(value: Any) -> Dict[str, Any]:
         if isinstance(raw_closest_rejections, list)
         else []
     )
+    if "permission_prefilter_excluded" in value:
+        raw_permission_exclusions = value.get("permission_prefilter_excluded")
+        sanitized["permission_prefilter_excluded"] = (
+            [
+                _copy_public_scalar_fields(
+                    item,
+                    ("code", "name", "reason_code"),
+                )
+                for item in raw_permission_exclusions
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(raw_permission_exclusions, list)
+            else []
+        )
     sanitized["earnings_screen_status_counts"] = _sanitize_public_count_mapping(
         value.get("earnings_screen_status_counts"),
         set(PUBLIC_EARNINGS_SCREEN_STATUS_KEYS),
@@ -7602,6 +7617,8 @@ def _orchestrate_public_full_market_research_payload(
     external_risk_level: Optional[str] = None,
     database_status: Optional[Dict[str, Any]] = None,
     discovery_state: Optional[Dict[str, Any]] = None,
+    excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one deadline-bounded public discovery workflow for opportunities."""
     if context.index_status != "ok" or not _valid_opportunity_benchmark_trade_date(
@@ -7643,10 +7660,19 @@ def _orchestrate_public_full_market_research_payload(
         return result
 
     _require_opportunity_time(context, stage="candidate_discovery")
+    discovery_kwargs: Dict[str, Any] = {
+        "fetch_quotes": fetch_candidate_quotes,
+        "now": context.now,
+    }
+    if excluded_code_reasons:
+        discovery_kwargs["excluded_code_reasons"] = excluded_code_reasons
+    if star_market_exclusion_reason:
+        discovery_kwargs[
+            "star_market_exclusion_reason"
+        ] = star_market_exclusion_reason
     discovery_result = discover_public_candidate_universe(
         public_snapshot,
-        fetch_quotes=fetch_candidate_quotes,
-        now=context.now,
+        **discovery_kwargs,
     )
     if discovery_state is not None:
         discovery_state["result"] = discovery_result
@@ -7768,6 +7794,8 @@ def _build_public_full_market_research_payload(
     context: OpportunityMarketContext,
     external_risk_level: Optional[str] = None,
     database_status: Optional[Dict[str, Any]] = None,
+    excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     discovery_state: Dict[str, Any] = {}
     try:
@@ -7776,6 +7804,8 @@ def _build_public_full_market_research_payload(
             external_risk_level=external_risk_level,
             database_status=database_status,
             discovery_state=discovery_state,
+            excluded_code_reasons=excluded_code_reasons,
+            star_market_exclusion_reason=star_market_exclusion_reason,
         )
     except CLIError as exc:
         if exc.code in {
@@ -7798,6 +7828,8 @@ def _build_public_full_market_research_payload(
 def run_public_full_market_research(
     *,
     external_risk_level: Optional[str] = None,
+    excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the account-independent full-market research workflow.
 
@@ -7809,6 +7841,8 @@ def run_public_full_market_research(
     return _build_public_full_market_research_payload(
         context=context,
         external_risk_level=external_risk_level,
+        excluded_code_reasons=excluded_code_reasons,
+        star_market_exclusion_reason=star_market_exclusion_reason,
         database_status={
             "status": "not_required",
             "reason_code": "public_research_mode",

@@ -12,6 +12,7 @@ from app.services.a_share_market_regime import MIN_BREADTH_UNIVERSE_SIZE
 from app.services.public_market_breadth import _normalize_sina_snapshot
 from app.services.public_candidate_discovery_service import (
     PublicCandidateDiscoveryInputError,
+    discover_public_candidate_universe,
     midrank_percentiles,
     rank_public_candidate_universe,
 )
@@ -90,6 +91,55 @@ def _quote(definition, **overrides):
     }
     quote.update(overrides)
     return quote
+
+
+def test_discovery_prefilters_star_and_user_exclusions_before_tencent_review():
+    snapshot = _snapshot(
+        [
+            _row("600406", name="国电南瑞", amount=900_000_000.0),
+            _row("688208", name="道通科技", amount=800_000_000.0),
+            _row("000977", name="浪潮信息", amount=700_000_000.0),
+        ]
+    )
+    requested = []
+
+    def fetch_quotes(codes):
+        requested.extend(codes)
+        definitions = rank_public_candidate_universe(
+            [_row(code, amount=700_000_000.0) for code in codes],
+            benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        )["definitions"]
+        return {
+            "status": "ok",
+            "requested_codes": list(codes),
+            "rows": [_quote(definition) for definition in definitions],
+        }
+
+    result = discover_public_candidate_universe(
+        snapshot,
+        fetch_quotes=fetch_quotes,
+        now=NOW,
+        excluded_code_reasons={"600406": "user_excluded"},
+        star_market_exclusion_reason="star_market_permission_denied",
+    )
+
+    assert "600406" not in requested
+    assert "688208" not in requested
+    assert "000977" in requested
+    audit = result["candidate_discovery"]
+    assert audit["permission_prefilter_excluded_count"] == 2
+    assert audit["permission_prefilter_excluded"] == [
+        {
+            "code": "600406",
+            "name": "国电南瑞",
+            "reason_code": "user_excluded",
+        },
+        {
+            "code": "688208",
+            "name": "道通科技",
+            "reason_code": "star_market_permission_denied",
+        },
+    ]
 
 
 def _tencent_quote_payload(
@@ -1534,8 +1584,10 @@ def test_discovery_does_not_call_tencent_when_public_preselection_is_empty():
         "rejection_counts": {
             "below_min_amount": MIN_BREADTH_UNIVERSE_SIZE
         },
-        "quality_counts": {},
-        "stage_sources": {
+            "quality_counts": {},
+            "permission_prefilter_excluded_count": 0,
+            "permission_prefilter_excluded": [],
+            "stage_sources": {
             "public_snapshot": {
                 "provider": "akshare.sina.stock_zh_a_spot",
                 "status": "ok",

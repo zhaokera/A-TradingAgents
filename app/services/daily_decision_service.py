@@ -79,6 +79,7 @@ CONDITION_ORDER_PRICE_REASON = "condition_order_order_price_missing"
 _TOP_LEVEL_VOLATILE_FIELDS = {
     "decision_id",
     "as_of",
+    "briefing_as_of",
     "created_at",
     "persisted_at",
     "persistence",
@@ -120,6 +121,21 @@ def _execution_capabilities(account: Mapping[str, Any]) -> Dict[str, Any]:
         condition.get("separate_order_limit_price_supported") is True
     )
     eligible = verified and independent_trigger and separate_limit
+    market_permissions = raw.get("market_permissions")
+    market_permissions = (
+        market_permissions if isinstance(market_permissions, Mapping) else {}
+    )
+    star = market_permissions.get("star_market")
+    star = star if isinstance(star, Mapping) else {}
+    star_verified = star.get("verified") is True
+    star_tradable = star.get("tradable") is True
+    excluded_codes = account.get("excluded_codes")
+    excluded_codes = (
+        excluded_codes
+        if isinstance(excluded_codes, Iterable)
+        and not isinstance(excluded_codes, (str, bytes, Mapping))
+        else []
+    )
     return {
         "source": str(raw.get("source") or "unverified").strip(),
         "condition_order": {
@@ -128,7 +144,42 @@ def _execution_capabilities(account: Mapping[str, Any]) -> Dict[str, Any]:
             "separate_order_limit_price_supported": separate_limit,
             "eligible": eligible,
         },
+        "market_permissions": {
+            "star_market": {
+                "verified": star_verified,
+                "tradable": star_tradable,
+                "eligible": star_verified and star_tradable,
+            }
+        },
+        "excluded_codes": sorted(
+            {
+                _normalise_code(code)
+                for code in excluded_codes
+                if re.fullmatch(r"\d{6}", _normalise_code(code))
+            }
+        ),
     }
+
+
+def _permission_prefilter_reason(
+    code: str,
+    execution_capabilities: Mapping[str, Any],
+) -> Optional[str]:
+    if code in set(execution_capabilities.get("excluded_codes") or []):
+        return "user_excluded"
+    if not code.startswith(("688", "689")):
+        return None
+    market_permissions = execution_capabilities.get("market_permissions")
+    market_permissions = (
+        market_permissions if isinstance(market_permissions, Mapping) else {}
+    )
+    star = market_permissions.get("star_market")
+    star = star if isinstance(star, Mapping) else {}
+    if star.get("eligible") is True:
+        return None
+    if star.get("verified") is True:
+        return "star_market_permission_denied"
+    return "star_market_permission_unverified"
 
 
 def _as_shanghai(value: Any) -> datetime:
@@ -542,24 +593,15 @@ class DailyDecisionService:
     def _candidate_quote(candidate: Mapping[str, Any]) -> Dict[str, Any]:
         quote = candidate.get("quote")
         quote = dict(quote) if isinstance(quote, Mapping) else {}
-        source = (
-            quote.get("source")
-            or quote.get("data_source")
-            or candidate.get("quote_source")
-        )
-        trade_at = quote.get("trade_at") or candidate.get("trade_at")
-        price = (
-            quote.get("price")
-            or quote.get("close")
-            or candidate.get("reference_price")
-        )
+        source = quote.get("source") or quote.get("data_source")
+        trade_at = quote.get("trade_at")
+        price = quote.get("price") or quote.get("close")
         result = {
             **quote,
             "price": price,
             "source": str(source or "unknown").strip().lower(),
             "trade_at": trade_at,
-            "quote_checked_at": quote.get("quote_checked_at")
-            or candidate.get("quote_checked_at"),
+            "quote_checked_at": quote.get("quote_checked_at"),
         }
         if "quote_fresh" in candidate:
             result["fresh"] = bool(candidate.get("quote_fresh"))
@@ -693,11 +735,38 @@ class DailyDecisionService:
         candidate_run = await self._latest_candidate_run(user_id, refresh)
         briefing = await self.briefing_service.build(user_id, refresh=False)
         briefing = dict(briefing) if isinstance(briefing, Mapping) else {}
+        account = briefing.get("account")
+        account = dict(account) if isinstance(account, Mapping) else {}
+        execution_capabilities = _execution_capabilities(account)
         raw_candidates = [
             dict(item)
             for item in candidate_run.get("candidates", [])
             if isinstance(item, Mapping)
         ]
+        permission_prefilter_excluded: list[Dict[str, str]] = []
+        permitted_candidates: list[Dict[str, Any]] = []
+        for candidate in raw_candidates:
+            code = _normalise_code(candidate.get("code"))
+            permission_reason = _permission_prefilter_reason(
+                code,
+                execution_capabilities,
+            )
+            if permission_reason:
+                permission_prefilter_excluded.append(
+                    {
+                        "code": code,
+                        "name": str(candidate.get("name") or code),
+                        "board": (
+                            "STAR"
+                            if code.startswith(("688", "689"))
+                            else "A_SHARE"
+                        ),
+                        "reason_code": permission_reason,
+                    }
+                )
+                continue
+            permitted_candidates.append(candidate)
+        raw_candidates = permitted_candidates
         holdings_payload = briefing.get("holdings")
         holdings_payload = holdings_payload if isinstance(holdings_payload, Mapping) else {}
         raw_holdings = [
@@ -735,9 +804,6 @@ class DailyDecisionService:
                 }
             )
 
-        account = briefing.get("account")
-        account = dict(account) if isinstance(account, Mapping) else {}
-        execution_capabilities = _execution_capabilities(account)
         condition_order_capability = execution_capabilities["condition_order"]
         total_assets = account.get("total_assets")
         available_cash = account.get("available_cash")
@@ -913,6 +979,8 @@ class DailyDecisionService:
                     **quote,
                     "status": quote_status.get("status"),
                     "actionable": quote_status.get("actionable"),
+                    "age_seconds": quote_status.get("age_seconds"),
+                    "event_age_seconds": quote_status.get("event_age_seconds"),
                 },
                 "execution": {
                     "status": (
@@ -1041,7 +1109,8 @@ class DailyDecisionService:
             "as_of": local_now.isoformat(),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "candidate_run_id": candidate_run.get("run_id"),
-            "briefing_as_of": candidate_run.get("generated_at"),
+            "candidate_generated_at": candidate_run.get("generated_at"),
+            "briefing_as_of": briefing.get("as_of"),
             "market_session": stable_session,
             "account": deepcopy(account),
             "execution_capabilities": deepcopy(execution_capabilities),
@@ -1058,9 +1127,16 @@ class DailyDecisionService:
             "authority": "software_baseline",
             "is_final_decision": False,
             "summary": {
-                f"{bucket}_count": len(bucket_items[bucket]) for bucket in BUCKETS
+                **{
+                    f"{bucket}_count": len(bucket_items[bucket])
+                    for bucket in BUCKETS
+                },
+                "permission_prefilter_excluded_count": len(
+                    permission_prefilter_excluded
+                ),
             },
             **bucket_items,
+            "permission_prefilter_excluded": permission_prefilter_excluded,
             "data_quality": {
                 "candidate_run_available": bool(candidate_run),
                 "profile_errors": profile_errors,

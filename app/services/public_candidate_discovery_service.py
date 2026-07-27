@@ -1316,6 +1316,12 @@ def _discovery_output(
         "earnings_screen_results": [],
         "rejection_counts": dict(sorted((rejection_counts or {}).items())),
         "quality_counts": dict(sorted((quality_counts or {}).items())),
+        "permission_prefilter_excluded_count": len(
+            context.get("permission_prefilter_excluded") or []
+        ),
+        "permission_prefilter_excluded": list(
+            context.get("permission_prefilter_excluded") or []
+        ),
         "stage_sources": {
             "public_snapshot": {
                 "provider": context["source"],
@@ -1343,6 +1349,8 @@ def discover_public_candidate_universe(
     *,
     fetch_quotes: Callable[[Iterable[str]], Dict[str, Any]],
     now: datetime,
+    excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run public preselection and one deadline-bounded Tencent review callback."""
 
@@ -1362,6 +1370,35 @@ def discover_public_candidate_universe(
             stage=snapshot_stage,
         )
     public_source = context["source"]
+    explicit_exclusions = {
+        str(code or "").strip(): str(reason or "user_excluded").strip()
+        for code, reason in (excluded_code_reasons or {}).items()
+        if re.fullmatch(r"[0-9]{6}", str(code or "").strip())
+    }
+    permission_prefilter_excluded: List[Dict[str, str]] = []
+    filtered_rows: List[Dict[str, Any]] = []
+    for row in context["rows"]:
+        code = _normalized_code(row.get("code")) if isinstance(row, Mapping) else ""
+        reason = explicit_exclusions.get(code)
+        if reason is None and star_market_exclusion_reason and code.startswith(
+            ("688", "689")
+        ):
+            reason = star_market_exclusion_reason
+        if reason:
+            permission_prefilter_excluded.append(
+                {
+                    "code": code,
+                    "name": str(row.get("name") or code),
+                    "reason_code": reason,
+                }
+            )
+            continue
+        filtered_rows.append(dict(row))
+    context = {
+        **context,
+        "rows": filtered_rows,
+        "permission_prefilter_excluded": permission_prefilter_excluded,
+    }
     try:
         public_result = rank_public_candidate_universe(
             context["rows"],

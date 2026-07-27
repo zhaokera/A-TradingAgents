@@ -142,6 +142,79 @@ async def test_live_quote_requires_tencent_same_trade_date_and_at_most_90_second
 
 
 @pytest.mark.asyncio
+async def test_live_candidate_quote_requires_recent_observed_market_event():
+    policy = MarketSessionPolicyService(calendar=StubCalendar(authoritative_calendar()))
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=SHANGHAI)
+
+    missing_confirmation = await policy.quote_status(
+        {
+            "source": "tencent",
+            "trade_at": "2026-07-22T10:00:00+08:00",
+            "event_confirmation_required": True,
+            "event_observed_at": None,
+        },
+        now=now,
+    )
+    recent_confirmation = await policy.quote_status(
+        {
+            "source": "tencent",
+            "trade_at": "2026-07-22T10:00:00+08:00",
+            "event_confirmation_required": True,
+            "event_observed_at": "2026-07-22T09:59:30+08:00",
+        },
+        now=now,
+    )
+    stale_confirmation = await policy.quote_status(
+        {
+            "source": "tencent",
+            "trade_at": "2026-07-22T10:00:00+08:00",
+            "event_confirmation_required": True,
+            "event_observed_at": "2026-07-22T09:58:29+08:00",
+        },
+        now=now,
+    )
+
+    assert missing_confirmation["actionable"] is False
+    assert missing_confirmation["status"] == "missing_event_confirmation"
+    assert recent_confirmation["actionable"] is True
+    assert recent_confirmation["status"] == "fresh"
+    assert recent_confirmation["event_age_seconds"] == 30
+    assert stale_confirmation["actionable"] is False
+    assert stale_confirmation["status"] == "stale_event_confirmation"
+
+
+@pytest.mark.asyncio
+async def test_event_confirmation_allows_only_small_same_request_clock_skew():
+    policy = MarketSessionPolicyService(calendar=StubCalendar(authoritative_calendar()))
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=SHANGHAI)
+
+    same_request = await policy.quote_status(
+        {
+            "source": "tencent",
+            "trade_at": "2026-07-22T10:00:00+08:00",
+            "event_confirmation_required": True,
+            "event_observed_at": "2026-07-22T10:00:05+08:00",
+        },
+        now=now,
+    )
+    future_event = await policy.quote_status(
+        {
+            "source": "tencent",
+            "trade_at": "2026-07-22T10:00:00+08:00",
+            "event_confirmation_required": True,
+            "event_observed_at": "2026-07-22T10:00:06+08:00",
+        },
+        now=now,
+    )
+
+    assert same_request["actionable"] is True
+    assert same_request["status"] == "fresh"
+    assert same_request["event_age_seconds"] == 0
+    assert future_event["actionable"] is False
+    assert future_event["status"] == "future_event_confirmation"
+
+
+@pytest.mark.asyncio
 async def test_quote_status_preserves_session_subsecond_precision_for_freshness():
     policy = MarketSessionPolicyService(calendar=StubCalendar(authoritative_calendar()))
     session = await policy.classify(

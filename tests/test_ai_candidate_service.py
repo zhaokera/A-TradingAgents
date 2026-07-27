@@ -15,6 +15,7 @@ from app.services.ai_candidate_service import (
     normalize_ai_candidate_run,
 )
 from app.services.favorites_service import FavoritesService
+from app.services.holdings_cli import CLIError
 
 
 def _offline_research_dependencies():
@@ -133,6 +134,10 @@ def test_normalize_ai_candidate_run_keeps_reference_only_price_evidence():
     first = result["candidates"][0]
     second = result["candidates"][1]
     assert first["research_status"] == "condition_order"
+    assert first["research_condition_ready"] is True
+    assert first["condition_order_ready"] is False
+    assert first["execution_actionable"] is False
+    assert first["execution_status"] == "research_only"
     assert first["is_reference_only"] is True
     assert first["price_plan"]["observation_zone"] == [10.8, 11.1]
     assert first["price_plan"]["entry_price"] == 11.0
@@ -375,11 +380,25 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
                 "_id": run_id,
                 "user_id": "admin-id",
                 "generated_at": datetime(2026, 7, 20, tzinfo=timezone.utc),
+                "market": {
+                    "session": "closed",
+                    "is_trading_hours": False,
+                    "local_time": "2026-07-20T14:00:00+08:00",
+                },
                 "candidates": [
                     {
                         "code": "600000",
                         "name": "候选",
                         "reference_price": 10.6,
+                        "quote": {
+                            "price": 10.6,
+                            "source": "tencent",
+                            "trade_at": "2026-07-21T09:59:00+08:00",
+                            "volume": 1000,
+                            "amount": 10600.0,
+                            "event_confirmation_required": True,
+                            "event_observed_at": None,
+                        },
                         "price_plan": {
                             "entry_strategy": "pullback",
                             "entry_price": 10.0,
@@ -410,6 +429,8 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
                     "pct_chg": -1.0,
                     "source": "tencent",
                     "trade_at": "2026-07-21T10:00:00+08:00",
+                    "volume": 1200,
+                    "amount": 11880.0,
                 }
             }
         )
@@ -432,6 +453,27 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
     assert candidate["price_plan"]["entry_status"] == "price_ready"
     assert candidate["actionability"] == "ready_now"
     assert candidate["quote_source"] == "tencent"
+    assert candidate["quote"] == {
+        "price": 9.9,
+        "source": "tencent",
+        "trade_at": "2026-07-21T10:00:00+08:00",
+        "quote_checked_at": candidate["quote_checked_at"],
+        "volume": 1200.0,
+        "amount": 11880.0,
+        "event_confirmation_required": True,
+        "event_change_detected": True,
+        "event_observed_at": candidate["quote_checked_at"],
+    }
+    assert candidate["condition_order_ready"] is False
+    assert candidate["execution_actionable"] is False
+    assert result["market"]["execution_usable"] is False
+    assert result["market"]["execution_status"] == (
+        "research_snapshot_not_execution_decision"
+    )
+    assert result["market"]["reason_code"] == "daily_decision_required"
+    assert result["market"]["discovery_snapshot"]["local_time"] == (
+        "2026-07-20T14:00:00+08:00"
+    )
     assert candidate["performance"]["observation_count"] == 1
     collection.update_one.assert_awaited_once()
 
@@ -575,6 +617,50 @@ async def test_add_to_favorites_rejects_invalidated_candidate():
 
 
 @pytest.mark.asyncio
+async def test_add_to_favorites_rejects_governance_excluded_candidate():
+    run_id = ObjectId()
+    collection = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "_id": run_id,
+                "user_id": "admin-id",
+                "candidates": [
+                    {
+                        "code": "688208",
+                        "name": "无权限科创板",
+                        "actionability": "ready_now",
+                        "can_add_to_favorites": True,
+                    }
+                ],
+            }
+        )
+    )
+    db = MagicMock()
+    db.__getitem__.return_value = collection
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(
+            get_favorite_codes=AsyncMock(return_value=set())
+        ),
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+    service._candidate_governance = AsyncMock(
+        return_value={
+            "excluded_codes": ["600406"],
+            "star_market": {
+                "verified": True,
+                "tradable": False,
+                "eligible": False,
+            },
+        }
+    )
+
+    with pytest.raises(InvalidAICandidateSelectionError):
+        await service.add_to_favorites("admin-id", str(run_id), ["688208"])
+
+
+@pytest.mark.asyncio
 async def test_start_run_returns_background_job_without_waiting(monkeypatch):
     collection = SimpleNamespace(
         find_one=AsyncMock(return_value=None),
@@ -607,6 +693,51 @@ async def test_start_run_returns_background_job_without_waiting(monkeypatch):
     assert result["status"] == "queued"
     assert result["job_id"]
     collection.insert_one.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_background_job_keeps_discovery_stage_from_error_details():
+    job_id = ObjectId()
+    jobs = SimpleNamespace(update_one=AsyncMock())
+    db = MagicMock()
+    db.__getitem__.return_value = jobs
+
+    def fail_research():
+        raise CLIError(
+            "公开全市场候选发现不可用",
+            code="candidate_discovery_unavailable",
+            exit_code=4,
+            details={"stage": "candidate_discovery"},
+        )
+
+    service = AICandidateService(
+        research_runner=fail_research,
+        favorites=SimpleNamespace(
+            get_favorite_codes=AsyncMock(return_value=set())
+        ),
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+    service._candidate_governance = AsyncMock(
+        return_value={
+            "excluded_codes": [],
+            "star_market": {"verified": True, "tradable": True},
+        }
+    )
+
+    await service._execute_job(
+        job_id=job_id,
+        user_id="admin-id",
+        max_candidates=5,
+    )
+
+    failed_update = jobs.update_one.await_args_list[-1].args[1]["$set"]
+    assert failed_update["status"] == "failed"
+    assert failed_update["error"] == {
+        "code": "candidate_discovery_unavailable",
+        "message": "公开全市场候选发现不可用",
+        "stage": "candidate_discovery",
+    }
 
 
 @pytest.mark.asyncio
@@ -816,3 +947,328 @@ def test_performance_counts_each_tencent_trade_timestamp_once():
     )
 
     assert candidate["performance"]["observation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_research_entry_receives_user_and_star_market_prefilters():
+    captured = {}
+
+    def runner(*, excluded_code_reasons, star_market_exclusion_reason):
+        captured["excluded_code_reasons"] = excluded_code_reasons
+        captured["star_market_exclusion_reason"] = star_market_exclusion_reason
+        return _research_payload()
+
+    service = AICandidateService(
+        research_runner=runner,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+    )
+
+    payload = await service._run_research(
+        {
+            "excluded_codes": ["600406"],
+            "star_market": {
+                "verified": True,
+                "tradable": False,
+                "eligible": False,
+            },
+        }
+    )
+
+    assert payload["ok"] is True
+    assert captured == {
+        "excluded_code_reasons": {"600406": "user_excluded"},
+        "star_market_exclusion_reason": "star_market_permission_denied",
+    }
+
+
+def test_governance_stops_old_star_and_user_excluded_shadow_plans():
+    document = {
+        "candidates": [
+            {"code": "688208", "performance": {"shadow_trade": {"status": "active"}}},
+            {"code": "600406", "performance": {"shadow_trade": {"status": "active"}}},
+            {"code": "000977", "performance": {"shadow_trade": {"status": "active"}}},
+        ]
+    }
+
+    AICandidateService._apply_candidate_governance(
+        document,
+        {
+            "excluded_codes": ["600406"],
+            "star_market": {
+                "verified": True,
+                "tradable": False,
+                "eligible": False,
+            },
+        },
+    )
+
+    assert [item["code"] for item in document["candidates"]] == ["000977"]
+    excluded = {
+        item["code"]: item for item in document["governance_excluded_candidates"]
+    }
+    assert excluded["688208"]["governance_reason"] == (
+        "star_market_permission_denied"
+    )
+    assert excluded["600406"]["governance_reason"] == "user_excluded"
+    assert all(
+        item["execution_status"] == "governance_excluded"
+        for item in excluded.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_performance_is_diagnostic_deduplicated_and_governed():
+    plan = {
+        "entry_strategy": "pullback",
+        "entry_price": 10.0,
+        "stop_price": 9.0,
+        "target_price": 12.0,
+    }
+    tracked = {
+        "price_plan": plan,
+        "performance": {
+            "shadow_trade": {
+                "status": "closed_stop",
+                "entry_price": 10.0,
+                "quantity": 100,
+                "net_return_pct": -10.5,
+                "net_pnl": -105.0,
+            }
+        },
+    }
+    documents = [
+        {
+            "_id": ObjectId(),
+            "generated_at": datetime(2026, 7, 27, tzinfo=timezone.utc),
+            "plan_expires_at": "2026-07-30T15:00:00+08:00",
+            "candidates": [
+                {**tracked, "code": "002558", "name": "巨人网络"},
+                {**tracked, "code": "688208", "name": "道通科技"},
+                {**tracked, "code": "600406", "name": "国电南瑞"},
+            ],
+        },
+        {
+            "_id": ObjectId(),
+            "generated_at": datetime(2026, 7, 26, tzinfo=timezone.utc),
+            "plan_expires_at": "2026-07-30T15:00:00+08:00",
+            "candidates": [
+                {**tracked, "code": "002558", "name": "巨人网络"},
+            ],
+        },
+    ]
+
+    class Cursor:
+        def sort(self, *_args):
+            return self
+
+        def limit(self, *_args):
+            return self
+
+        async def to_list(self, *, length):
+            assert length == 30
+            return documents
+
+    settings = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "excluded_codes": ["600406"],
+                "execution_capabilities": {
+                    "market_permissions": {
+                        "star_market": {"verified": True, "tradable": False}
+                    }
+                },
+            }
+        )
+    )
+    runs = SimpleNamespace(find=MagicMock(return_value=Cursor()))
+    db = {
+        "user_holding_settings": settings,
+        "ai_candidate_runs": runs,
+    }
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+
+    result = await service.performance_summary("admin-id")
+
+    assert result["statistics_scope"] == "candidate_shadow_diagnostics"
+    assert result["diagnostic_sample_count"] == 1
+    assert result["governed_decision_sample_count"] == 0
+    assert result["learning_eligible_count"] == 0
+    assert result["duplicate_plan_count"] == 1
+    assert result["governance_excluded_by_reason"] == {
+        "star_market_permission_denied": 1,
+        "user_excluded": 1,
+    }
+    assert [item["code"] for item in result["items"]] == ["002558"]
+    assert result["items"][0]["counts_as_governed_decision_sample"] is False
+    assert result["items"][0]["represents_real_account_position"] is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_quote_refresh_never_polls_governance_excluded_codes():
+    requested = []
+
+    async def get_quotes(codes):
+        requested.extend(codes)
+        return {
+            "000977": {
+                "price": 63.0,
+                "source": "tencent",
+                "trade_at": "2026-07-27T14:55:00+08:00",
+                "volume": 1000,
+                "amount": 63_000,
+            }
+        }
+
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(
+            get_favorite_codes=AsyncMock(return_value=set())
+        ),
+        quotes=SimpleNamespace(get_quotes=get_quotes),
+    )
+    service._candidate_governance = AsyncMock(
+        return_value={
+            "excluded_codes": ["600406"],
+            "star_market": {
+                "verified": True,
+                "tradable": False,
+                "eligible": False,
+            },
+        }
+    )
+    service._apply_objective_profiles = AsyncMock()
+    service._apply_macro_policy = AsyncMock()
+    service._apply_account_policy = AsyncMock()
+    document = {
+        "_id": ObjectId(),
+        "user_id": "admin-id",
+        "generated_at": datetime(2026, 7, 27, tzinfo=timezone.utc),
+        "candidates": [
+            {"code": "688208", "price_plan": {}},
+            {"code": "600406", "price_plan": {}},
+            {
+                "code": "000977",
+                "price_plan": {},
+                "quote": {
+                    "price": 63.0,
+                    "source": "tencent",
+                    "trade_at": "2026-07-27T14:54:00+08:00",
+                    "volume": 1000,
+                    "amount": 63_000,
+                    "event_observed_at": None,
+                },
+            },
+        ],
+    }
+
+    refreshed = await service._refresh_document(
+        document,
+        user_id="admin-id",
+        persist=False,
+        notify=False,
+    )
+
+    assert requested == ["000977", "sh000300"]
+    assert [item["code"] for item in refreshed["candidates"]] == ["000977"]
+    assert {
+        item["code"] for item in refreshed["governance_excluded_candidates"]
+    } == {"688208", "600406"}
+    active = refreshed["candidates"][0]
+    assert active["quote"]["event_change_detected"] is False
+    assert active["quote"]["event_observed_at"] is None
+    assert "performance" not in active
+
+
+@pytest.mark.asyncio
+async def test_scheduler_entry_never_polls_governance_excluded_codes():
+    requested = []
+
+    async def get_quotes(codes):
+        requested.extend(codes)
+        return {
+            "000977": {
+                "price": 63.1,
+                "source": "tencent",
+                "trade_at": "2026-07-27T14:56:00+08:00",
+                "volume": 1100,
+                "amount": 69_410,
+            }
+        }
+
+    document = {
+        "_id": ObjectId(),
+        "user_id": "admin-id",
+        "generated_at": datetime(2026, 7, 27, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 7, 30, tzinfo=timezone.utc),
+        "candidates": [
+            {"code": "688208", "price_plan": {}},
+            {"code": "600406", "price_plan": {}},
+            {
+                "code": "000977",
+                "price_plan": {},
+                "quote": {
+                    "price": 63.0,
+                    "source": "tencent",
+                    "trade_at": "2026-07-27T14:55:00+08:00",
+                    "volume": 1000,
+                    "amount": 63_000,
+                },
+            },
+        ],
+    }
+
+    class Cursor:
+        def sort(self, *_args):
+            return self
+
+        async def to_list(self, *, length):
+            assert length == 500
+            return [document]
+
+    runs = SimpleNamespace(
+        find=MagicMock(return_value=Cursor()),
+        update_one=AsyncMock(),
+    )
+    db = {"ai_candidate_runs": runs}
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(
+            get_favorite_codes=AsyncMock(return_value=set())
+        ),
+        quotes=SimpleNamespace(get_quotes=get_quotes),
+    )
+    service.db = db
+    service._candidate_governance = AsyncMock(
+        return_value={
+            "excluded_codes": ["600406"],
+            "star_market": {
+                "verified": True,
+                "tradable": False,
+                "eligible": False,
+            },
+        }
+    )
+    service._apply_objective_profiles = AsyncMock()
+    service._apply_macro_policy = AsyncMock()
+    service._apply_account_policy = AsyncMock()
+    service._publish_transition = AsyncMock()
+
+    result = await service.refresh_all_active_runs()
+
+    assert result == {
+        "refreshed_user_count": 1,
+        "refreshed_historical_run_count": 0,
+        "failed_user_count": 0,
+    }
+    assert requested == ["000977", "sh000300"]
+    persisted = runs.update_one.await_args.args[1]["$set"]
+    assert [item["code"] for item in persisted["candidates"]] == ["000977"]
+    assert {
+        item["code"] for item in persisted["governance_excluded_candidates"]
+    } == {"688208", "600406"}

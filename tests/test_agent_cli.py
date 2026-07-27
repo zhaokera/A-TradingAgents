@@ -104,10 +104,20 @@ def test_holdings_opportunities_is_candidate_api_alias(fake_client: FakeClient) 
 
 
 def test_candidates_performance_calls_backend(fake_client: FakeClient) -> None:
+    fake_client.responses["/api/screening/ai-candidates/performance"] = {
+        "statistics_scope": "candidate_shadow_diagnostics",
+        "governed_decision_sample_count": 0,
+        "learning_eligible_count": 0,
+        "items": [],
+    }
     result = runner.invoke(agent_cli.app, ["candidates", "performance"])
 
     assert result.exit_code == 0
     assert fake_client.calls[0]["path"] == "/api/screening/ai-candidates/performance"
+    data = json.loads(result.stdout)["data"]
+    assert data["statistics_scope"] == "candidate_shadow_diagnostics"
+    assert data["governed_decision_sample_count"] == 0
+    assert data["learning_eligible_count"] == 0
 
 
 def test_briefing_today_calls_unified_backend_contract(fake_client: FakeClient) -> None:
