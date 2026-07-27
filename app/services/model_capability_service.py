@@ -5,6 +5,7 @@
 """
 
 from typing import Tuple, Dict, Optional, List, Any
+from types import SimpleNamespace
 from app.constants.model_capabilities import (
     ANALYSIS_DEPTH_REQUIREMENTS,
     DEFAULT_MODEL_CAPABILITIES,
@@ -19,8 +20,55 @@ import re
 logger = logging.getLogger(__name__)
 
 
+class ModelRecommendationError(RuntimeError):
+    """Raised when no enabled model satisfies the analysis requirements."""
+
+
 class ModelCapabilityService:
     """模型能力管理服务"""
+
+    @staticmethod
+    def _enum_values(values: Any) -> set[str]:
+        if values is None:
+            return set()
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        return {str(getattr(value, "value", value)) for value in values}
+
+    def _get_enabled_model_configs(self) -> List[Any]:
+        """Load enabled models from the active database configuration."""
+        from pymongo import MongoClient
+        from app.core.config import settings
+
+        client = MongoClient(settings.MONGO_URI)
+        try:
+            db = client[settings.MONGO_DB]
+            doc = db.system_configs.find_one(
+                {"is_active": True},
+                sort=[("version", -1)],
+            )
+            if not doc:
+                raise ModelRecommendationError(
+                    "数据库中没有活跃的模型配置，已停止分析"
+                )
+
+            enabled_models = []
+            for config in doc.get("llm_configs", []):
+                if not config.get("enabled", False):
+                    continue
+                enabled_models.append(
+                    SimpleNamespace(
+                        model_name=config.get("model_name", ""),
+                        enabled=True,
+                        capability_level=config.get("capability_level", 2),
+                        suitable_roles=config.get("suitable_roles", ["both"]),
+                        features=config.get("features", []),
+                        performance_metrics=config.get("performance_metrics"),
+                    )
+                )
+            return enabled_models
+        finally:
+            client.close()
 
     def _parse_aggregator_model_name(self, model_name: str) -> Tuple[Optional[str], str]:
         """
@@ -177,6 +225,8 @@ class ModelCapabilityService:
 
                         return {
                             "model_name": config_dict.get("model_name"),
+                            "enabled": bool(config_dict.get("enabled", False)),
+                            "_configured": True,
                             "capability_level": config_dict.get('capability_level', 2),
                             "suitable_roles": roles_enum,
                             "features": features_enum,
@@ -192,7 +242,9 @@ class ModelCapabilityService:
 
         # 2. 从默认映射表读取（直接匹配）
         if model_name in DEFAULT_MODEL_CAPABILITIES:
-            return DEFAULT_MODEL_CAPABILITIES[model_name]
+            config = DEFAULT_MODEL_CAPABILITIES[model_name].copy()
+            config.update({"enabled": False, "_configured": False})
+            return config
 
         # 3. 尝试聚合渠道模型映射
         provider, original_model = self._parse_aggregator_model_name(model_name)
@@ -202,12 +254,16 @@ class ModelCapabilityService:
                 config = DEFAULT_MODEL_CAPABILITIES[original_model].copy()
                 config["model_name"] = model_name  # 保持原始模型名
                 config["_mapped_from"] = original_model  # 记录映射来源
+                config["enabled"] = False
+                config["_configured"] = False
                 return config
 
         # 4. 返回默认配置
         logger.warning(f"未找到模型 {model_name} 的配置，使用默认配置")
         return {
             "model_name": model_name,
+            "enabled": False,
+            "_configured": False,
             "capability_level": 2,
             "suitable_roles": [ModelRole.BOTH],
             "features": [ModelFeature.TOOL_CALLING],
@@ -248,6 +304,17 @@ class ModelCapabilityService:
             "warnings": [],
             "recommendations": []
         }
+
+        if not quick_config.get("enabled", False):
+            result["valid"] = False
+            result["warnings"].append(
+                f"❌ 快速模型 {quick_model} 未在当前系统配置中启用"
+            )
+        if not deep_config.get("enabled", False):
+            result["valid"] = False
+            result["warnings"].append(
+                f"❌ 深度模型 {deep_model} 未在当前系统配置中启用"
+            )
         
         # 检查快速模型
         quick_level = quick_config["capability_level"]
@@ -327,36 +394,43 @@ class ModelCapabilityService:
         
         # 获取所有启用的模型
         try:
-            llm_configs = unified_config.get_llm_configs()
-            enabled_models = [c for c in llm_configs if c.enabled]
+            enabled_models = [
+                model
+                for model in self._get_enabled_model_configs()
+                if getattr(model, "enabled", False)
+            ]
         except Exception as e:
             logger.error(f"获取模型配置失败: {e}")
-            # 使用默认模型
-            return self._get_default_models()
+            raise ModelRecommendationError(
+                "无法读取已启用模型配置，已停止分析"
+            ) from e
         
         if not enabled_models:
-            logger.warning("没有启用的模型，使用默认配置")
-            return self._get_default_models()
+            raise ModelRecommendationError("当前没有已启用模型，已停止分析")
         
         # 筛选适合快速分析的模型
         quick_candidates = []
         for m in enabled_models:
-            roles = getattr(m, 'suitable_roles', [ModelRole.BOTH])
+            roles = self._enum_values(
+                getattr(m, 'suitable_roles', [ModelRole.BOTH])
+            )
             level = getattr(m, 'capability_level', 2)
-            features = getattr(m, 'features', [])
+            features = self._enum_values(getattr(m, 'features', []))
             
-            if (ModelRole.QUICK_ANALYSIS in roles or ModelRole.BOTH in roles) and \
+            if (ModelRole.QUICK_ANALYSIS.value in roles or ModelRole.BOTH.value in roles) and \
                level >= requirements["quick_model_min"] and \
-               ModelFeature.TOOL_CALLING in features:
+               ModelFeature.TOOL_CALLING.value in features:
                 quick_candidates.append(m)
         
         # 筛选适合深度分析的模型
         deep_candidates = []
         for m in enabled_models:
-            roles = getattr(m, 'suitable_roles', [ModelRole.BOTH])
+            roles = self._enum_values(
+                getattr(m, 'suitable_roles', [ModelRole.BOTH])
+            )
             level = getattr(m, 'capability_level', 2)
             
-            if (ModelRole.DEEP_ANALYSIS in roles or ModelRole.BOTH in roles) and \
+            if (ModelRole.DEEP_ANALYSIS.value in roles or ModelRole.BOTH.value in roles) and \
                level >= requirements["deep_model_min"]:
                 deep_candidates.append(m)
         
@@ -381,9 +455,13 @@ class ModelCapabilityService:
         quick_model = quick_candidates[0].model_name if quick_candidates else None
         deep_model = deep_candidates[0].model_name if deep_candidates else None
         
-        # 如果没找到合适的，使用系统默认
+        # 不得回退到未启用或未配置的硬编码模型。
         if not quick_model or not deep_model:
-            return self._get_default_models()
+            enabled_names = ", ".join(m.model_name for m in enabled_models)
+            raise ModelRecommendationError(
+                f"已启用模型不满足 {research_depth} 分析要求"
+                f"（enabled={enabled_names or 'none'}）"
+            )
         
         logger.info(
             f"🤖 为 {research_depth} 分析推荐模型: "
@@ -394,15 +472,17 @@ class ModelCapabilityService:
         return quick_model, deep_model
     
     def _get_default_models(self) -> Tuple[str, str]:
-        """获取默认模型对"""
-        try:
-            quick_model = unified_config.get_quick_analysis_model()
-            deep_model = unified_config.get_deep_analysis_model()
-            logger.info(f"使用系统默认模型: quick={quick_model}, deep={deep_model}")
-            return quick_model, deep_model
-        except Exception as e:
-            logger.error(f"获取默认模型失败: {e}")
-            return "qwen-turbo", "qwen-plus"
+        """Return configured defaults only when both defaults are enabled."""
+        enabled = {
+            config.model_name for config in self._get_enabled_model_configs()
+        }
+        quick_model = unified_config.get_quick_analysis_model()
+        deep_model = unified_config.get_deep_analysis_model()
+        if quick_model not in enabled or deep_model not in enabled:
+            raise ModelRecommendationError(
+                "系统默认模型未全部启用，拒绝回退到未配置模型"
+            )
+        return quick_model, deep_model
     
     def _recommend_model(self, model_type: str, min_level: int) -> str:
         """推荐满足要求的模型"""
@@ -428,4 +508,3 @@ def get_model_capability_service() -> ModelCapabilityService:
     if _model_capability_service is None:
         _model_capability_service = ModelCapabilityService()
     return _model_capability_service
-

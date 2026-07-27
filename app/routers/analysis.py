@@ -1100,13 +1100,9 @@ async def websocket_task_progress(websocket: WebSocket, task_id: str):
 async def get_task_details(
     task_id: str,
     user: dict = Depends(get_current_user),
-    svc: QueueService = Depends(get_queue_service)
 ):
-    """获取任务详情（使用不同的路径避免冲突）"""
-    t = await svc.get_task(task_id)
-    if not t or t.get("user") != user["id"]:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return t
+    """获取与 status 命令同源的任务详情。"""
+    return await get_task_status_new(task_id=task_id, user=user)
 
 
 # ==================== 僵尸任务管理 ====================

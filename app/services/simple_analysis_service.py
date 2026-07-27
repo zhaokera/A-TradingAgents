@@ -52,6 +52,129 @@ logger = logging.getLogger("app.services.simple_analysis_service")
 config_service = ConfigService()
 
 
+class ModelConnectivityError(RuntimeError):
+    """Raised when no configured credential can reach the selected model."""
+
+
+def _valid_api_key(value: Optional[str]) -> bool:
+    return bool(value and value.strip() and value != "your-api-key")
+
+
+def _credential_candidates(
+    model_api_key: Optional[str],
+    provider_api_key: Optional[str],
+    environment_api_key: Optional[str],
+) -> List[tuple[str, str]]:
+    """Build an ordered, de-duplicated credential list without logging secrets."""
+    candidates: List[tuple[str, str]] = []
+    seen: set[str] = set()
+    for source, value in (
+        ("model_config", model_api_key),
+        ("provider_config", provider_api_key),
+        ("environment", environment_api_key),
+    ):
+        if not _valid_api_key(value) or value in seen:
+            continue
+        seen.add(value)
+        candidates.append((source, value))
+    return candidates
+
+
+def _select_verified_model_credential(
+    *,
+    model_name: str,
+    provider: str,
+    backend_url: str,
+    candidates: List[tuple[str, str]],
+    request_post=None,
+) -> tuple[str, str, List[Dict[str, Any]]]:
+    """Select the first credential that can call an OpenAI-compatible model."""
+    if not candidates:
+        raise ModelConnectivityError(
+            f"模型 {model_name} 没有可用凭据，请配置模型、供应商或环境变量 API Key"
+        )
+
+    from tradingagents.llm_clients.provider_keys import normalize_provider_key
+
+    provider_key = normalize_provider_key(provider)
+    if provider_key != "qwen":
+        source, api_key = candidates[0]
+        return api_key, source, [{"source": source, "status": "not_probed"}]
+
+    if request_post is None:
+        import requests
+
+        request_post = requests.post
+
+    endpoint = f"{backend_url.rstrip('/')}/chat/completions"
+    diagnostics: List[Dict[str, Any]] = []
+    for source, api_key in candidates:
+        try:
+            response = request_post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "temperature": 0,
+                },
+                timeout=15,
+            )
+            error_code = None
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    error = body.get("error")
+                    if isinstance(error, dict):
+                        error_code = error.get("code") or error.get("type")
+                    error_code = error_code or body.get("code")
+            except Exception:
+                pass
+
+            diagnostic = {"source": source, "http_status": response.status_code}
+            if error_code:
+                diagnostic["error_code"] = str(error_code)
+            diagnostics.append(diagnostic)
+            if 200 <= response.status_code < 300:
+                return api_key, source, diagnostics
+        except Exception as exc:
+            diagnostics.append(
+                {"source": source, "error_type": type(exc).__name__}
+            )
+
+    summary = ", ".join(
+        f"{item['source']}:{item.get('http_status', item.get('error_type', 'failed'))}"
+        for item in diagnostics
+    )
+    raise ModelConnectivityError(
+        f"模型 {model_name} 连通性验证失败（{summary}）；未使用无效凭据继续分析"
+    )
+
+
+def _propagate_trading_graph(
+    trading_graph,
+    request: SingleAnalysisRequest,
+    analysis_date: str,
+    *,
+    progress_callback,
+    task_id: str,
+):
+    """Invoke the graph with the canonical symbol from either request field."""
+    stock_code = request.get_symbol()
+    if not stock_code:
+        raise ValueError("股票代码不能为空")
+    return trading_graph.propagate(
+        stock_code,
+        analysis_date,
+        progress_callback=progress_callback,
+        task_id=task_id,
+    )
+
+
 async def get_provider_by_model_name(model_name: str) -> str:
     """
     根据模型名称从数据库配置中查找对应的供应商（异步版本）
@@ -99,7 +222,11 @@ def get_provider_by_model_name_sync(model_name: str) -> str:
     return provider_info["provider"]
 
 
-def get_provider_and_url_by_model_sync(model_name: str) -> dict:
+def get_provider_and_url_by_model_sync(
+    model_name: str,
+    *,
+    verify_connectivity: bool = False,
+) -> dict:
     """
     根据模型名称从数据库配置中查找对应的供应商和 API URL（同步版本）
 
@@ -129,30 +256,28 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
                 if config_dict.get("model_name") == model_name:
                     provider = config_dict.get("provider")
                     api_base = config_dict.get("api_base")
-                    model_api_key = config_dict.get("api_key")  # 🔥 获取模型配置的 API Key
+                    if verify_connectivity and not config_dict.get("enabled", False):
+                        client.close()
+                        raise ModelConnectivityError(
+                            f"模型 {model_name} 未启用，不能用于分析"
+                        )
+                    model_api_key = config_dict.get("api_key")
 
                     # 从 llm_providers 集合中查找厂家配置
                     providers_collection = db.llm_providers
                     provider_doc = providers_collection.find_one({"name": provider})
 
-                    # 🔥 确定 API Key（优先级：模型配置 > 厂家配置 > 环境变量）
-                    api_key = None
-                    if model_api_key and model_api_key.strip() and model_api_key != "your-api-key":
-                        api_key = model_api_key
-                        logger.info(f"✅ [同步查询] 使用模型配置的 API Key")
-                    elif provider_doc and provider_doc.get("api_key"):
-                        provider_api_key = provider_doc["api_key"]
-                        if provider_api_key and provider_api_key.strip() and provider_api_key != "your-api-key":
-                            api_key = provider_api_key
-                            logger.info(f"✅ [同步查询] 使用厂家配置的 API Key")
-
-                    # 如果数据库中没有有效的 API Key，尝试从环境变量获取
-                    if not api_key:
-                        api_key = _get_env_api_key_for_provider(provider)
-                        if api_key:
-                            logger.info(f"✅ [同步查询] 使用环境变量的 API Key")
-                        else:
-                            logger.warning(f"⚠️ [同步查询] 未找到 {provider} 的 API Key")
+                    provider_api_key = (
+                        provider_doc.get("api_key") if provider_doc else None
+                    )
+                    candidates = _credential_candidates(
+                        model_api_key,
+                        provider_api_key,
+                        _get_env_api_key_for_provider(provider),
+                    )
+                    api_key = candidates[0][1] if candidates else None
+                    credential_source = candidates[0][0] if candidates else None
+                    credential_diagnostics: List[Dict[str, Any]] = []
 
                     # 确定 backend_url
                     backend_url = None
@@ -172,14 +297,41 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
                     if provider_key == "qwen" and backend_url == "https://dashscope.aliyuncs.com/api/v1":
                         backend_url = default_backend_url(provider_key)
 
+                    if verify_connectivity:
+                        try:
+                            api_key, credential_source, credential_diagnostics = (
+                                _select_verified_model_credential(
+                                    model_name=model_name,
+                                    provider=provider_key,
+                                    backend_url=backend_url,
+                                    candidates=candidates,
+                                )
+                            )
+                        except Exception:
+                            client.close()
+                            raise
+                    if credential_source:
+                        logger.info(
+                            "✅ [同步查询] 模型 %s 使用凭据来源: %s",
+                            model_name,
+                            credential_source,
+                        )
+
                     client.close()
                     return {
                         "provider": provider_key,
                         "backend_url": backend_url,
-                        "api_key": api_key
+                        "api_key": api_key,
+                        "credential_source": credential_source,
+                        "credential_diagnostics": credential_diagnostics,
                     }
 
         client.close()
+
+        if verify_connectivity:
+            raise ModelConnectivityError(
+                f"模型 {model_name} 不在当前系统配置中，不能用于分析"
+            )
 
         # 如果数据库中没有找到模型配置，使用默认映射
         logger.warning(f"⚠️ [同步查询] 数据库中未找到模型 {model_name}，使用默认映射")
@@ -237,6 +389,8 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
             "api_key": _get_env_api_key_for_provider(provider_key)
         }
 
+    except ModelConnectivityError:
+        raise
     except Exception as e:
         logger.error(f"❌ [同步查询] 查找模型供应商失败: {e}")
         provider = _get_default_provider_by_model(model_name)
@@ -1016,9 +1170,9 @@ class SimpleAnalysisService:
                     payload=NotificationCreate(
                         user_id=str(user_id),
                         type='analysis',
-                        title=f"{request.stock_code} 分析完成",
+                        title=f"{stock_code} 分析完成",
                         content=summary,
-                        link=f"/stocks/{request.stock_code}",
+                        link=f"/stocks/{stock_code}",
                         source='analysis'
                     )
                 )
@@ -1083,10 +1237,13 @@ class SimpleAnalysisService:
         progress_tracker: Optional[RedisProgressTracker] = None
     ) -> Dict[str, Any]:
         """同步执行分析（在共享线程池中运行）"""
+        stock_code = request.get_symbol()
+        if not stock_code:
+            raise ValueError("股票代码不能为空")
         # 🔧 使用共享线程池，支持多个任务并发执行
         # 不再每次创建新的线程池，避免串行执行
         loop = asyncio.get_event_loop()
-        logger.info(f"🚀 [线程池] 提交分析任务到共享线程池: {task_id} - {request.stock_code}")
+        logger.info(f"🚀 [线程池] 提交分析任务到共享线程池: {task_id} - {stock_code}")
         result = await loop.run_in_executor(
             self._thread_pool,  # 使用共享线程池
             self._run_analysis_sync,
@@ -1106,14 +1263,17 @@ class SimpleAnalysisService:
         progress_tracker: Optional[RedisProgressTracker] = None
     ) -> Dict[str, Any]:
         """同步执行分析的具体实现"""
+        stock_code = request.get_symbol()
+        if not stock_code:
+            raise ValueError("股票代码不能为空")
         try:
             # 在线程中重新初始化日志系统
             from tradingagents.utils.logging_init import init_logging, get_logger
             init_logging()
             thread_logger = get_logger('analysis_thread')
 
-            thread_logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {request.stock_code}")
-            logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {request.stock_code}")
+            thread_logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {stock_code}")
+            logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {stock_code}")
 
             # 🔧 根据 RedisProgressTracker 的步骤权重计算准确的进度
             # 基础准备阶段 (10%): 0.03 + 0.02 + 0.01 + 0.02 + 0.02 = 0.10
@@ -1224,8 +1384,18 @@ class SimpleAnalysisService:
                 logger.info(f"🤖 自动推荐模型: quick={quick_model}, deep={deep_model}")
 
             # 🔧 根据快速模型和深度模型分别查找对应的供应商和 API URL
-            quick_provider_info = get_provider_and_url_by_model_sync(quick_model)
-            deep_provider_info = get_provider_and_url_by_model_sync(deep_model)
+            quick_provider_info = get_provider_and_url_by_model_sync(
+                quick_model,
+                verify_connectivity=True,
+            )
+            deep_provider_info = (
+                quick_provider_info
+                if deep_model == quick_model
+                else get_provider_and_url_by_model_sync(
+                    deep_model,
+                    verify_connectivity=True,
+                )
+            )
 
             quick_provider = quick_provider_info["provider"]
             deep_provider = deep_provider_info["provider"]
@@ -1263,6 +1433,19 @@ class SimpleAnalysisService:
             config["quick_backend_url"] = quick_backend_url
             config["deep_backend_url"] = deep_backend_url
             config["backend_url"] = quick_backend_url  # 保持向后兼容
+            config["quick_api_key"] = quick_provider_info.get("api_key")
+            config["deep_api_key"] = deep_provider_info.get("api_key")
+            config["quick_credential_source"] = quick_provider_info.get(
+                "credential_source"
+            )
+            config["deep_credential_source"] = deep_provider_info.get(
+                "credential_source"
+            )
+            logger.info(
+                "🔐 [凭据验证] quick=%s, deep=%s",
+                config["quick_credential_source"],
+                config["deep_credential_source"],
+            )
 
             # 🔍 验证配置中的模型
             logger.info(f"🔍 [模型验证] 配置中的快速模型: {config.get('quick_think_llm')}")
@@ -1514,11 +1697,12 @@ class SimpleAnalysisService:
             logger.info(f"🚀 准备调用 trading_graph.propagate，progress_callback={graph_progress_callback}")
 
             # 执行实际分析，传递进度回调和task_id
-            state, decision = trading_graph.propagate(
-                request.stock_code,
+            state, decision = _propagate_trading_graph(
+                trading_graph,
+                request,
                 analysis_date,
                 progress_callback=graph_progress_callback,
-                task_id=task_id
+                task_id=task_id,
             )
 
             logger.info(f"✅ trading_graph.propagate 执行完成")
@@ -1785,7 +1969,7 @@ class SimpleAnalysisService:
 
             # 5. 最后的备用方案
             if not summary:
-                summary = f"对{request.stock_code}的分析已完成，请查看详细报告。"
+                summary = f"对{stock_code}的分析已完成，请查看详细报告。"
                 logger.warning(f"⚠️ [SUMMARY] 使用备用摘要")
 
             if not recommendation:
@@ -1815,8 +1999,8 @@ class SimpleAnalysisService:
             # 构建结果
             result = {
                 "analysis_id": str(uuid.uuid4()),
-                "stock_code": request.stock_code,
-                "stock_symbol": request.stock_code,  # 添加stock_symbol字段以保持兼容性
+                "stock_code": stock_code,
+                "stock_symbol": stock_code,
                 "analysis_date": analysis_date,
                 "summary": summary,
                 "recommendation": recommendation,
