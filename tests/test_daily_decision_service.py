@@ -624,6 +624,40 @@ async def test_unverified_star_market_permission_prefilters_candidate_before_dec
 
 
 @pytest.mark.asyncio
+async def test_decision_propagates_candidate_run_permission_audit():
+    run = _run([_candidate()])
+    run["permission_prefilter_excluded"] = [
+        {
+            "code": "688208",
+            "name": "道通科技",
+            "board": "STAR",
+            "reason_code": "star_market_permission_denied",
+        }
+    ]
+    briefing = _briefing()
+    briefing["account"]["execution_capabilities"] = {
+        "market_permissions": {
+            "star_market": {"verified": True, "tradable": False}
+        }
+    }
+
+    packet = await _service(run=run, briefing=briefing).today(
+        "user-1",
+        now=NOW,
+    )
+
+    assert packet["summary"]["permission_prefilter_excluded_count"] == 1
+    assert packet["permission_prefilter_excluded"] == [
+        {
+            "code": "688208",
+            "name": "道通科技",
+            "board": "STAR",
+            "reason_code": "star_market_permission_denied",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_user_exclusion_prefilters_candidate_before_profile_and_allocation():
     briefing = _briefing()
     briefing["account"]["excluded_codes"] = ["600406"]
