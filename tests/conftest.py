@@ -42,6 +42,7 @@ MAINTAINED_ROOT_TESTS = {
     "test_a_share_market_regime.py",
     "test_agent_cli.py",
     "test_agent_client.py",
+    "test_analysis_runtime_contract.py",
     "test_ai_candidate_service.py",
     "test_auth_cli_session.py",
     "test_candidate_discovery_service.py",
