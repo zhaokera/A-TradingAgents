@@ -880,6 +880,56 @@ def test_serialize_run_marks_mongo_naive_datetime_as_utc():
     assert serialized["generated_at"] == "2026-07-20T07:12:38+00:00"
 
 
+def test_serialize_run_exposes_only_compact_permission_prefilter_audit():
+    serialized = AICandidateService._serialize_run(
+        {
+            "_id": ObjectId(),
+            "governance": {
+                "excluded_codes": ["600406"],
+                "star_market": {
+                    "verified": True,
+                    "tradable": False,
+                    "eligible": False,
+                },
+            },
+            "governance_excluded_candidates": [
+                {
+                    "code": "688208",
+                    "name": "道通科技",
+                    "governance_reason": "star_market_permission_unverified",
+                    "price_plan": {"entry_price": 31.2},
+                    "performance": {
+                        "shadow_trade": {"status": "stopped_governance"}
+                    },
+                },
+                {
+                    "code": "600406",
+                    "name": "国电南瑞",
+                    "governance_reason": "user_excluded",
+                    "quote": {"price": 24.5},
+                },
+            ],
+        }
+    )
+
+    assert "governance_excluded_candidates" not in serialized
+    assert serialized["permission_prefilter_excluded_count"] == 2
+    assert serialized["permission_prefilter_excluded"] == [
+        {
+            "code": "688208",
+            "name": "道通科技",
+            "board": "STAR",
+            "reason_code": "star_market_permission_denied",
+        },
+        {
+            "code": "600406",
+            "name": "国电南瑞",
+            "board": "A_SHARE",
+            "reason_code": "user_excluded",
+        },
+    ]
+
+
 def test_serialize_run_backfills_entry_state_for_existing_candidates():
     serialized = AICandidateService._serialize_run(
         {
