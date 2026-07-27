@@ -75,8 +75,10 @@ def test_scheduler_adds_quotes_job(monkeypatch):
     monkeypatch.setattr(main_mod, "_print_config_summary", _noop_async, raising=True)
 
     import app.core.config_bridge as config_bridge
+    import app.core.startup_validator as startup_validator
 
     monkeypatch.setattr(config_bridge, "bridge_config_to_env", lambda: None, raising=True)
+    monkeypatch.setattr(startup_validator, "validate_startup_config", lambda: None, raising=True)
 
     # Patch scheduler, quotes service and asyncio.create_task
     monkeypatch.setattr(main_mod, "AsyncIOScheduler", lambda *args, **kwargs: fake_scheduler, raising=True)
