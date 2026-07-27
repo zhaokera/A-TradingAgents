@@ -914,6 +914,74 @@ class AICandidateService:
     def _serialize_run(document: Mapping[str, Any]) -> Dict[str, Any]:
         result = deepcopy(dict(document))
         result["run_id"] = str(result.pop("_id"))
+        raw_governance_excluded = result.pop(
+            "governance_excluded_candidates",
+            [],
+        )
+        governance = (
+            result.get("governance")
+            if isinstance(result.get("governance"), Mapping)
+            else {}
+        )
+        governance_excluded_codes = _normalized_code_set(
+            governance.get("excluded_codes")
+        )
+        star_governance = governance.get("star_market")
+        star_governance = (
+            star_governance if isinstance(star_governance, Mapping) else {}
+        )
+        candidate_discovery = result.get("candidate_discovery")
+        candidate_discovery = (
+            candidate_discovery
+            if isinstance(candidate_discovery, Mapping)
+            else {}
+        )
+        raw_discovery_excluded = candidate_discovery.get(
+            "permission_prefilter_excluded"
+        )
+        raw_discovery_excluded = (
+            raw_discovery_excluded
+            if isinstance(raw_discovery_excluded, list)
+            else []
+        )
+        permission_audit: List[Dict[str, str]] = []
+        seen_permission_audit: set[tuple[str, str]] = set()
+        for item in [*raw_discovery_excluded, *raw_governance_excluded]:
+            if not isinstance(item, Mapping):
+                continue
+            code = str(item.get("code") or "").strip()
+            if not _A_SHARE_CODE.fullmatch(code):
+                continue
+            if code in governance_excluded_codes:
+                reason = "user_excluded"
+            elif code.startswith(("688", "689")):
+                reason = (
+                    "star_market_permission_denied"
+                    if star_governance.get("verified") is True
+                    else "star_market_permission_unverified"
+                )
+            else:
+                reason = str(
+                    item.get("reason_code")
+                    or item.get("governance_reason")
+                    or "governance_excluded"
+                )
+            key = (code, reason)
+            if key in seen_permission_audit:
+                continue
+            seen_permission_audit.add(key)
+            permission_audit.append(
+                {
+                    "code": code,
+                    "name": str(item.get("name") or code),
+                    "board": (
+                        "STAR" if code.startswith(("688", "689")) else "A_SHARE"
+                    ),
+                    "reason_code": reason,
+                }
+            )
+        result["permission_prefilter_excluded_count"] = len(permission_audit)
+        result["permission_prefilter_excluded"] = permission_audit
         candidates = result.get("candidates")
         if isinstance(candidates, list):
             result["candidates"] = [
