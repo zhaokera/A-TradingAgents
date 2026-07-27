@@ -15,7 +15,12 @@ export interface FavoriteItem {
   current_price?: number | null
   change_percent?: number | null
   volume?: number | null
+  quote_source?: string | null
+  quote_trade_at?: string | null
+  quote_checked_at?: string | null
   source?: 'manual' | 'ai_screening'
+  lifecycle_state?: 'manual' | 'current' | 'superseded' | 'expired' | 'invalidated' | 'target_reached'
+  is_current_ai_candidate?: boolean
   ai_metadata?: {
     run_id?: string
     generated_at?: string
@@ -27,6 +32,10 @@ export interface FavoriteItem {
       breakout_price?: number | null
       stop_price?: number | null
       target_price?: number | null
+      entry_strategy?: 'pullback' | 'breakout' | 'reference'
+      entry_status?: string
+      entry_status_label?: string
+      entry_guidance?: string
       status?: string
     }
     objective_id?: string
@@ -37,6 +46,32 @@ export interface FavoriteItem {
     horizon?: string
     source?: string
     is_reference_only?: boolean
+    tracking_enabled?: boolean
+    actionability?: string
+    actionability_label?: string
+    rank_score?: number
+    last_checked_at?: string
+    quote_source?: string
+    quote_trade_at?: string
+    position_sizing?: {
+      status?: string
+      suggested_quantity?: number
+      suggested_amount?: number
+      suggested_position_pct?: number
+      planned_loss_amount?: number
+    }
+    performance?: {
+      return_since_generated_pct?: number
+      max_return_pct?: number
+      min_return_pct?: number
+      observation_count?: number
+      target_hit_at?: string
+      stop_hit_at?: string
+    }
+    lifecycle_state?: 'current' | 'superseded' | 'expired' | 'invalidated' | 'target_reached'
+    is_current?: boolean
+    superseded_at?: string | null
+    superseded_by_run_id?: string | null
   } | null
 }
 

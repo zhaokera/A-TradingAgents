@@ -6,6 +6,9 @@ from fastapi import FastAPI
 
 
 def test_scheduler_adds_quotes_job(monkeypatch):
+    monkeypatch.setenv("USE_MONGODB_STORAGE", "false")
+    monkeypatch.setenv("MONGODB_ENABLED", "false")
+    monkeypatch.setenv("REDIS_ENABLED", "false")
     # Flags to assert behavior
     state = SimpleNamespace(
         ensure_indexes_called=False,
@@ -21,6 +24,9 @@ def test_scheduler_adds_quotes_job(monkeypatch):
             # simple async no-op
             return None
 
+        async def backfill_last_close_snapshot_if_needed(self):
+            return None
+
     # Capture added jobs from scheduler
     class _FakeScheduler:
         def __init__(self):
@@ -32,6 +38,9 @@ def test_scheduler_adds_quotes_job(monkeypatch):
 
         def start(self):
             # no-op in tests
+            return None
+
+        def pause_job(self, _job_id):
             return None
 
         def shutdown(self, wait=False):
@@ -63,6 +72,11 @@ def test_scheduler_adds_quotes_job(monkeypatch):
     monkeypatch.setattr(main_mod, "init_db", _noop_async, raising=True)
     monkeypatch.setattr(main_mod, "close_db", _noop_async, raising=True)
     monkeypatch.setattr(main_mod, "get_basics_sync_service", lambda: _FakeBasicsService(), raising=True)
+    monkeypatch.setattr(main_mod, "_print_config_summary", _noop_async, raising=True)
+
+    import app.core.config_bridge as config_bridge
+
+    monkeypatch.setattr(config_bridge, "bridge_config_to_env", lambda: None, raising=True)
 
     # Patch scheduler, quotes service and asyncio.create_task
     monkeypatch.setattr(main_mod, "AsyncIOScheduler", lambda *args, **kwargs: fake_scheduler, raising=True)
@@ -86,13 +100,19 @@ def test_scheduler_adds_quotes_job(monkeypatch):
             job = j
             break
     assert job is not None, "Quotes ingestion IntervalTrigger job not found"
+    assert {item["kwargs"].get("id") for item in fake_scheduler.jobs} >= {
+        "quotes_ingestion_service",
+        "ai_candidate_tracking",
+        "ai_candidate_daily_research",
+    }
 
     # Ensure ensure_indexes called during startup
     assert state.ensure_indexes_called is True
 
     # Simulate scheduler tick by invoking the stored func
     job_func = job["func"]
-    job_func()  # should call asyncio.create_task(...) with our fake
+    scheduled_result = job_func()
+    if inspect.iscoroutine(scheduled_result):
+        scheduled_result.close()
 
     assert state.create_task_called is True
-

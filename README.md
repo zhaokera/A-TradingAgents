@@ -54,6 +54,13 @@
 
 面向中文用户的**多智能体与大模型股票分析学习平台**。帮助你系统化学习如何使用多智能体交易框架与 AI 大模型进行合规的股票研究与策略实验，不提供实盘交易指令，平台定位为学习与研究用途。
 
+## Agent CLI
+
+本地 Hermes/Agent 自动化统一使用 `agentctl`，覆盖持仓、自选、候选、股票数据、
+分析任务、报告、通知和受保护的系统管理能力。CLI 首次通过系统账号密码登录，默认会话
+至少有效 7 天，后续自动刷新。安装、命令和提示词见
+[Agent CLI 使用说明](./docs/cli/AGENTCTL.md)。
+
 ## 🙏 致敬源项目
 
 感谢 [Tauric Research](https://github.com/TauricResearch) 团队创造的革命性多智能体交易框架 [TradingAgents](https://github.com/TauricResearch/TradingAgents)！

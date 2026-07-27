@@ -92,6 +92,15 @@ export interface DecisionResearchPacket {
     current_exposure_pct?: number
     [key: string]: unknown
   }
+  execution_capabilities?: {
+    source?: string
+    condition_order?: {
+      verified?: boolean
+      independent_trigger_price_supported?: boolean
+      separate_order_limit_price_supported?: boolean
+      eligible?: boolean
+    }
+  }
   market: {
     combined_regime?: string
     domestic_regime?: string
@@ -155,6 +164,7 @@ export interface CodexDecisionSelection {
   requested_quantity?: number | null
   entry_strategy?: 'pullback' | 'breakout' | 'reference' | null
   trigger_price?: number | string | null
+  order_limit_price?: number | string | null
   stop_price?: number | string | null
   target_price?: number | string | null
   expires_at?: string | null

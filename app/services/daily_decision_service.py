@@ -73,6 +73,8 @@ WAIT_REASON_CODES = (
     "correlation_limit",
     "loss_budget_exhausted",
 )
+CONDITION_ORDER_CAPABILITY_REASON = "condition_order_capability_unverified"
+CONDITION_ORDER_PRICE_REASON = "condition_order_order_price_missing"
 
 _TOP_LEVEL_VOLATILE_FIELDS = {
     "decision_id",
@@ -103,6 +105,30 @@ def _normalise_code(value: Any) -> str:
         if match:
             return match.group(1).zfill(6)
     return text
+
+
+def _execution_capabilities(account: Mapping[str, Any]) -> Dict[str, Any]:
+    raw = account.get("execution_capabilities")
+    raw = raw if isinstance(raw, Mapping) else {}
+    condition = raw.get("condition_order")
+    condition = condition if isinstance(condition, Mapping) else {}
+    verified = condition.get("verified") is True
+    independent_trigger = (
+        condition.get("independent_trigger_price_supported") is True
+    )
+    separate_limit = (
+        condition.get("separate_order_limit_price_supported") is True
+    )
+    eligible = verified and independent_trigger and separate_limit
+    return {
+        "source": str(raw.get("source") or "unverified").strip(),
+        "condition_order": {
+            "verified": verified,
+            "independent_trigger_price_supported": independent_trigger,
+            "separate_order_limit_price_supported": separate_limit,
+            "eligible": eligible,
+        },
+    }
 
 
 def _as_shanghai(value: Any) -> datetime:
@@ -711,6 +737,8 @@ class DailyDecisionService:
 
         account = briefing.get("account")
         account = dict(account) if isinstance(account, Mapping) else {}
+        execution_capabilities = _execution_capabilities(account)
+        condition_order_capability = execution_capabilities["condition_order"]
         total_assets = account.get("total_assets")
         available_cash = account.get("available_cash")
         holdings: list[Dict[str, Any]] = []
@@ -796,7 +824,22 @@ class DailyDecisionService:
                 now=now,
                 session=session,
             )
+            plan = candidate.get("price_plan")
+            plan = dict(plan) if isinstance(plan, Mapping) else {}
+            quote_price = _finite_decimal(quote.get("price"))
+            stop_price = _finite_decimal(plan.get("stop_price"))
+            has_live_price = quote_price is not None and quote_price > 0
             avoid_reasons = self._avoid_reasons(candidate, market=market, now=now)
+            if (
+                quote_status.get("actionable") is True
+                and has_live_price
+                and stop_price is not None
+                and quote_price <= stop_price
+            ):
+                avoid_reasons = _dedupe_ordered(
+                    [*avoid_reasons, "plan_invalidated"],
+                    AVOID_REASON_CODES,
+                )
             wait_reasons = self._wait_reasons(
                 candidate,
                 session=session,
@@ -804,10 +847,6 @@ class DailyDecisionService:
                 profile=profile,
                 allocation=allocation,
             )
-            plan = candidate.get("price_plan")
-            plan = dict(plan) if isinstance(plan, Mapping) else {}
-            quote_price = _finite_decimal(quote.get("price"))
-            has_live_price = quote_price is not None and quote_price > 0
             if avoid_reasons:
                 bucket = "avoid"
                 reasons = avoid_reasons
@@ -823,17 +862,25 @@ class DailyDecisionService:
             ):
                 bucket = "buy_now"
                 reasons = ["live_price_condition_met"]
+            elif (
+                quote_status.get("actionable") is not True
+                or not has_live_price
+            ):
+                bucket = "wait"
+                reasons = ["live_quote_recheck_required"]
+            elif plan.get("price_condition_met") is not True:
+                if condition_order_capability.get("eligible") is not True:
+                    bucket = "wait"
+                    reasons = [CONDITION_ORDER_CAPABILITY_REASON]
+                elif _finite_decimal(plan.get("order_limit_price")) is None:
+                    bucket = "wait"
+                    reasons = [CONDITION_ORDER_PRICE_REASON]
+                else:
+                    bucket = "condition_order"
+                    reasons = ["valid_allocated_plan", "entry_condition_not_met"]
             else:
-                bucket = "condition_order"
-                reasons = ["valid_allocated_plan"]
-                if phase in LIVE_PHASES and (
-                    quote_status.get("actionable") is not True or not has_live_price
-                ):
-                    reasons.append("live_quote_recheck_required")
-                elif phase not in LIVE_PHASES:
-                    reasons.append("live_quote_recheck_required")
-                elif plan.get("price_condition_met") is not True:
-                    reasons.append("entry_condition_not_met")
+                bucket = "wait"
+                reasons = ["live_quote_recheck_required"]
 
             plans = candidate.get("plans")
             plans = plans if isinstance(plans, Mapping) else {}
@@ -866,6 +913,18 @@ class DailyDecisionService:
                     **quote,
                     "status": quote_status.get("status"),
                     "actionable": quote_status.get("actionable"),
+                },
+                "execution": {
+                    "status": (
+                        "condition_order_eligible"
+                        if bucket == "condition_order"
+                        else "research_only"
+                    ),
+                    "condition_order_capability_verified": (
+                        condition_order_capability.get("eligible") is True
+                    ),
+                    "requires_separate_trigger_and_limit_fields": True,
+                    "order_limit_price": plan.get("order_limit_price"),
                 },
                 "plans": {
                     "short": deepcopy(plans.get("short") or plan),
@@ -985,6 +1044,7 @@ class DailyDecisionService:
             "briefing_as_of": candidate_run.get("generated_at"),
             "market_session": stable_session,
             "account": deepcopy(account),
+            "execution_capabilities": deepcopy(execution_capabilities),
             "market": deepcopy(market),
             "portfolio_constraints": {
                 "effective_limits": deepcopy(

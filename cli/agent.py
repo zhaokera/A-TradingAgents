@@ -202,10 +202,23 @@ def _decision_item_summary(item: Any) -> Dict[str, Any]:
         "objective_segment": identity.get("objective_segment"),
         "objective_match_score": identity.get("objective_match_score"),
         "price": quote.get("price"),
+        "current_price": quote.get("price"),
+        "current_price_trade_at": quote.get("trade_at"),
         "quote_source": quote.get("source"),
         "quote_status": quote.get("status"),
         "quote_checked_at": quote.get("quote_checked_at"),
         "entry_price": short_plan.get("entry_price"),
+        "entry_reference_price": short_plan.get("entry_price"),
+        "order_limit_price": (
+            value.get("execution", {}).get("order_limit_price")
+            if isinstance(value.get("execution"), dict)
+            else None
+        ),
+        "execution_status": (
+            value.get("execution", {}).get("status")
+            if isinstance(value.get("execution"), dict)
+            else "research_only"
+        ),
         "stop_price": short_plan.get("stop_price"),
         "target_price": short_plan.get("target_price"),
         "plan_status": short_plan.get("entry_status"),
@@ -241,6 +254,7 @@ def _decision_projection(data: Dict[str, Any], *, view: str) -> Dict[str, Any]:
         "candidate_run_id": data.get("candidate_run_id"),
         "briefing_as_of": data.get("briefing_as_of"),
         "account": data.get("account"),
+        "execution_capabilities": data.get("execution_capabilities"),
         "market": data.get("market"),
         "summary": data.get("summary"),
         "rule_version": data.get("rule_version"),

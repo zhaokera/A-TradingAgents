@@ -3,7 +3,7 @@
 """
 
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 
 from app.core.database import get_mongo_db
@@ -39,6 +39,13 @@ class FavoritesService:
         added_at = favorite.get("added_at")
         if isinstance(added_at, datetime):
             added_at = added_at.isoformat()
+        ai_metadata = favorite.get("ai_metadata")
+        ai_metadata = ai_metadata if isinstance(ai_metadata, dict) else None
+        lifecycle_state = (
+            str(ai_metadata.get("lifecycle_state") or "current")
+            if favorite.get("source") == "ai_screening" and ai_metadata
+            else "manual"
+        )
         return {
             "stock_code": favorite.get("stock_code"),
             "stock_name": favorite.get("stock_name"),
@@ -49,11 +56,16 @@ class FavoritesService:
             "alert_price_high": favorite.get("alert_price_high"),
             "alert_price_low": favorite.get("alert_price_low"),
             "source": favorite.get("source") or "manual",
-            "ai_metadata": favorite.get("ai_metadata"),
+            "ai_metadata": ai_metadata,
+            "lifecycle_state": lifecycle_state,
+            "is_current_ai_candidate": lifecycle_state == "current",
             # 行情占位，稍后填充
             "current_price": None,
             "change_percent": None,
             "volume": None,
+            "quote_source": None,
+            "quote_trade_at": None,
+            "quote_checked_at": None,
         }
 
     async def get_user_favorites(self, user_id: str) -> List[Dict[str, Any]]:
@@ -121,32 +133,25 @@ class FavoritesService:
                     it["board"] = "-"
                     it["exchange"] = "-"
 
-        # 批量获取行情（优先使用入库的 market_quotes，30秒更新）
+        # 批量获取行情：腾讯直连优先，失败时由 QuotesService 统一降级。
         if codes:
             try:
-                coll = db["market_quotes"]
-                cursor = coll.find({"code": {"$in": codes}}, {"code": 1, "close": 1, "pct_chg": 1, "amount": 1})
-                docs = await cursor.to_list(length=None)
-                quotes_map = {str(d.get("code")).zfill(6): d for d in (docs or [])}
+                quotes_map = await get_quotes_service().get_quotes(codes)
+                checked_at = datetime.utcnow().isoformat() + "Z"
                 for it in items:
                     code = it.get("stock_code")
                     q = quotes_map.get(code)
                     if q:
-                        it["current_price"] = q.get("close")
+                        it["current_price"] = (
+                            q.get("price")
+                            or q.get("close")
+                            or q.get("current_price")
+                        )
                         it["change_percent"] = q.get("pct_chg")
-                # 兜底：对未命中的代码使用在线源补齐（可选）
-                missing = [c for c in codes if c not in quotes_map]
-                if missing:
-                    try:
-                        quotes_online = await get_quotes_service().get_quotes(missing)
-                        for it in items:
-                            code = it.get("stock_code")
-                            if it.get("current_price") is None:
-                                q2 = quotes_online.get(code, {}) if quotes_online else {}
-                                it["current_price"] = q2.get("close")
-                                it["change_percent"] = q2.get("pct_chg")
-                    except Exception:
-                        pass
+                        it["volume"] = q.get("volume")
+                        it["quote_source"] = q.get("source") or q.get("data_source") or "fallback"
+                        it["quote_trade_at"] = q.get("trade_at")
+                        it["quote_checked_at"] = checked_at
             except Exception:
                 # 查询失败时保持占位 None，避免影响基础功能
                 pass
@@ -317,20 +322,160 @@ class FavoritesService:
                 {"$set": update_fields}
             )
             return result.modified_count > 0
-        else:
-            result = await db.user_favorites.update_one(
+        result = await db.user_favorites.update_one(
+            {
+                "user_id": user_id,
+                "favorites.stock_code": stock_code
+            },
+            {
+                "$set": {
+                    **update_fields,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        return result.modified_count > 0
+
+    async def update_ai_candidate_tracking(
+        self,
+        user_id: str,
+        stock_code: str,
+        candidate: Dict[str, Any],
+    ) -> bool:
+        """Refresh the persisted AI plan without overwriting user notes or tags."""
+
+        db = await self._get_db()
+        find_one = getattr(db.user_favorites, "find_one", None)
+        doc = (
+            await find_one(
                 {
-                    "user_id": user_id,
-                    "favorites.stock_code": stock_code
+                    "user_id": str(user_id),
+                    "favorites.stock_code": str(stock_code),
+                    "favorites.source": "ai_screening",
                 },
+                {"favorites": 1},
+            )
+            if callable(find_one)
+            else None
+        )
+        existing_metadata: Dict[str, Any] = {}
+        for favorite in (doc or {}).get("favorites", []):
+            if (
+                str(favorite.get("stock_code") or "") == str(stock_code)
+                and favorite.get("source") == "ai_screening"
+                and isinstance(favorite.get("ai_metadata"), dict)
+            ):
+                existing_metadata = dict(favorite["ai_metadata"])
+                break
+        actionability = str(candidate.get("actionability") or "")
+        lifecycle_state = (
+            actionability
+            if actionability in {"expired", "invalidated", "target_reached"}
+            else "current"
+        )
+        ai_metadata = {
+            **existing_metadata,
+            "run_id": candidate.get("run_id"),
+            "generated_at": candidate.get("generated_at"),
+            "reason_summary": candidate.get("reason_summary"),
+            "reference_price": candidate.get("reference_price"),
+            "price_plan": candidate.get("price_plan"),
+            "objective_id": candidate.get("objective_id"),
+            "objective_label": candidate.get("objective_label"),
+            "objective_tier": candidate.get("objective_tier"),
+            "objective_tier_label": candidate.get("objective_tier_label"),
+            "objective_segment": candidate.get("objective_segment"),
+            "source": candidate.get("source"),
+            "tracking_enabled": True,
+            "actionability": candidate.get("actionability"),
+            "actionability_label": candidate.get("actionability_label"),
+            "rank_score": candidate.get("rank_score"),
+            "position_sizing": candidate.get("position_sizing"),
+            "performance": candidate.get("performance"),
+            "last_checked_at": candidate.get("quote_checked_at"),
+            "quote_source": candidate.get("quote_source"),
+            "quote_trade_at": candidate.get("trade_at"),
+            "is_reference_only": True,
+            "lifecycle_state": lifecycle_state,
+            "is_current": lifecycle_state == "current",
+            "superseded_at": None,
+            "superseded_by_run_id": None,
+        }
+        result = await db.user_favorites.update_one(
+            {
+                "user_id": str(user_id),
+                "favorites.stock_code": str(stock_code),
+                "favorites.source": "ai_screening",
+            },
+            {
+                "$set": {
+                    "favorites.$.ai_metadata": ai_metadata,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+        return result.modified_count > 0
+
+    async def reconcile_ai_candidate_lifecycle(
+        self,
+        user_id: str,
+        *,
+        current_run_id: str,
+        current_codes: List[str],
+        generated_at: datetime,
+    ) -> Dict[str, int]:
+        """Archive prior AI picks while preserving every user-owned field."""
+
+        db = await self._get_db()
+        doc = await db.user_favorites.find_one({"user_id": str(user_id)})
+        if not doc:
+            return {"current": 0, "superseded": 0}
+        current_code_set = {str(code) for code in current_codes}
+        favorites = list(doc.get("favorites") or [])
+        current_count = 0
+        superseded_count = 0
+        changed = False
+        timestamp = generated_at
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        timestamp_text = timestamp.isoformat()
+        for favorite in favorites:
+            if favorite.get("source") != "ai_screening":
+                continue
+            metadata = dict(favorite.get("ai_metadata") or {})
+            code = str(favorite.get("stock_code") or "")
+            if code in current_code_set:
+                current_count += 1
+                desired = {
+                    "lifecycle_state": "current",
+                    "is_current": True,
+                    "run_id": current_run_id,
+                    "superseded_at": None,
+                    "superseded_by_run_id": None,
+                }
+            else:
+                superseded_count += 1
+                desired = {
+                    "lifecycle_state": "superseded",
+                    "is_current": False,
+                    "superseded_at": timestamp_text,
+                    "superseded_by_run_id": current_run_id,
+                }
+            if any(metadata.get(key) != value for key, value in desired.items()):
+                metadata.update(desired)
+                favorite["ai_metadata"] = metadata
+                changed = True
+        if changed:
+            await db.user_favorites.update_one(
+                {"user_id": str(user_id)},
                 {
                     "$set": {
-                        **update_fields,
-                        "updated_at": datetime.utcnow()
+                        "favorites": favorites,
+                        "updated_at": datetime.utcnow(),
                     }
-                }
+                },
             )
-            return result.modified_count > 0
+        return {"current": current_count, "superseded": superseded_count}
 
     async def is_favorite(self, user_id: str, stock_code: str) -> bool:
         """检查股票是否在自选股中（兼容字符串ID与ObjectId）"""

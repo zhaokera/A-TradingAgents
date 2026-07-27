@@ -10,10 +10,30 @@ from app.services.ai_candidate_service import (
     AICandidateRunNotFoundError,
     AICandidateService,
     InvalidAICandidateSelectionError,
+    _apply_candidate_state,
     normalize_ai_candidate,
     normalize_ai_candidate_run,
 )
 from app.services.favorites_service import FavoritesService
+
+
+def _offline_research_dependencies():
+    stock_master = SimpleNamespace(
+        db=None,
+        resolve_many=AsyncMock(return_value={}),
+    )
+    macro_risk = SimpleNamespace(
+        db=None,
+        get_current=AsyncMock(
+            return_value={
+                "status": "ok",
+                "regime": "green",
+                "score": 0,
+                "factors": [],
+            }
+        ),
+    )
+    return stock_master, macro_risk
 
 
 def _research_payload():
@@ -109,23 +129,23 @@ def test_normalize_ai_candidate_run_keeps_reference_only_price_evidence():
         favorite_codes={"600001"},
     )
 
-    assert [item["code"] for item in result["candidates"]] == ["600000", "600001"]
+    assert [item["code"] for item in result["candidates"]] == ["600001", "600000"]
     first = result["candidates"][0]
     second = result["candidates"][1]
-    assert first["research_status"] == "observe"
+    assert first["research_status"] == "condition_order"
     assert first["is_reference_only"] is True
-    assert first["price_plan"]["entry_price"] == 10.0
-    assert first["price_plan"]["stop_price"] == 9.2
-    assert first["price_plan"]["entry_status"] == "plan_unavailable"
-    assert first["favorite_status"] == "not_added"
-    assert second["price_plan"]["observation_zone"] == [10.8, 11.1]
-    assert second["price_plan"]["entry_price"] == 11.0
-    assert second["price_plan"]["entry_strategy"] == "pullback"
-    assert second["price_plan"]["entry_status"] == "waiting_pullback"
-    assert second["price_plan"]["distance_to_entry_pct"] == -1.79
-    assert "等待回落" in second["price_plan"]["entry_guidance"]
-    assert second["favorite_status"] == "in_favorites"
-    assert "suggested_quantity" not in second
+    assert first["price_plan"]["observation_zone"] == [10.8, 11.1]
+    assert first["price_plan"]["entry_price"] == 11.0
+    assert first["price_plan"]["entry_strategy"] == "pullback"
+    assert first["price_plan"]["entry_status"] == "waiting_pullback"
+    assert first["price_plan"]["distance_to_entry_pct"] == -1.79
+    assert "等待回落" in first["price_plan"]["entry_guidance"]
+    assert first["favorite_status"] == "in_favorites"
+    assert second["price_plan"]["entry_price"] == 10.0
+    assert second["price_plan"]["stop_price"] == 9.2
+    assert second["price_plan"]["entry_status"] == "plan_unavailable"
+    assert second["favorite_status"] == "not_added"
+    assert "suggested_quantity" not in first
     assert result["disclaimer"].startswith("仅供研究参考")
 
 
@@ -198,6 +218,62 @@ def test_breakout_price_ready_is_still_blocked_by_quote_risk():
     assert "刷新行情后再确认" in price_plan["entry_guidance"]
 
 
+def test_warning_risk_does_not_block_price_ready_candidate():
+    candidate = normalize_ai_candidate(
+        {
+            "code": "600012",
+            "name": "普通警告候选",
+            "quote": {"price": 10.2},
+            "guarded_price_plan": {
+                "status": "ok",
+                "entry_strategy": "breakout",
+                "suggested_buy_price": 10.0,
+                "stop_loss_price": 9.4,
+                "target_price": 11.8,
+            },
+            "risk_flags": [
+                {
+                    "code": "wait_for_confirmation",
+                    "severity": "warning",
+                    "message": "仍需确认成交量。",
+                }
+            ],
+        },
+        context={},
+        favorite_codes=set(),
+    )
+
+    assert candidate is not None
+    assert candidate["price_plan"]["risk_blocked"] is False
+    assert candidate["price_plan"]["entry_status"] == "price_ready"
+    assert candidate["actionability"] == "ready_now"
+    assert candidate["can_add_to_favorites"] is True
+
+
+def test_invalidated_candidate_is_not_addable():
+    candidate = normalize_ai_candidate(
+        {
+            "code": "600013",
+            "name": "失效候选",
+            "quote": {"price": 9.0},
+            "guarded_price_plan": {
+                "status": "ok",
+                "entry_strategy": "pullback",
+                "suggested_buy_price": 10.0,
+                "stop_loss_price": 9.2,
+                "target_price": 11.8,
+            },
+            "risk_flags": [],
+        },
+        context={},
+        favorite_codes=set(),
+    )
+
+    assert candidate is not None
+    assert candidate["actionability"] == "invalidated"
+    assert candidate["can_add_to_favorites"] is False
+
+
 def test_price_below_stop_marks_original_entry_plan_invalidated():
     candidate = normalize_ai_candidate(
         {
@@ -243,7 +319,7 @@ async def test_run_persists_user_owned_candidate_batch():
     assert result["run_id"]
     assert result["user_id"] == "admin-id"
     assert result["candidate_count"] == 1
-    assert result["candidates"][0]["code"] == "600000"
+    assert result["candidates"][0]["code"] == "600001"
     stored = collection.insert_one.await_args.args[0]
     assert stored["user_id"] == "admin-id"
     assert stored["expires_at"] > stored["generated_at"]
@@ -262,14 +338,23 @@ async def test_latest_reconciles_favorite_status_with_current_favorites():
                     {"code": "600001", "favorite_status": "not_added"},
                 ],
             }
-        )
+        ),
+        update_one=AsyncMock(),
     )
     db = MagicMock()
     db.__getitem__.return_value = collection
     favorites = SimpleNamespace(
         get_favorite_codes=AsyncMock(return_value={"600001"})
     )
-    service = AICandidateService(research_runner=_research_payload, favorites=favorites)
+    quotes = SimpleNamespace(get_quotes=AsyncMock(return_value={}))
+    stock_master, macro_risk = _offline_research_dependencies()
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=favorites,
+        quotes=quotes,
+        stock_master=stock_master,
+        macro_risk=macro_risk,
+    )
     service.db = db
 
     result = await service.latest("admin-id")
@@ -279,6 +364,76 @@ async def test_latest_reconciles_favorite_status_with_current_favorites():
         "not_added",
         "in_favorites",
     ]
+
+
+@pytest.mark.asyncio
+async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
+    run_id = ObjectId()
+    collection = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "_id": run_id,
+                "user_id": "admin-id",
+                "generated_at": datetime(2026, 7, 20, tzinfo=timezone.utc),
+                "candidates": [
+                    {
+                        "code": "600000",
+                        "name": "候选",
+                        "reference_price": 10.6,
+                        "price_plan": {
+                            "entry_strategy": "pullback",
+                            "entry_price": 10.0,
+                            "stop_price": 9.2,
+                            "target_price": 11.5,
+                            "status": "ok",
+                        },
+                        "risk_flags": [],
+                        "favorite_status": "not_added",
+                    }
+                ],
+            }
+        ),
+        update_one=AsyncMock(),
+    )
+    db = MagicMock()
+    db.__getitem__.return_value = collection
+    favorites = SimpleNamespace(
+        get_favorite_codes=AsyncMock(return_value=set()),
+        update_ai_candidate_tracking=AsyncMock(return_value=True),
+    )
+    quotes = SimpleNamespace(
+        get_quotes=AsyncMock(
+            return_value={
+                "600000": {
+                    "price": 9.9,
+                    "close": 9.9,
+                    "pct_chg": -1.0,
+                    "source": "tencent",
+                    "trade_at": "2026-07-21T10:00:00+08:00",
+                }
+            }
+        )
+    )
+    stock_master, macro_risk = _offline_research_dependencies()
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=favorites,
+        quotes=quotes,
+        stock_master=stock_master,
+        macro_risk=macro_risk,
+    )
+    service.db = db
+
+    result = await service.latest("admin-id")
+
+    assert result is not None
+    candidate = result["candidates"][0]
+    assert candidate["reference_price"] == 9.9
+    assert candidate["price_plan"]["entry_status"] == "price_ready"
+    assert candidate["actionability"] == "ready_now"
+    assert candidate["quote_source"] == "tencent"
+    assert candidate["performance"]["observation_count"] == 1
+    collection.update_one.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -385,6 +540,160 @@ async def test_add_to_favorites_rejects_code_outside_persisted_run():
         await service.add_to_favorites("admin-id", str(run_id), ["600999"])
 
 
+@pytest.mark.asyncio
+async def test_add_to_favorites_rejects_invalidated_candidate():
+    run_id = ObjectId()
+    collection = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "_id": run_id,
+                "user_id": "admin-id",
+                "candidates": [
+                    {
+                        "code": "600000",
+                        "name": "失效候选",
+                        "actionability": "invalidated",
+                        "can_add_to_favorites": False,
+                    }
+                ],
+            }
+        )
+    )
+    db = MagicMock()
+    db.__getitem__.return_value = collection
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(
+            get_favorite_codes=AsyncMock(return_value=set())
+        ),
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+
+    with pytest.raises(InvalidAICandidateSelectionError):
+        await service.add_to_favorites("admin-id", str(run_id), ["600000"])
+
+
+@pytest.mark.asyncio
+async def test_start_run_returns_background_job_without_waiting(monkeypatch):
+    collection = SimpleNamespace(
+        find_one=AsyncMock(return_value=None),
+        insert_one=AsyncMock(),
+    )
+    db = MagicMock()
+    db.__getitem__.return_value = collection
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+
+    class FakeTask:
+        def add_done_callback(self, _callback):
+            return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return FakeTask()
+
+    monkeypatch.setattr(
+        "app.services.ai_candidate_service.asyncio.create_task",
+        fake_create_task,
+    )
+
+    result = await service.start_run("admin-id", max_candidates=5)
+
+    assert result["status"] == "queued"
+    assert result["job_id"]
+    collection.insert_one.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_performance_summary_aggregates_tracked_candidate_results():
+    class FakeCursor:
+        def sort(self, *_args):
+            return self
+
+        def limit(self, *_args):
+            return self
+
+        async def to_list(self, *, length):
+            assert length == 30
+            return [
+                {
+                    "_id": ObjectId(),
+                    "generated_at": datetime(2026, 7, 20, tzinfo=timezone.utc),
+                    "candidates": [
+                        {
+                            "code": "600000",
+                            "name": "候选",
+                            "performance": {
+                                "return_since_generated_pct": 5.0,
+                                "max_return_pct": 6.0,
+                                "min_return_pct": -1.0,
+                                "target_hit_at": "2026-07-21T10:00:00Z",
+                                "observation_count": 3,
+                            },
+                        },
+                        {
+                            "code": "600001",
+                            "name": "候选二",
+                            "performance": {
+                                "return_since_generated_pct": -1.0,
+                                "stop_hit_at": "2026-07-21T11:00:00Z",
+                                "observation_count": 2,
+                            },
+                        },
+                        {
+                            "code": "600002",
+                            "name": "新版影子交易",
+                            "performance": {
+                                "observation_count": 4,
+                                "shadow_trade": {
+                                    "status": "closed_target",
+                                    "entry_price": 10.0,
+                                    "quantity": 100,
+                                    "net_return_pct": 8.5,
+                                    "net_pnl": 85.0,
+                                    "max_return_pct": 10.0,
+                                    "min_return_pct": -1.0,
+                                },
+                            },
+                        },
+                    ],
+                }
+            ]
+
+    collection = SimpleNamespace(find=MagicMock(return_value=FakeCursor()))
+    db = MagicMock()
+    db.__getitem__.return_value = collection
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+
+    result = await service.performance_summary("admin-id")
+
+    assert result["sample_count"] == 1
+    assert result["legacy_baseline_count"] == 2
+    assert result["total_item_count"] == 3
+    assert result["triggered_count"] == 1
+    assert result["closed_count"] == 1
+    assert result["average_return_pct"] == 8.5
+    assert result["positive_count"] == 1
+    assert result["target_hit_count"] == 1
+    assert result["stop_hit_count"] == 0
+    legacy = [
+        item
+        for item in result["items"]
+        if item["metric_basis"] == "legacy_generated_baseline"
+    ]
+    assert all(item["entry_triggered"] is False for item in legacy)
+
+
 def test_favorite_format_defaults_old_records_to_manual_source():
     formatted = FavoritesService()._format_favorite(
         {
@@ -396,6 +705,37 @@ def test_favorite_format_defaults_old_records_to_manual_source():
 
     assert formatted["source"] == "manual"
     assert formatted["ai_metadata"] is None
+
+
+@pytest.mark.asyncio
+async def test_favorite_tracking_update_preserves_user_fields():
+    collection = SimpleNamespace(
+        update_one=AsyncMock(
+            return_value=SimpleNamespace(modified_count=1)
+        )
+    )
+    db = SimpleNamespace(user_favorites=collection)
+    service = FavoritesService()
+    service.db = db
+
+    updated = await service.update_ai_candidate_tracking(
+        "admin-id",
+        "600000",
+        {
+            "run_id": "run-1",
+            "generated_at": "2026-07-20T00:00:00Z",
+            "reference_price": 10.2,
+            "actionability": "ready_now",
+            "actionability_label": "价格条件已满足",
+            "price_plan": {"entry_price": 10.0, "stop_price": 9.2},
+        },
+    )
+
+    assert updated is True
+    update = collection.update_one.await_args.args[1]["$set"]
+    assert "favorites.$.notes" not in update
+    assert "favorites.$.tags" not in update
+    assert update["favorites.$.ai_metadata"]["actionability"] == "ready_now"
 
 
 def test_serialize_run_marks_mongo_naive_datetime_as_utc():
@@ -439,3 +779,40 @@ def test_serialize_run_backfills_entry_state_for_existing_candidates():
     assert price_plan["entry_status"] == "waiting_pullback"
     assert price_plan["entry_status_label"] == "等待回落"
     assert price_plan["distance_to_entry_pct"] == -1.8
+
+
+def test_portfolio_gate_overrides_price_ready_state():
+    candidate = {
+        "price_plan": {"entry_status": "price_ready"},
+        "portfolio_gate": {
+            "blocked": True,
+            "reason_code": "market_regime_new_exposure_blocked",
+        },
+    }
+
+    _apply_candidate_state(candidate)
+
+    assert candidate["actionability"] == "blocked"
+    assert candidate["can_add_to_favorites"] is False
+
+
+def test_performance_counts_each_tencent_trade_timestamp_once():
+    candidate = {
+        "initial_reference_price": 10.0,
+        "price_plan": {"stop_price": 9.0, "target_price": 12.0},
+    }
+
+    AICandidateService._update_performance(
+        candidate,
+        current_price=10.5,
+        checked_at="2026-07-21T02:00:00+00:00",
+        observation_key="2026-07-21T10:00:00+08:00",
+    )
+    AICandidateService._update_performance(
+        candidate,
+        current_price=10.5,
+        checked_at="2026-07-21T02:05:00+00:00",
+        observation_key="2026-07-21T10:00:00+08:00",
+    )
+
+    assert candidate["performance"]["observation_count"] == 1

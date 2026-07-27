@@ -995,7 +995,12 @@ class ConfigService:
             elif provider_str == "dashscope":
                 # DashScope 使用专门的测试方法
                 logger.info(f"🔍 使用 DashScope 专用测试方法")
-                result = self._test_dashscope_api(api_key, f"{provider_str} {llm_config.model_name}", llm_config.model_name)
+                result = await asyncio.to_thread(
+                    self._test_dashscope_api,
+                    api_key,
+                    f"{provider_str} {llm_config.model_name}",
+                    llm_config.model_name,
+                )
                 result["response_time"] = time.time() - start_time
                 return result
             else:
@@ -3673,7 +3678,7 @@ class ConfigService:
 
             # 如果没有指定模型，使用默认模型
             if not model_name:
-                model_name = "qwen-turbo"
+                model_name = "qwen3.7-max"
                 logger.info(f"⚠️ 未指定模型，使用默认模型: {model_name}")
 
             logger.info(f"🔍 [DashScope 测试] 使用模型: {model_name}")
@@ -3695,7 +3700,7 @@ class ConfigService:
                 "temperature": 0.1
             }
 
-            response = requests.post(url, json=data, headers=headers, timeout=10)
+            response = requests.post(url, json=data, headers=headers, timeout=30)
 
             if response.status_code == 200:
                 result = response.json()

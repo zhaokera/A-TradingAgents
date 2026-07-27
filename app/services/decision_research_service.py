@@ -66,6 +66,8 @@ HARD_REASON_CODES = frozenset(
 )
 ACTION_SCOPED_HARD_CODES = {
     "calendar_unknown": ("buy_now",),
+    "condition_order_capability_unverified": ("condition_order",),
+    "condition_order_order_price_missing": ("condition_order",),
 }
 
 
@@ -477,6 +479,9 @@ class DecisionResearchService:
             "created_at": created_at,
             "market_session": deepcopy(baseline.get("market_session") or {}),
             "account": account,
+            "execution_capabilities": deepcopy(
+                baseline.get("execution_capabilities") or {}
+            ),
             "market": deepcopy(baseline.get("market") or {}),
             "decision_objective": {
                 "max_new_positions": self.max_new_positions,

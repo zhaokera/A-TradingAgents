@@ -1,13 +1,14 @@
 import asyncio
 from datetime import date, datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
-from app.core.database import get_mongo_db
+from app.core.database import get_mongo_db, get_mongo_db_sync
 from app.core.response import ok
 from app.routers.auth_db import get_current_user
 from app.routers.paper import _detect_market_and_code, _get_last_price
@@ -65,6 +66,23 @@ class HoldingUpdateRequest(BaseModel):
 
 class HoldingSettingsUpdateRequest(BaseModel):
     total_assets: Optional[float] = Field(default=None, ge=0, description="账户总资产")
+
+
+class HoldingSaleRequest(BaseModel):
+    code: str
+    quantity: int = Field(..., gt=0)
+    sell_price: float = Field(..., gt=0)
+    market: Optional[str] = None
+    fee: float = Field(default=0.0, ge=0)
+    sold_at: Optional[str] = None
+
+
+class HoldingResearchRequest(BaseModel):
+    codes: List[str] = Field(..., min_length=1, max_length=8)
+
+
+class HoldingNoticeResearchRequest(HoldingResearchRequest):
+    lookback_days: int = Field(default=7, ge=1, le=90)
 
 
 PRICE_PLAN_FIELDS = {
@@ -251,6 +269,189 @@ async def _resolve_stock_name(code: str, market: str = "CN") -> str:
         if doc and doc.get("name"):
             return str(doc["name"])
     return code
+
+
+def _run_legacy_account_builder(
+    builder_name: str,
+    *,
+    user_id: str,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Run mature account builders inside the backend process only."""
+    from app.services import holdings_cli
+
+    builder = getattr(holdings_cli, builder_name)
+    return builder(
+        get_mongo_db_sync(),
+        user_id=user_id,
+        **kwargs,
+    )
+
+
+def _run_legacy_research_builder(
+    builder_name: str,
+    *,
+    codes: Optional[List[str]] = None,
+    lookback_days: int = 7,
+) -> Dict[str, Any]:
+    """Run public research builders in the Docker backend process."""
+    from app.services import holdings_cli
+
+    if builder_name == "market_status":
+        return holdings_cli.build_market_status_payload(
+            get_mongo_db_sync(),
+            database_status={"status": "connected"},
+            retry_public_timeout=True,
+        )
+
+    context = holdings_cli.build_opportunity_market_context()
+    if builder_name == "earnings":
+        return holdings_cli.build_public_candidate_earnings_payload(
+            codes,
+            context=context,
+        )
+    if builder_name == "notices":
+        return holdings_cli.build_public_candidate_notice_payload(
+            codes,
+            context=context,
+            lookback_calendar_days=lookback_days,
+        )
+    raise ValueError(f"unsupported holdings research builder: {builder_name}")
+
+
+def _research_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload.get("data") or {})
+    if isinstance(payload.get("meta"), dict):
+        data["meta"] = payload["meta"]
+    return ok(data)
+
+
+def _raise_research_http_error(exc: Exception) -> None:
+    from app.services.holdings_cli import CLIError
+
+    if not isinstance(exc, CLIError):
+        raise exc
+    detail: Dict[str, Any] = {
+        "code": exc.code,
+        "message": exc.message,
+    }
+    if exc.stage:
+        detail["stage"] = exc.stage
+    if exc.details:
+        detail["details"] = exc.details
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=detail,
+    ) from exc
+
+
+@router.get("/snapshot", response_model=dict)
+async def get_holdings_snapshot(
+    code: Optional[str] = None,
+    market: Optional[str] = None,
+    analysis: bool = True,
+    summary_only: bool = False,
+    current_user: dict = Depends(get_current_user),
+):
+    builder_name = "build_summary_payload" if summary_only else "build_holdings_payload"
+    kwargs = {} if summary_only else {
+        "code": code,
+        "market": market,
+        "include_analysis": analysis,
+    }
+    payload = await run_in_threadpool(
+        _run_legacy_account_builder,
+        builder_name,
+        user_id=current_user["id"],
+        **kwargs,
+    )
+    return ok(payload["data"])
+
+
+@router.get("/research/market-status", response_model=dict)
+async def get_holding_market_status(
+    _current_user: dict = Depends(get_current_user),
+):
+    try:
+        payload = await run_in_threadpool(
+            _run_legacy_research_builder,
+            "market_status",
+        )
+    except Exception as exc:
+        _raise_research_http_error(exc)
+    return _research_response(payload)
+
+
+@router.post("/research/earnings", response_model=dict)
+async def review_holding_earnings(
+    request: HoldingResearchRequest,
+    _current_user: dict = Depends(get_current_user),
+):
+    try:
+        payload = await run_in_threadpool(
+            _run_legacy_research_builder,
+            "earnings",
+            codes=request.codes,
+        )
+    except Exception as exc:
+        _raise_research_http_error(exc)
+    return _research_response(payload)
+
+
+@router.post("/research/notices", response_model=dict)
+async def review_holding_notices(
+    request: HoldingNoticeResearchRequest,
+    _current_user: dict = Depends(get_current_user),
+):
+    try:
+        payload = await run_in_threadpool(
+            _run_legacy_research_builder,
+            "notices",
+            codes=request.codes,
+            lookback_days=request.lookback_days,
+        )
+    except Exception as exc:
+        _raise_research_http_error(exc)
+    return _research_response(payload)
+
+
+@router.get("/trades", response_model=dict)
+async def list_holding_trades(
+    code: Optional[str] = None,
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+):
+    if not 1 <= limit <= 500:
+        raise HTTPException(status_code=400, detail="limit 必须在 1 到 500 之间")
+    payload = await run_in_threadpool(
+        _run_legacy_account_builder,
+        "build_trades_payload",
+        user_id=current_user["id"],
+        code=code,
+        limit=limit,
+    )
+    return ok(payload["data"])
+
+
+@router.post("/record-sale", response_model=dict)
+async def record_holding_sale(
+    request: HoldingSaleRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        payload = await run_in_threadpool(
+            _run_legacy_account_builder,
+            "build_record_sale_payload",
+            user_id=current_user["id"],
+            **request.model_dump(),
+        )
+    except Exception as exc:
+        from app.services.holdings_cli import CLIError
+
+        if isinstance(exc, CLIError):
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        raise
+    return ok(payload["data"], "卖出记录已保存")
 
 
 @router.get("/", response_model=dict)

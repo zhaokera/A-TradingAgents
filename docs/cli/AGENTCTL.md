@@ -91,6 +91,10 @@ agentctl --pretty decision performance
 立即执行首次硬风控校验；`decision validate` 使用最新时间敏感数据再次校验；
 `decision final` 并列返回研究包、软件基线、Codex 提案、校验与用户确认状态。
 
+`condition_order` 不是普通限价单。只有实时行情有效、券商能力已核实支持独立触发价和
+独立委托限价、且计划同时提供 `trigger_price` 与 `order_limit_price` 时才会出现。
+若界面只有一个“委托价”字段，不能使用该动作；研究触发价不得当作实际委托价。
+
 软件校验器只接受或拒绝提案，不会静默修改股票、数量、价格或操作方式。只有校验为
 `valid` 且未过期的提案才能由用户运行以下命令确认：
 

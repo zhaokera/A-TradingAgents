@@ -24,7 +24,7 @@
             </p>
           </div>
           <el-tag type="primary" effect="plain" class="objective-policy-tag">
-            单股硬上限 {{ aiCandidateRun?.objective?.portfolio.hard_single_symbol_cap_pct || 40 }}%
+            动态单股上限 {{ aiCandidateRun?.objective?.portfolio.hard_single_symbol_cap_pct || 40 }}%
           </el-tag>
         </div>
         <div class="ai-candidate-actions">
@@ -39,7 +39,11 @@
             @click="addAllAiCandidates"
           >
             <el-icon><Plus /></el-icon>
-            全部加入自选
+            加入可跟踪候选
+          </el-button>
+          <el-button v-if="aiCandidateRun" :loading="aiCandidateLoading" @click="refreshCandidateQuotes">
+            <el-icon><Refresh /></el-icon>
+            刷新行情
           </el-button>
           <el-button type="primary" :loading="aiCandidateLoading" @click="runAiCandidateResearch">
             <el-icon><Refresh /></el-icon>
@@ -58,12 +62,20 @@
           <strong>{{ formatCount(aiCandidateRun.discovery.eligible_count) }}</strong>
         </div>
         <div class="ai-summary-item">
-          <span>研究候选</span>
-          <strong>{{ aiCandidateRun.candidate_count }}</strong>
+          <span>价格已到</span>
+          <strong>{{ aiCandidateRun.actionability_counts?.ready_now || 0 }}</strong>
         </div>
         <div class="ai-summary-item">
-          <span>核心方向</span>
-          <strong>{{ aiCandidateRun.objective?.candidate_counts.core || 0 }}</strong>
+          <span>条件提醒</span>
+          <strong>{{ aiCandidateRun.actionability_counts?.condition_order || 0 }}</strong>
+        </div>
+        <div class="ai-summary-item">
+          <span>风险阻断</span>
+          <strong>{{ aiCandidateRun.actionability_counts?.blocked || 0 }}</strong>
+        </div>
+        <div class="ai-summary-item">
+          <span>可新增仓位</span>
+          <strong>{{ aiCandidateRun.objective?.portfolio.available_new_exposure_pct ?? '--' }}%</strong>
         </div>
         <div class="ai-summary-item ai-summary-time">
           <span>分析时间</span>
@@ -71,9 +83,43 @@
         </div>
       </div>
 
+      <div v-if="aiCandidateRun?.portfolio_plan" class="portfolio-budget-strip">
+        <div>
+          <span>组合新仓预算</span>
+          <strong>{{ formatMoney(aiCandidateRun.portfolio_plan.capital_budget) }}</strong>
+        </div>
+        <div>
+          <span>已分配</span>
+          <strong>{{ formatMoney(aiCandidateRun.portfolio_plan.allocated_amount) }}</strong>
+        </div>
+        <div>
+          <span>计划最大亏损</span>
+          <strong>{{ formatMoney(aiCandidateRun.portfolio_plan.total_planned_loss) }} · {{ aiCandidateRun.portfolio_plan.total_planned_loss_pct }}%</strong>
+        </div>
+        <div>
+          <span>国际风险</span>
+          <el-tag :type="getRegimeTagType(aiCandidateRun.market?.macro_risk?.regime)" effect="plain" size="small">
+            {{ getRegimeLabel(aiCandidateRun.market?.macro_risk?.regime) }}
+          </el-tag>
+        </div>
+      </div>
+
+      <div v-if="aiCandidateRun" class="candidate-status-filter">
+        <div class="candidate-filter-groups">
+          <el-radio-group v-model="aiStatusFilter" size="small">
+            <el-radio-button value="all">全部 {{ aiCandidateRun.candidate_count }}</el-radio-button>
+            <el-radio-button value="ready_now">价格已到</el-radio-button>
+            <el-radio-button value="condition_order">条件提醒</el-radio-button>
+            <el-radio-button value="blocked">风险阻断</el-radio-button>
+          </el-radio-group>
+          <el-segmented v-model="selectedHorizon" :options="horizonOptions" size="small" />
+        </div>
+        <span v-if="aiJobStatus" class="candidate-job-status">{{ aiJobStatus }}</span>
+      </div>
+
       <el-table
         v-if="aiCandidateRun && aiCandidateRun.candidates.length > 0"
-        :data="aiCandidateRun.candidates"
+        :data="displayedAiCandidates"
         class="ai-candidate-table"
         row-key="code"
       >
@@ -82,13 +128,22 @@
             <div class="candidate-stock">
               <el-link type="primary" @click="viewStockDetail(row)">{{ row.code }}</el-link>
               <strong>{{ row.name }}</strong>
-              <el-tag size="small" type="warning" effect="plain">{{ row.research_status_label }}</el-tag>
+              <el-tag size="small" :type="getActionabilityTagType(row.actionability)" effect="plain">
+                {{ row.actionability_label }}
+              </el-tag>
               <el-tag
                 size="small"
                 effect="plain"
                 :type="getObjectiveTagType(row.objective_tier)"
               >
                 {{ row.objective_tier_label || '待分类' }}<template v-if="row.objective_segment"> · {{ row.objective_segment }}</template>
+              </el-tag>
+              <el-tag
+                size="small"
+                effect="plain"
+                :type="getAllocationTagType(row.portfolio_allocation?.status)"
+              >
+                {{ getAllocationLabel(row.portfolio_allocation?.status) }}
               </el-tag>
             </div>
           </template>
@@ -100,16 +155,17 @@
               <span :class="getChangeClass(row.pct_change || 0)">
                 {{ formatCandidatePercent(row.pct_change) }}
               </span>
+              <small>{{ row.quote_source || '待确认' }} · {{ formatQuoteTime(row.trade_at) }}</small>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="参考入手" min-width="290">
+        <el-table-column :label="`${getHorizonLabel(selectedHorizon)}计划`" min-width="290">
           <template #default="{ row }">
             <div class="candidate-entry-plan">
               <div class="candidate-entry-heading">
                 <strong>
-                  {{ row.price_plan.entry_strategy_label }}
-                  {{ formatCandidatePrice(row.price_plan.entry_price) }}
+                  {{ getSelectedPlan(row).entry_strategy_label || getHorizonLabel(selectedHorizon) }}
+                  {{ formatCandidatePrice(getSelectedPlan(row).entry_price) }}
                 </strong>
                 <el-tag
                   size="small"
@@ -119,9 +175,18 @@
                   {{ row.price_plan.entry_status_label }}
                 </el-tag>
               </div>
-              <span>{{ row.price_plan.entry_guidance }}</span>
-              <small v-if="row.risk_flags.length > 0" class="candidate-entry-risk">
-                风险未解除：{{ row.risk_flags[0].message }}
+              <span>{{ getSelectedPlan(row).entry_guidance || getSelectedPlan(row).basis || row.price_plan.entry_guidance }}</span>
+              <el-tooltip
+                v-if="row.risk_flags.length > 0"
+                :content="row.risk_flags.map((item: any) => item.message).join('；')"
+                placement="top"
+              >
+                <small class="candidate-entry-risk">
+                  风险 {{ row.risk_flags.length }} 项：{{ row.risk_flags[0].message }}
+                </small>
+              </el-tooltip>
+              <small v-if="row.portfolio_gate?.blocked" class="candidate-entry-risk">
+                组合门禁：当前市场环境不开放新仓额度
               </small>
             </div>
           </template>
@@ -129,11 +194,17 @@
         <el-table-column label="保护与目标" min-width="210">
           <template #default="{ row }">
             <div class="candidate-price-plan">
-              <span v-if="row.price_plan.observation_zone">
-                <small>观察区</small>{{ formatObservationZone(row.price_plan.observation_zone) }}
+              <span v-if="getSelectedPlan(row).observation_zone">
+                <small>观察区</small>{{ formatObservationZone(getSelectedPlan(row).observation_zone) }}
               </span>
-              <span><small>失效价</small>{{ formatCandidatePrice(row.price_plan.stop_price) }}</span>
-              <span><small>目标价</small>{{ formatCandidatePrice(row.price_plan.target_price) }}</span>
+              <span><small>失效价</small>{{ formatCandidatePrice(getSelectedPlan(row).stop_price) }}</span>
+              <span><small>目标价</small>{{ formatCandidatePrice(getSelectedPlan(row).target_price) }}</span>
+              <span v-if="row.portfolio_allocation?.status === 'allocated'">
+                <small>组合分配</small>{{ row.portfolio_allocation.quantity }}股 · {{ row.portfolio_allocation.position_pct }}%
+              </span>
+              <span v-else>
+                <small>仓位</small>观察，不占组合预算
+              </span>
             </div>
           </template>
         </el-table-column>
@@ -141,7 +212,10 @@
           <template #default="{ row }">
             <div class="candidate-reason">
               <strong>{{ row.reason_summary }}</strong>
-              <span>{{ row.evidence.slice(0, 2).join(' · ') }}</span>
+              <span>{{ row.stock_profile?.industry || '行业待同步' }} · {{ row.stock_profile?.source || '主数据缺失' }}</span>
+              <el-tooltip v-if="row.stock_profile?.main_business" :content="row.stock_profile.main_business" placement="top">
+                <small>主营证据已获取</small>
+              </el-tooltip>
             </div>
           </template>
         </el-table-column>
@@ -153,6 +227,7 @@
               plain
               size="small"
               :loading="aiAddingCodes.has(row.code)"
+              :disabled="!row.can_add_to_favorites"
               @click="addAiCandidates([row.code])"
             >
               <el-icon><Plus /></el-icon>
@@ -542,6 +617,8 @@ import {
 import type { StockInfo } from '@/types/analysis'
 import {
   screeningApi,
+  type AICandidateActionability,
+  type AICandidateJob,
   type AICandidatePricePlan,
   type AICandidateRun,
   type AICandidateObjectiveTier,
@@ -562,6 +639,14 @@ const aiCandidateLoading = ref(false)
 const aiBatchAdding = ref(false)
 const aiCandidateRun = ref<AICandidateRun | null>(null)
 const aiAddingCodes = ref<Set<string>>(new Set())
+const aiStatusFilter = ref<'all' | AICandidateActionability>('all')
+const selectedHorizon = ref<'short' | 'swing' | 'position'>('short')
+const horizonOptions = [
+  { label: '短线', value: 'short' },
+  { label: '波段', value: 'swing' },
+  { label: '中长期', value: 'position' }
+]
+const aiJobStatus = ref('')
 
 // 路由 & 自选集
 const router = useRouter()
@@ -604,8 +689,17 @@ const paginatedResults = computed(() => {
 })
 
 const pendingAiCandidates = computed(() =>
-  aiCandidateRun.value?.candidates.filter(item => item.favorite_status !== 'in_favorites') || []
+  aiCandidateRun.value?.candidates.filter(
+    item => item.favorite_status !== 'in_favorites' && item.can_add_to_favorites
+  ) || []
 )
+
+const displayedAiCandidates = computed(() => {
+  const candidates = aiCandidateRun.value?.candidates || []
+  return aiStatusFilter.value === 'all'
+    ? candidates
+    : candidates.filter(item => item.actionability === aiStatusFilter.value)
+})
 
 const formatCount = (value?: number | null) => {
   if (value === null || value === undefined) return '-'
@@ -617,8 +711,33 @@ const formatAiRunTime = (value: string) => {
   return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString('zh-CN', { hour12: false })
 }
 
+const formatQuoteTime = (value?: string | null) => {
+  if (!value) return '时间缺失'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? '时间缺失'
+    : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
 const formatCandidatePrice = (value?: number | null) =>
   value === null || value === undefined ? '-' : `¥${Number(value).toFixed(2)}`
+
+const formatMoney = (value?: number | null) =>
+  value === null || value === undefined
+    ? '-'
+    : `¥${Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+
+const getSelectedPlan = (row: any) => row.plans?.[selectedHorizon.value] || row.price_plan || {}
+const getHorizonLabel = (value: string) => ({ short: '短线', swing: '波段', position: '中长期' }[value] || '短线')
+const getRegimeLabel = (value?: string) => ({ green: '低风险', yellow: '谨慎', red: '高风险' }[value || ''] || '待更新')
+const getRegimeTagType = (value?: string) => value === 'green' ? 'success' : value === 'red' ? 'danger' : 'warning'
+const getAllocationLabel = (value?: string) => ({
+  allocated: '组合已分配',
+  watch_only: '观察',
+  budget_exhausted: '预算已满',
+  market_blocked: '市场门禁'
+}[value || ''] || '待计算')
+const getAllocationTagType = (value?: string) => value === 'allocated' ? 'success' : value === 'market_blocked' ? 'danger' : 'info'
 
 const formatCandidatePercent = (value?: number | null) => {
   if (value === null || value === undefined) return '-'
@@ -637,26 +756,61 @@ const getEntryStatusTagType = (status: AICandidatePricePlan['entry_status']) => 
   return 'info'
 }
 
+const getActionabilityTagType = (status: AICandidateActionability) => {
+  if (status === 'ready_now') return 'success'
+  if (status === 'condition_order') return 'warning'
+  if (status === 'blocked' || status === 'invalidated') return 'danger'
+  return 'info'
+}
+
 const getObjectiveTagType = (tier?: AICandidateObjectiveTier) => {
   if (tier === 'core') return 'success'
   if (tier === 'related') return 'warning'
   return 'info'
 }
 
-const loadLatestAiCandidateRun = async () => {
+const loadLatestAiCandidateRun = async (refresh = true) => {
   try {
-    const response = await screeningApi.getLatestAiCandidates()
+    const response = await screeningApi.getLatestAiCandidates(refresh)
     aiCandidateRun.value = ((response as any)?.data || null) as AICandidateRun | null
   } catch (error) {
     console.warn('加载最近 AI 候选失败', error)
   }
 }
 
+const refreshCandidateQuotes = async () => {
+  aiCandidateLoading.value = true
+  try {
+    await loadLatestAiCandidateRun(true)
+    ElMessage.success('腾讯行情和候选状态已刷新')
+  } finally {
+    aiCandidateLoading.value = false
+  }
+}
+
+const waitForCandidateJob = async (job: AICandidateJob) => {
+  let current = job
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    if (current.status === 'completed') return current
+    if (current.status === 'failed') {
+      throw new Error(current.error?.message || 'AI 候选分析失败')
+    }
+    aiJobStatus.value = current.status === 'queued' ? '分析排队中' : '正在分析全市场'
+    await new Promise(resolve => window.setTimeout(resolve, 2000))
+    const response = await screeningApi.getAiCandidateJob(current.job_id)
+    current = ((response as any)?.data || response) as AICandidateJob
+  }
+  throw new Error('AI 候选分析超时，请在任务状态中稍后查看')
+}
+
 const runAiCandidateResearch = async () => {
   aiCandidateLoading.value = true
   try {
     const response = await screeningApi.runAiCandidates(5)
-    aiCandidateRun.value = ((response as any)?.data || response) as AICandidateRun
+    const job = ((response as any)?.data || response) as AICandidateJob
+    const completed = await waitForCandidateJob(job)
+    aiCandidateRun.value = completed.result || null
+    if (!aiCandidateRun.value) await loadLatestAiCandidateRun(true)
     const count = aiCandidateRun.value?.candidate_count || 0
     ElMessage.success(count > 0 ? `分析完成，生成 ${count} 只研究候选` : '分析完成，本轮没有合格候选')
   } catch (error: any) {
@@ -664,6 +818,7 @@ const runAiCandidateResearch = async () => {
     ElMessage.error(detail?.message || error?.message || 'AI 候选分析暂时不可用')
   } finally {
     aiCandidateLoading.value = false
+    aiJobStatus.value = ''
   }
 }
 
@@ -1167,7 +1322,7 @@ onMounted(() => {
 
   .ai-run-summary {
     display: grid;
-    grid-template-columns: repeat(4, minmax(110px, 1fr)) minmax(190px, 1.4fr);
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
     border-bottom: 1px solid var(--el-border-color-lighter);
     background: #f8fafc;
   }
@@ -1202,6 +1357,49 @@ onMounted(() => {
     width: 100%;
   }
 
+  .portfolio-budget-strip {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(140px, 1fr));
+    gap: 1px;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+    background: var(--el-border-color-lighter);
+
+    > div {
+      display: flex;
+      min-height: 58px;
+      justify-content: center;
+      flex-direction: column;
+      gap: 4px;
+      padding: 9px 18px;
+      background: var(--el-bg-color);
+    }
+
+    span { color: var(--el-text-color-secondary); font-size: 12px; }
+    strong { font-size: 15px; font-variant-numeric: tabular-nums; }
+  }
+
+  .candidate-status-filter {
+    display: flex;
+    min-height: 48px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 18px;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+  }
+
+  .candidate-job-status {
+    color: var(--el-color-primary);
+    font-size: 13px;
+  }
+
+  .candidate-filter-groups {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
   .candidate-stock,
   .candidate-quote,
   .candidate-reason {
@@ -1223,6 +1421,11 @@ onMounted(() => {
     color: var(--el-text-color-secondary);
     font-size: 12px;
     line-height: 1.5;
+  }
+
+  .candidate-quote small {
+    color: var(--el-text-color-secondary);
+    font-size: 11px;
   }
 
   .candidate-entry-plan {
@@ -1347,6 +1550,8 @@ onMounted(() => {
     .ai-run-summary {
       grid-template-columns: repeat(2, minmax(120px, 1fr));
     }
+
+    .portfolio-budget-strip { grid-template-columns: repeat(2, 1fr); }
 
     .ai-summary-item:nth-child(2) {
       border-right: 0;

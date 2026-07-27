@@ -5,11 +5,11 @@
       <div class="hero-content">
         <div class="hero-text">
           <h1 class="hero-title">
-            TradingAgents-CN
+            Agent管理平台
             <span class="version-badge">v1.0.1</span>
           </h1>
           <p class="hero-subtitle">
-            现代化的多智能体股票分析学习平台
+            AI 股票研究与资产管理平台
           </p>
           <p class="hero-description">
             基于先进的AI技术，为投资者提供专业、准确、及时的股票分析服务。
@@ -273,7 +273,7 @@
 
           <div class="origin-description">
             <p>
-              <strong>TradingAgents-CN</strong> 是基于 <strong>TradingAgents</strong> 项目开发的中文本地化版本。
+              <strong>A-TradingAgents</strong> 基于 <strong>TradingAgents</strong> 与 TradingAgents-CN 的既有实现持续开发。
               原项目由 Tauric Research 团队开发，是一个创新的多智能体股票分析框架。
             </p>
             <p>
@@ -422,7 +422,7 @@
     <!-- Footer -->
     <div class="footer-section">
       <div class="footer-content">
-        <p>&copy; 2025 TradingAgents-CN. All rights reserved.</p>
+        <p>&copy; 2025 A-TradingAgents. All rights reserved.</p>
         <p>许可证说明：开源组件遵循 Apache 2.0；前端与后端采用专有许可证（个人学习/研究免费，商业使用需授权）。</p>
       </div>
     </div>

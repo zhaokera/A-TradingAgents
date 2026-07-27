@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
 import re
 from copy import deepcopy
@@ -12,19 +14,74 @@ from bson import ObjectId
 from starlette.concurrency import run_in_threadpool
 
 from app.core.database import get_mongo_db
+from app.models.notification import NotificationCreate
+from app.services.candidate_research_pipeline import run_candidate_research
 from app.services.favorites_service import FavoritesService, favorites_service
-from app.services.holdings_cli import run_public_full_market_research
 from app.services.investment_policy import (
     INVESTMENT_OBJECTIVE,
+    allocate_candidate_portfolio,
+    build_dynamic_portfolio_policy,
+    calculate_candidate_position_sizing,
     classify_investment_objective,
     objective_tier_rank,
+)
+from app.services.global_macro_risk_service import GlobalMacroRiskService
+from app.services.stock_master_data_service import StockMasterDataService
+from app.services.a_share_calendar_service import AShareCalendarService
+from app.services.notifications_service import get_notifications_service
+from app.services.tencent_quote_service import (
+    TencentQuoteService,
+    get_tencent_quote_service,
 )
 
 
 AI_CANDIDATE_SOURCE = "ai_screening"
 AI_CANDIDATE_TAG = "AI候选"
-AI_CANDIDATE_RUN_TTL_DAYS = 14
+AI_CANDIDATE_RUN_TTL_DAYS = 90
+AI_CANDIDATE_JOB_TTL_DAYS = 7
 _A_SHARE_CODE = re.compile(r"^[0-9]{6}$")
+logger = logging.getLogger(__name__)
+
+_BLOCKING_RISK_SEVERITIES = {"error", "critical", "blocker", "blocked"}
+_BLOCKING_RISK_CODES = {
+    "quote_not_actionable",
+    "corporate_action",
+    "corporate_action_blocked",
+    "technical_deep_check_timeout",
+    "earnings_risk_blocked",
+    "notice_risk_blocked",
+    "suspended",
+    "delisted",
+}
+
+_ACTIONABILITY_LABELS = {
+    "ready_now": "价格条件已满足",
+    "condition_order": "可设置条件提醒",
+    "blocked": "风险阻断",
+    "invalidated": "计划失效",
+    "target_reached": "已达到目标价",
+    "expired": "需要重新分析",
+    "quote_unavailable": "行情待刷新",
+    "incomplete": "价格计划不完整",
+}
+
+_ACTIONABILITY_ORDER = {
+    "ready_now": 0,
+    "condition_order": 1,
+    "blocked": 2,
+    "quote_unavailable": 3,
+    "incomplete": 4,
+    "target_reached": 5,
+    "expired": 6,
+    "invalidated": 7,
+}
+
+_ALLOCATION_ORDER = {
+    "allocated": 0,
+    "watch_only": 1,
+    "budget_exhausted": 2,
+    "market_blocked": 3,
+}
 
 _ENTRY_STRATEGY_LABELS = {
     "pullback": "回落参考",
@@ -118,14 +175,133 @@ def _normalize_risk_flags(value: Any) -> List[Dict[str, str]]:
             continue
         code = str(raw.get("code") or raw.get("key") or "risk_flag").strip()
         message = str(raw.get("message") or raw.get("reason") or code).strip()
+        if code == "quote_not_actionable":
+            message = (
+                "腾讯成交时间未通过当前时效门禁；可保留条件价和组合预算，"
+                "但触发时必须刷新行情后再判定是否可执行。"
+            )
         flags.append(
             {
                 "code": code[:80],
-                "severity": str(raw.get("severity") or "warning")[:20],
+                "severity": str(
+                    raw.get("severity") or raw.get("level") or "warning"
+                ).lower()[:20],
                 "message": message[:240],
             }
         )
     return flags
+
+
+def _is_blocking_risk_flag(flag: Mapping[str, Any]) -> bool:
+    return (
+        str(flag.get("severity") or "").lower() in _BLOCKING_RISK_SEVERITIES
+        or str(flag.get("code") or "") in _BLOCKING_RISK_CODES
+    )
+
+
+def _derive_actionability(
+    price_plan: Mapping[str, Any],
+    *,
+    performance: Optional[Mapping[str, Any]] = None,
+) -> str:
+    if performance and performance.get("target_hit_at"):
+        return "target_reached"
+    entry_status = str(price_plan.get("entry_status") or "plan_unavailable")
+    if entry_status == "price_ready":
+        return "ready_now"
+    if entry_status in {"waiting_pullback", "waiting_breakout"}:
+        return "condition_order"
+    if entry_status == "price_ready_risk_blocked":
+        return "blocked"
+    if entry_status == "invalidated":
+        return "invalidated"
+    if entry_status == "quote_unavailable":
+        return "quote_unavailable"
+    return "incomplete"
+
+
+def _apply_candidate_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    performance = (
+        candidate.get("performance")
+        if isinstance(candidate.get("performance"), Mapping)
+        else None
+    )
+    actionability = _derive_actionability(
+        candidate.get("price_plan") or {},
+        performance=performance,
+    )
+    portfolio_gate = (
+        candidate.get("portfolio_gate")
+        if isinstance(candidate.get("portfolio_gate"), Mapping)
+        else {}
+    )
+    if portfolio_gate.get("blocked") and actionability in {
+        "ready_now",
+        "condition_order",
+    }:
+        actionability = "blocked"
+    elif candidate.get("plan_expired") is True and actionability not in {
+        "target_reached",
+        "invalidated",
+    }:
+        actionability = "expired"
+    candidate["actionability"] = actionability
+    candidate["actionability_label"] = _ACTIONABILITY_LABELS[actionability]
+    candidate["research_status"] = actionability
+    candidate["research_status_label"] = _ACTIONABILITY_LABELS[actionability]
+    candidate["can_add_to_favorites"] = actionability in {
+        "ready_now",
+        "condition_order",
+    }
+    candidate["condition_order_ready"] = actionability == "condition_order"
+    return candidate
+
+
+def _candidate_rank_score(candidate: Mapping[str, Any]) -> float:
+    objective_score = float(candidate.get("objective_match_score") or 0) * 40
+    actionability_score = {
+        "ready_now": 40,
+        "condition_order": 30,
+        "blocked": 5,
+        "quote_unavailable": 2,
+        "incomplete": 0,
+        "target_reached": -5,
+        "expired": -8,
+        "invalidated": -10,
+    }.get(str(candidate.get("actionability") or ""), 0)
+    plan = candidate.get("price_plan") if isinstance(candidate.get("price_plan"), Mapping) else {}
+    entry = _finite_number(plan.get("entry_price"))
+    stop = _finite_number(plan.get("stop_price"))
+    target = _finite_number(plan.get("target_price"))
+    reward_risk_score = 0.0
+    if entry and stop is not None and target is not None and stop < entry < target:
+        ratio = (target - entry) / (entry - stop)
+        reward_risk_score = min(20.0, max(0.0, ratio * 8))
+    priority = int(candidate.get("priority") or 999)
+    profile = candidate.get("stock_profile")
+    profile_confidence = (
+        str(profile.get("confidence") or "missing")
+        if isinstance(profile, Mapping)
+        else "missing"
+    )
+    evidence_score = {"high": 8, "medium": 5, "low": 1, "missing": -6}.get(
+        profile_confidence, -6
+    )
+    sizing = candidate.get("position_sizing")
+    executable_score = (
+        8
+        if isinstance(sizing, Mapping) and sizing.get("status") == "sized"
+        else -5
+    )
+    return round(
+        objective_score
+        + actionability_score
+        + reward_risk_score
+        + evidence_score
+        + executable_score
+        - min(priority, 50) * 0.1,
+        2,
+    )
 
 
 def _infer_entry_strategy(
@@ -196,7 +372,8 @@ def _build_candidate_price_plan(
         and stop_price < entry_price < target_price
     )
     plan_available = plan_status == "ok" and complete_price_order
-    risk_blocked = bool(risk_flags)
+    blocking_risk_flags = [flag for flag in risk_flags if _is_blocking_risk_flag(flag)]
+    risk_blocked = bool(blocking_risk_flags)
     price_condition_met = False
 
     if not plan_available:
@@ -272,10 +449,63 @@ def _build_candidate_price_plan(
         "distance_to_entry_pct": distance_to_entry_pct,
         "price_condition_met": price_condition_met,
         "risk_blocked": risk_blocked,
+        "blocking_risk_count": len(blocking_risk_flags),
         "entry_status": entry_status,
         "entry_status_label": _ENTRY_STATUS_LABELS[entry_status],
         "entry_guidance": guidance,
         "status": plan_status,
+    }
+
+
+def _build_horizon_plans(price_plan: Mapping[str, Any]) -> Dict[str, Any]:
+    """Derive explicit short, swing and position plans from one validated plan."""
+
+    entry = _finite_number(price_plan.get("entry_price"))
+    stop = _finite_number(price_plan.get("stop_price"))
+    target = _finite_number(price_plan.get("target_price"))
+    short = deepcopy(dict(price_plan))
+    short.update(horizon="short", horizon_label="短线", validity="2-3个交易日")
+    if entry is None or stop is None or target is None or not stop < entry < target:
+        unavailable = {
+            "status": "unavailable",
+            "entry_price": entry,
+            "stop_price": stop,
+            "target_price": target,
+        }
+        return {
+            "short": short,
+            "swing": {**unavailable, "horizon": "swing", "horizon_label": "波段", "validity": "2-6周"},
+            "position": {**unavailable, "horizon": "position", "horizon_label": "中长期", "validity": "3-12个月"},
+        }
+    risk = entry - stop
+    swing_stop = round(max(0.01, entry - risk * 1.6), 2)
+    swing_target = round(max(target, entry + risk * 2.8), 2)
+    position_stop = round(max(0.01, entry - risk * 2.5), 2)
+    position_target = round(max(swing_target, entry + risk * 5.0), 2)
+    return {
+        "short": short,
+        "swing": {
+            "status": "reference",
+            "horizon": "swing",
+            "horizon_label": "波段",
+            "validity": "2-6周",
+            "entry_price": entry,
+            "stop_price": swing_stop,
+            "target_price": swing_target,
+            "reward_risk_ratio": round((swing_target - entry) / (entry - swing_stop), 2),
+            "basis": "短线技术计划按1.6倍风险距离放宽止损、2.8R设置目标。",
+        },
+        "position": {
+            "status": "research_required",
+            "horizon": "position",
+            "horizon_label": "中长期",
+            "validity": "3-12个月",
+            "entry_price": entry,
+            "stop_price": position_stop,
+            "target_price": position_target,
+            "reward_risk_ratio": round((position_target - entry) / (entry - position_stop), 2),
+            "basis": "价格仅作估值研究锚点，需结合主营、景气和财报继续验证。",
+        },
     }
 
 
@@ -299,9 +529,15 @@ def _enrich_saved_candidate(value: Any) -> Any:
     )
     risk_flags = _normalize_risk_flags(candidate.get("risk_flags"))
     candidate["risk_flags"] = risk_flags
+    rebuild_plan = dict(saved_plan)
+    if not rebuild_plan.get("status") and all(
+        _finite_number(rebuild_plan.get(key)) is not None
+        for key in ("entry_price", "stop_price", "target_price")
+    ):
+        rebuild_plan["status"] = "ok"
     candidate["price_plan"] = _build_candidate_price_plan(
         reference_price=_finite_number(candidate.get("reference_price")),
-        plan=saved_plan,
+        plan=rebuild_plan,
         triggers={
             "breakout_price": saved_plan.get("breakout_price"),
             "invalidation_price": saved_plan.get("stop_price"),
@@ -309,6 +545,9 @@ def _enrich_saved_candidate(value: Any) -> Any:
         observation_zone=observation_zone,
         risk_flags=risk_flags,
     )
+    candidate["plans"] = _build_horizon_plans(candidate["price_plan"])
+    _apply_candidate_state(candidate)
+    candidate["rank_score"] = _candidate_rank_score(candidate)
     return candidate
 
 
@@ -354,18 +593,18 @@ def normalize_ai_candidate(
             key: candidate.get(key, value)
             for key, value in objective.items()
         }
-    return {
+    normalized = {
         "code": code,
         "name": str(candidate.get("name") or code).strip()[:80],
         "market": "A股",
         "priority": int(candidate.get("priority") or 999),
-        "research_status": "observe",
-        "research_status_label": "研究候选",
         **objective,
         "reference_price": reference_price,
+        "initial_reference_price": reference_price,
         "pct_change": _finite_number(quote.get("pct_change"), tencent.get("pct_change")),
         "trade_at": quote.get("trade_at"),
         "price_plan": price_plan,
+        "plans": _build_horizon_plans(price_plan),
         "reason_summary": _candidate_reason(candidate),
         "evidence": _candidate_evidence(candidate, context),
         "risk_flags": risk_flags,
@@ -373,6 +612,9 @@ def normalize_ai_candidate(
         "source": "public_full_market",
         "is_reference_only": True,
     }
+    _apply_candidate_state(normalized)
+    normalized["rank_score"] = _candidate_rank_score(normalized)
+    return normalized
 
 
 def normalize_ai_candidate_run(
@@ -395,7 +637,9 @@ def normalize_ai_candidate_run(
     ]
     candidates.sort(
         key=lambda item: (
+            _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
             objective_tier_rank(item.get("objective_tier")),
+            -float(item.get("rank_score") or 0),
             item["priority"],
             item["code"],
         )
@@ -416,10 +660,25 @@ def normalize_ai_candidate_run(
         if isinstance(market_status.get("market_session"), Mapping)
         else {}
     )
+    market_decision = (
+        market_status.get("decision")
+        if isinstance(market_status.get("decision"), Mapping)
+        else {}
+    )
+    if market_decision.get("action") == "evaluate_candidates":
+        market_regime = "green"
+    elif market_decision.get("reason_code") == "breadth_confirmation_required":
+        market_regime = "yellow"
+    else:
+        market_regime = "red"
     meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
     objective_counts = {
         tier: sum(item.get("objective_tier") == tier for item in candidates)
         for tier in ("core", "related", "non_core")
+    }
+    actionability_counts = {
+        status: sum(item.get("actionability") == status for item in candidates)
+        for status in _ACTIONABILITY_LABELS
     }
     return {
         "status": "completed",
@@ -427,6 +686,7 @@ def normalize_ai_candidate_run(
         "source_detail": meta.get("source"),
         "candidate_count": len(candidates),
         "candidates": candidates,
+        "actionability_counts": actionability_counts,
         "objective": {
             "id": INVESTMENT_OBJECTIVE["id"],
             "label": INVESTMENT_OBJECTIVE["label"],
@@ -447,6 +707,9 @@ def normalize_ai_candidate_run(
             "session": market_session.get("session"),
             "is_trading_hours": market_session.get("is_trading_hours"),
             "local_time": market_session.get("local_time"),
+            "regime": market_regime,
+            "decision": market_decision.get("action"),
+            "reason_code": market_decision.get("reason_code"),
         },
         "context": {
             "horizon": context.get("horizon") or "未来两个交易日",
@@ -463,12 +726,21 @@ class AICandidateService:
     def __init__(
         self,
         *,
-        research_runner: Callable[[], Dict[str, Any]] = run_public_full_market_research,
+        research_runner: Callable[[], Dict[str, Any]] = run_candidate_research,
         favorites: FavoritesService = favorites_service,
+        quotes: Optional[TencentQuoteService] = None,
+        stock_master: Any = None,
+        macro_risk: Any = None,
+        trading_calendar: Any = None,
     ) -> None:
         self._research_runner = research_runner
         self._favorites = favorites
+        self._quotes = quotes or get_tencent_quote_service()
+        self._stock_master = stock_master or StockMasterDataService()
+        self._macro_risk = macro_risk or GlobalMacroRiskService()
+        self._trading_calendar = trading_calendar or AShareCalendarService()
         self.db = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     async def _get_db(self):
         if self.db is None:
@@ -484,7 +756,7 @@ class AICandidateService:
             result["candidates"] = [
                 _enrich_saved_candidate(candidate) for candidate in candidates
             ]
-        for field in ("generated_at", "expires_at", "updated_at"):
+        for field in ("generated_at", "plan_expires_at", "expires_at", "updated_at"):
             value = result.get(field)
             if isinstance(value, datetime):
                 if value.tzinfo is None:
@@ -492,12 +764,576 @@ class AICandidateService:
                 result[field] = value.isoformat()
         return result
 
+    @staticmethod
+    def _serialize_job(document: Mapping[str, Any]) -> Dict[str, Any]:
+        result = deepcopy(dict(document))
+        result["job_id"] = str(result.pop("_id"))
+        for field in ("created_at", "started_at", "completed_at", "expires_at"):
+            value = result.get(field)
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                result[field] = value.isoformat()
+        return result
+
+    @staticmethod
+    def _update_performance(
+        candidate: Dict[str, Any],
+        *,
+        current_price: Optional[float],
+        checked_at: str,
+        observation_key: str,
+        session_high: Optional[float] = None,
+        session_low: Optional[float] = None,
+        benchmark_price: Optional[float] = None,
+    ) -> None:
+        if current_price is None or current_price <= 0:
+            return
+        performance = deepcopy(
+            candidate.get("performance")
+            if isinstance(candidate.get("performance"), Mapping)
+            else {}
+        )
+        baseline = _finite_number(
+            performance.get("baseline_price"),
+            candidate.get("initial_reference_price"),
+            candidate.get("reference_price"),
+        )
+        performance["baseline_price"] = baseline
+        performance["latest_price"] = current_price
+        performance["last_checked_at"] = checked_at
+        is_new_observation = performance.get("last_observation_key") != observation_key
+        if is_new_observation:
+            performance["observation_count"] = int(
+                performance.get("observation_count") or 0
+            ) + 1
+            performance["last_observation_key"] = observation_key
+        if baseline and baseline > 0:
+            current_return = round((current_price - baseline) / baseline * 100, 2)
+            performance["return_since_generated_pct"] = current_return
+            performance["max_return_pct"] = max(
+                current_return,
+                float(performance.get("max_return_pct") or current_return),
+            )
+            performance["min_return_pct"] = min(
+                current_return,
+                float(performance.get("min_return_pct") or current_return),
+            )
+        plan = candidate.get("price_plan") if isinstance(candidate.get("price_plan"), Mapping) else {}
+        target = _finite_number(plan.get("target_price"))
+        stop = _finite_number(plan.get("stop_price"))
+        if target is not None and current_price >= target:
+            performance.setdefault("target_hit_at", checked_at)
+        if stop is not None and current_price <= stop:
+            performance.setdefault("stop_hit_at", checked_at)
+        shadow = deepcopy(
+            performance.get("shadow_trade")
+            if isinstance(performance.get("shadow_trade"), Mapping)
+            else {}
+        )
+        status = str(shadow.get("status") or "waiting_entry")
+        shadow.setdefault("status", status)
+        entry = _finite_number(plan.get("entry_price"))
+        strategy = str(plan.get("entry_strategy") or "pullback")
+        allocation = candidate.get("portfolio_allocation")
+        allocation = allocation if isinstance(allocation, Mapping) else {}
+        quantity = int(allocation.get("quantity") or 0)
+        low = session_low if session_low is not None else current_price
+        high = session_high if session_high is not None else current_price
+        entry_triggered = bool(
+            entry
+            and quantity > 0
+            and (
+                (strategy == "breakout" and high is not None and high >= entry)
+                or (strategy != "breakout" and low is not None and low <= entry)
+            )
+        )
+        if status == "waiting_entry" and entry_triggered and entry is not None:
+            buy_fee = max(5.0, entry * quantity * 0.0003)
+            shadow.update(
+                status="active",
+                entry_triggered_at=checked_at,
+                entry_price=entry,
+                quantity=quantity,
+                invested_amount=round(entry * quantity + buy_fee, 2),
+                buy_fee=round(buy_fee, 2),
+                max_return_pct=0.0,
+                min_return_pct=0.0,
+                benchmark_entry_price=benchmark_price,
+            )
+            status = "active"
+        if status == "active":
+            actual_entry = _finite_number(shadow.get("entry_price"))
+            actual_quantity = int(shadow.get("quantity") or 0)
+            if actual_entry and actual_quantity > 0:
+                exit_price = current_price
+                exit_reason = None
+                if stop is not None and low is not None and low <= stop:
+                    exit_price, exit_reason = stop, "stop"
+                elif target is not None and high is not None and high >= target:
+                    exit_price, exit_reason = target, "target"
+                gross_return = (current_price - actual_entry) / actual_entry * 100
+                shadow["latest_price"] = current_price
+                shadow["return_pct"] = round(gross_return, 2)
+                shadow["max_return_pct"] = max(
+                    float(shadow.get("max_return_pct") or gross_return), gross_return
+                )
+                shadow["min_return_pct"] = min(
+                    float(shadow.get("min_return_pct") or gross_return), gross_return
+                )
+                benchmark_entry = _finite_number(shadow.get("benchmark_entry_price"))
+                if benchmark_entry and benchmark_price:
+                    benchmark_return = (
+                        benchmark_price - benchmark_entry
+                    ) / benchmark_entry * 100
+                    shadow["benchmark_latest_price"] = benchmark_price
+                    shadow["benchmark_return_pct"] = round(benchmark_return, 2)
+                    shadow["alpha_pct"] = round(gross_return - benchmark_return, 2)
+                if exit_reason and exit_price is not None:
+                    gross_proceeds = exit_price * actual_quantity
+                    sell_fee = max(5.0, gross_proceeds * 0.0003)
+                    stamp_duty = gross_proceeds * 0.0005
+                    net_pnl = (
+                        gross_proceeds
+                        - sell_fee
+                        - stamp_duty
+                        - float(shadow.get("invested_amount") or actual_entry * actual_quantity)
+                    )
+                    shadow.update(
+                        status=f"closed_{exit_reason}",
+                        closed_at=checked_at,
+                        exit_price=round(exit_price, 4),
+                        exit_reason=exit_reason,
+                        sell_fee=round(sell_fee, 2),
+                        stamp_duty=round(stamp_duty, 2),
+                        net_pnl=round(net_pnl, 2),
+                        net_return_pct=round(
+                            net_pnl / float(shadow["invested_amount"]) * 100, 2
+                        ),
+                    )
+        performance["shadow_trade"] = shadow
+        candidate["performance"] = performance
+
+    async def _account_context(self, user_id: str) -> Dict[str, Any]:
+        db = await self._get_db()
+        try:
+            settings_doc = await db["user_holding_settings"].find_one(
+                {"user_id": str(user_id)}
+            )
+            cursor = db["user_holdings"].find(
+                {"user_id": str(user_id)},
+                {"code": 1, "quantity": 1, "cost_price": 1, "_id": 0},
+            )
+            holdings = await cursor.to_list(length=None)
+        except Exception:
+            settings_doc = None
+            holdings = []
+        holding_values: Dict[str, float] = {}
+        total_holding_cost = 0.0
+        for holding in holdings or []:
+            try:
+                value = max(0.0, float(holding.get("quantity") or 0)) * max(
+                    0.0, float(holding.get("cost_price") or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+            code = str(holding.get("code") or "").strip()
+            if code:
+                holding_values[code] = holding_values.get(code, 0.0) + value
+            total_holding_cost += value
+        try:
+            total_assets = float((settings_doc or {}).get("total_assets") or 0)
+        except (TypeError, ValueError):
+            total_assets = 0.0
+        if total_assets <= 0:
+            total_assets = total_holding_cost
+        available_cash = max(0.0, total_assets - total_holding_cost)
+        exposure_pct = (
+            total_holding_cost / total_assets * 100 if total_assets > 0 else 0.0
+        )
+        return {
+            "total_assets": round(total_assets, 2),
+            "available_cash": round(available_cash, 2),
+            "current_exposure_pct": round(exposure_pct, 2),
+            "holding_values": holding_values,
+        }
+
+    async def _apply_objective_profiles(self, document: Dict[str, Any]) -> None:
+        candidates = [
+            item for item in document.get("candidates", []) if isinstance(item, dict)
+        ]
+        codes = [str(item.get("code") or "") for item in candidates if item.get("code")]
+        try:
+            db = await self._get_db()
+            if getattr(self._stock_master, "db", None) is None:
+                self._stock_master.db = db
+            profiles = await self._stock_master.resolve_many(codes)
+        except Exception:
+            logger.exception("Failed to resolve authoritative stock profiles")
+            profiles = {}
+        for candidate in candidates:
+            code = str(candidate.get("code") or "")
+            stock_profile = profiles.get(code) or {
+                "code": code,
+                "status": "missing",
+                "confidence": "missing",
+                "industry": None,
+                "main_business": None,
+                "source": None,
+                "evidence": [],
+            }
+            profile = classify_investment_objective(
+                code,
+                candidate.get("name"),
+                industry=stock_profile.get("industry"),
+            )
+            candidate.update(profile)
+            candidate["stock_profile"] = stock_profile
+            if stock_profile.get("industry"):
+                candidate["industry"] = stock_profile["industry"]
+            candidate["rank_score"] = _candidate_rank_score(candidate)
+        objective = document.setdefault("objective", {})
+        objective["candidate_counts"] = {
+            tier: sum(item.get("objective_tier") == tier for item in candidates)
+            for tier in ("core", "related", "non_core")
+        }
+
+    async def _apply_macro_policy(self, document: Dict[str, Any]) -> None:
+        market = document.setdefault("market", {})
+        domestic_regime = str(market.get("domestic_regime") or market.get("regime") or "yellow")
+        market["domestic_regime"] = domestic_regime
+        try:
+            db = await self._get_db()
+            if getattr(self._macro_risk, "db", None) is None:
+                self._macro_risk.db = db
+            macro = await self._macro_risk.get_current()
+        except Exception as exc:
+            logger.warning("Global macro risk unavailable: %s", exc)
+            macro = {
+                "status": "unavailable",
+                "regime": "yellow",
+                "score": None,
+                "factors": [],
+                "reason": str(exc)[:240],
+            }
+        macro_regime = str(macro.get("regime") or "yellow")
+        regime_rank = {"green": 0, "yellow": 1, "red": 2}
+        combined = max(
+            (domestic_regime, macro_regime),
+            key=lambda value: regime_rank.get(value, 1),
+        )
+        market["regime"] = combined
+        market["macro_risk"] = macro
+        market["regime_reason"] = (
+            "global_macro_downgrade"
+            if regime_rank.get(macro_regime, 1) > regime_rank.get(domestic_regime, 1)
+            else "domestic_market_regime"
+        )
+
+    async def _apply_account_policy(
+        self,
+        document: Dict[str, Any],
+        *,
+        user_id: str,
+    ) -> None:
+        account = await self._account_context(user_id)
+        market = document.get("market") if isinstance(document.get("market"), Mapping) else {}
+        policy = build_dynamic_portfolio_policy(
+            total_assets=account["total_assets"],
+            current_exposure_pct=account["current_exposure_pct"],
+            market_regime=str(market.get("regime") or "yellow"),
+        )
+        objective = document.setdefault("objective", {})
+        objective["portfolio"] = policy
+        document["account"] = {
+            key: value for key, value in account.items() if key != "holding_values"
+        }
+        market_blocked = float(policy.get("available_new_exposure_pct") or 0) <= 0
+        for candidate in document.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            plan = candidate.get("price_plan") if isinstance(candidate.get("price_plan"), Mapping) else {}
+            candidate["position_sizing"] = calculate_candidate_position_sizing(
+                entry_price=plan.get("entry_price"),
+                stop_price=plan.get("stop_price"),
+                total_assets=account["total_assets"],
+                available_cash=account["available_cash"],
+                current_symbol_value=account["holding_values"].get(
+                    str(candidate.get("code") or ""), 0.0
+                ),
+                policy=policy,
+            )
+            candidate["portfolio_gate"] = {
+                "blocked": market_blocked,
+                "reason_code": (
+                    "market_regime_new_exposure_blocked"
+                    if market_blocked
+                    else "new_exposure_available"
+                ),
+                "market_regime": policy.get("market_regime"),
+                "available_new_exposure_pct": policy.get(
+                    "available_new_exposure_pct"
+                ),
+            }
+            _apply_candidate_state(candidate)
+            candidate["rank_score"] = _candidate_rank_score(candidate)
+        candidates = [
+            candidate
+            for candidate in document.get("candidates", [])
+            if isinstance(candidate, dict)
+        ]
+        candidates.sort(
+            key=lambda item: (
+                _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
+                objective_tier_rank(item.get("objective_tier")),
+                -float(item.get("rank_score") or 0),
+            )
+        )
+        portfolio_plan = allocate_candidate_portfolio(
+            candidates,
+            total_assets=account["total_assets"],
+            available_cash=account["available_cash"],
+            policy=policy,
+        )
+        allocation_by_code = {
+            str(item.get("code") or ""): item
+            for item in portfolio_plan.get("allocations", [])
+        }
+        for candidate in candidates:
+            candidate["portfolio_allocation"] = allocation_by_code.get(
+                str(candidate.get("code") or ""), {}
+            )
+        candidates.sort(
+            key=lambda item: (
+                _ALLOCATION_ORDER.get(
+                    str((item.get("portfolio_allocation") or {}).get("status")), 9
+                ),
+                _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
+                objective_tier_rank(item.get("objective_tier")),
+                -float(item.get("rank_score") or 0),
+            )
+        )
+        document["candidates"] = candidates
+        document["portfolio_plan"] = portfolio_plan
+
+    @staticmethod
+    def _update_run_counts(document: Dict[str, Any]) -> None:
+        candidates = [
+            item for item in document.get("candidates", []) if isinstance(item, Mapping)
+        ]
+        document["actionability_counts"] = {
+            status: sum(item.get("actionability") == status for item in candidates)
+            for status in _ACTIONABILITY_LABELS
+        }
+        document["candidate_count"] = len(candidates)
+
+    async def _publish_transition(
+        self,
+        *,
+        user_id: str,
+        candidate: Dict[str, Any],
+        previous_actionability: Optional[str],
+    ) -> None:
+        current = str(candidate.get("actionability") or "")
+        if current == previous_actionability or current not in {
+            "ready_now",
+            "invalidated",
+            "target_reached",
+        }:
+            return
+        notified_events = list(candidate.get("notified_events") or [])
+        event_key = f"{current}:{candidate.get('trade_at') or candidate.get('quote_checked_at')}"
+        if event_key in notified_events:
+            return
+        try:
+            await get_notifications_service().create_and_publish(
+                NotificationCreate(
+                    user_id=str(user_id),
+                    type="alert",
+                    title=f"{candidate.get('name') or candidate.get('code')}：{_ACTIONABILITY_LABELS[current]}",
+                    content=str(
+                        (candidate.get("price_plan") or {}).get("entry_guidance")
+                        or candidate.get("reason_summary")
+                        or "候选状态发生变化。"
+                    ),
+                    link="/screening",
+                    source="ai_candidate_tracking",
+                    severity="warning" if current == "invalidated" else "success",
+                    metadata={
+                        "code": candidate.get("code"),
+                        "actionability": current,
+                    },
+                )
+            )
+            candidate["notified_events"] = [*notified_events[-9:], event_key]
+        except Exception as exc:
+            logger.warning("AI candidate notification failed: %s", exc)
+
+    async def _refresh_document(
+        self,
+        document: Dict[str, Any],
+        *,
+        user_id: str,
+        persist: bool = True,
+        notify: bool = True,
+    ) -> Dict[str, Any]:
+        candidates = [
+            item for item in document.get("candidates", []) if isinstance(item, dict)
+        ]
+        codes = [str(item.get("code") or "") for item in candidates if item.get("code")]
+        quote_map = await self._quotes.get_quotes([*codes, "sh000300"]) if codes else {}
+        benchmark_quote = quote_map.pop("000300", {})
+        benchmark_price = _finite_number(
+            benchmark_quote.get("price") if isinstance(benchmark_quote, Mapping) else None,
+            benchmark_quote.get("close") if isinstance(benchmark_quote, Mapping) else None,
+        )
+        if benchmark_price is not None:
+            benchmark = document.setdefault("benchmark", {})
+            benchmark.setdefault("baseline_price", benchmark_price)
+            benchmark["latest_price"] = benchmark_price
+            benchmark["code"] = "000300"
+            benchmark["name"] = "沪深300"
+            benchmark["return_since_generated_pct"] = round(
+                (benchmark_price - float(benchmark["baseline_price"]))
+                / float(benchmark["baseline_price"])
+                * 100,
+                2,
+            )
+            benchmark["checked_at"] = datetime.now(timezone.utc).isoformat()
+        favorite_codes = await self._favorites.get_favorite_codes(user_id)
+        checked_at = datetime.now(timezone.utc).isoformat()
+        plan_expires_at = document.get("plan_expires_at")
+        if isinstance(plan_expires_at, datetime):
+            if plan_expires_at.tzinfo is None:
+                plan_expires_at = plan_expires_at.replace(tzinfo=timezone.utc)
+            plan_expired = datetime.now(timezone.utc) >= plan_expires_at
+        else:
+            plan_expired = False
+        for candidate in candidates:
+            enriched_before = _enrich_saved_candidate(candidate)
+            previous_actionability = str(
+                enriched_before.get("actionability") or ""
+            ) if isinstance(enriched_before, Mapping) else None
+            quote = quote_map.get(str(candidate.get("code") or ""), {})
+            current_price = _finite_number(
+                quote.get("price") if isinstance(quote, Mapping) else None,
+                quote.get("close") if isinstance(quote, Mapping) else None,
+                quote.get("current_price") if isinstance(quote, Mapping) else None,
+            )
+            if current_price is not None:
+                candidate.setdefault(
+                    "initial_reference_price", candidate.get("reference_price")
+                )
+                candidate["reference_price"] = current_price
+                candidate["pct_change"] = _finite_number(quote.get("pct_chg"))
+                candidate["trade_at"] = quote.get("trade_at")
+                candidate["quote_source"] = str(
+                    quote.get("source") or quote.get("data_source") or "unknown"
+                )
+                candidate["quote_checked_at"] = checked_at
+            refreshed = _enrich_saved_candidate(candidate)
+            if isinstance(refreshed, dict):
+                candidate.clear()
+                candidate.update(refreshed)
+            candidate["plan_expired"] = plan_expired
+            self._update_performance(
+                candidate,
+                current_price=current_price,
+                checked_at=checked_at,
+                observation_key=str(
+                    (quote.get("trade_at") if isinstance(quote, Mapping) else None)
+                    or checked_at
+                ),
+                session_high=_finite_number(
+                    quote.get("high") if isinstance(quote, Mapping) else None
+                ),
+                session_low=_finite_number(
+                    quote.get("low") if isinstance(quote, Mapping) else None
+                ),
+                benchmark_price=benchmark_price,
+            )
+            if plan_expired:
+                performance = candidate.get("performance")
+                if isinstance(performance, dict):
+                    shadow = performance.get("shadow_trade")
+                    if isinstance(shadow, dict) and shadow.get("status") == "waiting_entry":
+                        shadow["status"] = "expired_untriggered"
+                        shadow["expired_at"] = checked_at
+            _apply_candidate_state(candidate)
+            candidate["rank_score"] = _candidate_rank_score(candidate)
+            candidate["favorite_status"] = (
+                "in_favorites"
+                if candidate.get("code") in favorite_codes
+                else "not_added"
+            )
+            if notify:
+                await self._publish_transition(
+                    user_id=user_id,
+                    candidate=candidate,
+                    previous_actionability=previous_actionability,
+                )
+        await self._apply_objective_profiles(document)
+        await self._apply_macro_policy(document)
+        candidates.sort(
+            key=lambda item: (
+                _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
+                objective_tier_rank(item.get("objective_tier")),
+                -float(item.get("rank_score") or 0),
+                int(item.get("priority") or 999),
+            )
+        )
+        document["candidates"] = candidates
+        document["updated_at"] = datetime.now(timezone.utc)
+        document["quote_refreshed_at"] = checked_at
+        await self._apply_account_policy(document, user_id=user_id)
+        self._update_run_counts(document)
+        update_tracking = getattr(
+            self._favorites, "update_ai_candidate_tracking", None
+        )
+        if callable(update_tracking):
+            generated_at = document.get("generated_at")
+            generated_at_text = (
+                generated_at.isoformat()
+                if isinstance(generated_at, datetime)
+                else str(generated_at or "")
+            )
+            for candidate in candidates:
+                if candidate.get("code") not in favorite_codes:
+                    continue
+                tracking_candidate = deepcopy(candidate)
+                tracking_candidate["run_id"] = str(document.get("_id") or "")
+                tracking_candidate["generated_at"] = generated_at_text
+                await update_tracking(
+                    str(user_id),
+                    str(candidate.get("code")),
+                    tracking_candidate,
+                )
+        if persist:
+            db = await self._get_db()
+            await db["ai_candidate_runs"].update_one(
+                {"_id": document["_id"], "user_id": str(user_id)},
+                {
+                    "$set": {
+                        "candidates": deepcopy(document["candidates"]),
+                        "actionability_counts": document["actionability_counts"],
+                        "objective": deepcopy(document.get("objective")),
+                        "account": deepcopy(document.get("account")),
+                        "portfolio_plan": deepcopy(document.get("portfolio_plan")),
+                        "market": deepcopy(document.get("market")),
+                        "benchmark": deepcopy(document.get("benchmark")),
+                        "updated_at": document["updated_at"],
+                        "quote_refreshed_at": checked_at,
+                    }
+                },
+            )
+        return document
+
     async def run(self, user_id: str, *, max_candidates: int = 5) -> Dict[str, Any]:
         favorite_codes = await self._favorites.get_favorite_codes(user_id)
         payload = await run_in_threadpool(self._research_runner)
         normalized = normalize_ai_candidate_run(
             payload,
-            max_candidates=max_candidates,
+            max_candidates=max(20, max_candidates * 4),
             favorite_codes=favorite_codes,
         )
         now = datetime.now(timezone.utc)
@@ -505,14 +1341,370 @@ class AICandidateService:
             "_id": ObjectId(),
             "user_id": str(user_id),
             "generated_at": now,
+            "plan_expires_at": now + timedelta(days=3),
             "expires_at": now + timedelta(days=AI_CANDIDATE_RUN_TTL_DAYS),
             **normalized,
         }
+        await self._apply_objective_profiles(document)
+        await self._apply_macro_policy(document)
+        await self._apply_account_policy(document, user_id=str(user_id))
+        document["candidates"] = list(document.get("candidates", []))[:max_candidates]
+        await self._apply_account_policy(document, user_id=str(user_id))
+        self._update_run_counts(document)
         db = await self._get_db()
         await db["ai_candidate_runs"].insert_one(deepcopy(document))
+        reconcile = getattr(self._favorites, "reconcile_ai_candidate_lifecycle", None)
+        if callable(reconcile):
+            await reconcile(
+                str(user_id),
+                current_run_id=str(document["_id"]),
+                current_codes=[
+                    str(item.get("code") or "")
+                    for item in document.get("candidates", [])
+                    if isinstance(item, Mapping)
+                ],
+                generated_at=now,
+            )
+        update_tracking = getattr(self._favorites, "update_ai_candidate_tracking", None)
+        if callable(update_tracking):
+            for candidate in document.get("candidates", []):
+                if (
+                    not isinstance(candidate, Mapping)
+                    or candidate.get("code") not in favorite_codes
+                ):
+                    continue
+                tracking_candidate = deepcopy(dict(candidate))
+                tracking_candidate["run_id"] = str(document["_id"])
+                tracking_candidate["generated_at"] = now.isoformat()
+                await update_tracking(
+                    str(user_id),
+                    str(candidate.get("code")),
+                    tracking_candidate,
+                )
         return self._serialize_run(document)
 
-    async def latest(self, user_id: str) -> Optional[Dict[str, Any]]:
+    async def _execute_job(
+        self,
+        *,
+        job_id: ObjectId,
+        user_id: str,
+        max_candidates: int,
+    ) -> None:
+        db = await self._get_db()
+        jobs = db["ai_candidate_jobs"]
+        await jobs.update_one(
+            {"_id": job_id, "user_id": str(user_id)},
+            {
+                "$set": {
+                    "status": "running",
+                    "started_at": datetime.now(timezone.utc),
+                    "progress": {"stage": "full_market_research", "percent": 10},
+                }
+            },
+        )
+        try:
+            result = await self.run(user_id, max_candidates=max_candidates)
+            await jobs.update_one(
+                {"_id": job_id, "user_id": str(user_id)},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "completed_at": datetime.now(timezone.utc),
+                        "run_id": result.get("run_id"),
+                        "result": result,
+                        "progress": {"stage": "completed", "percent": 100},
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.exception("AI candidate background research failed")
+            await jobs.update_one(
+                {"_id": job_id, "user_id": str(user_id)},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "completed_at": datetime.now(timezone.utc),
+                        "error": {
+                            "code": getattr(exc, "code", "candidate_research_failed"),
+                            "message": str(getattr(exc, "message", exc))[:500],
+                            "stage": getattr(exc, "stage", None),
+                        },
+                        "progress": {"stage": "failed", "percent": 100},
+                    }
+                },
+            )
+
+    async def start_run(
+        self,
+        user_id: str,
+        *,
+        max_candidates: int = 5,
+    ) -> Dict[str, Any]:
+        db = await self._get_db()
+        jobs = db["ai_candidate_jobs"]
+        stale_before = datetime.now(timezone.utc) - timedelta(minutes=30)
+        try:
+            await jobs.update_many(
+                {
+                    "user_id": str(user_id),
+                    "status": {"$in": ["queued", "running"]},
+                    "created_at": {"$lt": stale_before},
+                },
+                {
+                    "$set": {
+                        "status": "failed",
+                        "completed_at": datetime.now(timezone.utc),
+                        "error": {
+                            "code": "candidate_job_interrupted",
+                            "message": "后台任务已中断，请重新运行。",
+                        },
+                    }
+                },
+            )
+        except AttributeError:
+            pass
+        active = await jobs.find_one(
+            {
+                "user_id": str(user_id),
+                "status": {"$in": ["queued", "running"]},
+                "created_at": {"$gte": stale_before},
+            },
+            sort=[("created_at", -1)],
+        )
+        if active:
+            return self._serialize_job(active)
+        now = datetime.now(timezone.utc)
+        document = {
+            "_id": ObjectId(),
+            "user_id": str(user_id),
+            "status": "queued",
+            "progress": {"stage": "queued", "percent": 0},
+            "max_candidates": max_candidates,
+            "created_at": now,
+            "expires_at": now + timedelta(days=AI_CANDIDATE_JOB_TTL_DAYS),
+        }
+        await jobs.insert_one(deepcopy(document))
+        task = asyncio.create_task(
+            self._execute_job(
+                job_id=document["_id"],
+                user_id=str(user_id),
+                max_candidates=max_candidates,
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return self._serialize_job(document)
+
+    async def get_job(self, user_id: str, job_id: str) -> Dict[str, Any]:
+        if not ObjectId.is_valid(job_id):
+            raise AICandidateRunNotFoundError(job_id)
+        db = await self._get_db()
+        document = await db["ai_candidate_jobs"].find_one(
+            {"_id": ObjectId(job_id), "user_id": str(user_id)}
+        )
+        if not document:
+            raise AICandidateRunNotFoundError(job_id)
+        return self._serialize_job(document)
+
+    async def refresh_all_active_runs(self) -> Dict[str, Any]:
+        db = await self._get_db()
+        cursor = db["ai_candidate_runs"].find(
+            {"expires_at": {"$gt": datetime.now(timezone.utc)}}
+        ).sort("generated_at", -1)
+        documents = await cursor.to_list(length=500)
+        refreshed_users: set[str] = set()
+        refreshed_historical_runs = 0
+        failed_users: List[str] = []
+        today = datetime.now(timezone.utc).date()
+        for document in documents:
+            user_id = str(document.get("user_id") or "")
+            if not user_id:
+                continue
+            is_latest = user_id not in refreshed_users
+            refreshed_at = document.get("quote_refreshed_at")
+            if isinstance(refreshed_at, str):
+                try:
+                    refreshed_at = datetime.fromisoformat(refreshed_at.replace("Z", "+00:00"))
+                except ValueError:
+                    refreshed_at = None
+            already_refreshed_today = (
+                isinstance(refreshed_at, datetime) and refreshed_at.date() == today
+            )
+            if not is_latest and already_refreshed_today:
+                continue
+            if is_latest:
+                refreshed_users.add(user_id)
+            try:
+                await self._refresh_document(
+                    document,
+                    user_id=user_id,
+                    notify=is_latest,
+                )
+                if not is_latest:
+                    refreshed_historical_runs += 1
+            except Exception:
+                if user_id not in failed_users:
+                    failed_users.append(user_id)
+                logger.exception("Scheduled AI candidate refresh failed: user=%s", user_id)
+        return {
+            "refreshed_user_count": len(refreshed_users) - len(failed_users),
+            "refreshed_historical_run_count": refreshed_historical_runs,
+            "failed_user_count": len(failed_users),
+        }
+
+    async def start_daily_research_for_active_users(self) -> Dict[str, Any]:
+        db = await self._get_db()
+        if getattr(self._trading_calendar, "db", None) is None:
+            self._trading_calendar.db = db
+        calendar = await self._trading_calendar.is_trading_day()
+        if not calendar.get("is_trading_day"):
+            return {
+                "active_user_count": 0,
+                "started_count": 0,
+                "failed_count": 0,
+                "skipped": True,
+                "reason": "not_a_share_trading_day",
+                "calendar": calendar,
+            }
+        user_ids: List[str] = []
+        try:
+            user_cursor = db["users"].find(
+                {"is_active": {"$ne": False}},
+                {"_id": 1},
+            )
+            for user in await user_cursor.to_list(length=500):
+                user_id = str(user.get("_id") or "")
+                if user_id and user_id not in user_ids:
+                    user_ids.append(user_id)
+        except Exception:
+            logger.exception("Failed to load active users for daily candidate research")
+        cursor = db["ai_candidate_runs"].find(
+            {}, {"user_id": 1, "generated_at": 1}
+        ).sort("generated_at", -1)
+        documents = await cursor.to_list(length=500)
+        for document in documents:
+            user_id = str(document.get("user_id") or "")
+            if user_id and user_id not in user_ids:
+                user_ids.append(user_id)
+        started = 0
+        failed = 0
+        for user_id in user_ids:
+            try:
+                job = await self.start_run(user_id, max_candidates=5)
+                if job.get("status") == "queued":
+                    started += 1
+            except Exception:
+                failed += 1
+                logger.exception("Daily AI candidate research failed to start: user=%s", user_id)
+        return {
+            "active_user_count": len(user_ids),
+            "started_count": started,
+            "failed_count": failed,
+        }
+
+    async def performance_summary(self, user_id: str) -> Dict[str, Any]:
+        db = await self._get_db()
+        cursor = db["ai_candidate_runs"].find(
+            {"user_id": str(user_id)},
+            {"candidates": 1, "generated_at": 1},
+        ).sort("generated_at", -1).limit(30)
+        documents = await cursor.to_list(length=30)
+        rows: List[Dict[str, Any]] = []
+        for document in documents:
+            for candidate in document.get("candidates", []):
+                if not isinstance(candidate, Mapping):
+                    continue
+                performance = candidate.get("performance")
+                if not isinstance(performance, Mapping):
+                    continue
+                shadow = performance.get("shadow_trade")
+                if isinstance(shadow, Mapping):
+                    value = _finite_number(
+                        shadow.get("net_return_pct"), shadow.get("return_pct")
+                    )
+                    status = shadow.get("status")
+                    entry_triggered = status not in {
+                        None,
+                        "waiting_entry",
+                        "expired_untriggered",
+                    }
+                    target_hit = status == "closed_target"
+                    stop_hit = status == "closed_stop"
+                    max_return = shadow.get("max_return_pct")
+                    min_return = shadow.get("min_return_pct")
+                    metric_basis = "shadow_trade"
+                else:
+                    value = _finite_number(performance.get("return_since_generated_pct"))
+                    status = "legacy_generated_baseline"
+                    entry_triggered = False
+                    target_hit = bool(performance.get("target_hit_at"))
+                    stop_hit = bool(performance.get("stop_hit_at"))
+                    max_return = performance.get("max_return_pct")
+                    min_return = performance.get("min_return_pct")
+                    shadow = {}
+                    metric_basis = "legacy_generated_baseline"
+                if value is None:
+                    continue
+                rows.append(
+                    {
+                        "run_id": str(document.get("_id") or ""),
+                        "generated_at": document.get("generated_at"),
+                        "code": candidate.get("code"),
+                        "name": candidate.get("name"),
+                        "status": status,
+                        "metric_basis": metric_basis,
+                        "entry_triggered": entry_triggered,
+                        "entry_price": shadow.get("entry_price"),
+                        "quantity": shadow.get("quantity"),
+                        "return_pct": value,
+                        "net_pnl": shadow.get("net_pnl"),
+                        "max_return_pct": max_return,
+                        "min_return_pct": min_return,
+                        "target_hit": target_hit,
+                        "stop_hit": stop_hit,
+                        "observation_count": performance.get("observation_count", 0),
+                    }
+                )
+        shadow_rows = [row for row in rows if row["metric_basis"] == "shadow_trade"]
+        legacy_rows = [
+            row for row in rows if row["metric_basis"] == "legacy_generated_baseline"
+        ]
+        triggered = [row for row in shadow_rows if row["entry_triggered"]]
+        returns = [
+            float(row["return_pct"])
+            for row in triggered
+            if row.get("return_pct") is not None
+        ]
+        closed = [
+            row for row in triggered if str(row.get("status") or "").startswith("closed_")
+        ]
+        return {
+            "sample_count": len(shadow_rows),
+            "legacy_baseline_count": len(legacy_rows),
+            "total_item_count": len(rows),
+            "triggered_count": len(triggered),
+            "closed_count": len(closed),
+            "average_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
+            "positive_count": sum(value > 0 for value in returns),
+            "closed_win_rate_pct": round(
+                sum(float(row.get("net_pnl") or 0) > 0 for row in closed)
+                / len(closed)
+                * 100,
+                2,
+            )
+            if closed
+            else None,
+            "target_hit_count": sum(bool(row["target_hit"]) for row in shadow_rows),
+            "stop_hit_count": sum(bool(row["stop_hit"]) for row in shadow_rows),
+            "items": rows[:100],
+        }
+
+    async def latest(
+        self,
+        user_id: str,
+        *,
+        refresh_quotes: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         db = await self._get_db()
         document = await db["ai_candidate_runs"].find_one(
             {"user_id": str(user_id)},
@@ -520,14 +1712,24 @@ class AICandidateService:
         )
         if not document:
             return None
-        favorite_codes = await self._favorites.get_favorite_codes(user_id)
-        for candidate in document.get("candidates", []):
-            if isinstance(candidate, dict):
-                candidate["favorite_status"] = (
-                    "in_favorites"
-                    if candidate.get("code") in favorite_codes
-                    else "not_added"
-                )
+        if refresh_quotes:
+            document = await self._refresh_document(
+                document,
+                user_id=str(user_id),
+            )
+        else:
+            favorite_codes = await self._favorites.get_favorite_codes(user_id)
+            for candidate in document.get("candidates", []):
+                if isinstance(candidate, dict):
+                    candidate["favorite_status"] = (
+                        "in_favorites"
+                        if candidate.get("code") in favorite_codes
+                        else "not_added"
+                    )
+            await self._apply_objective_profiles(document)
+            await self._apply_macro_policy(document)
+            await self._apply_account_policy(document, user_id=str(user_id))
+            self._update_run_counts(document)
         return self._serialize_run(document)
 
     async def add_to_favorites(
@@ -546,7 +1748,7 @@ class AICandidateService:
             raise AICandidateRunNotFoundError(run_id)
 
         candidate_map = {
-            candidate["code"]: candidate
+            candidate["code"]: _enrich_saved_candidate(candidate)
             for candidate in document.get("candidates", [])
             if isinstance(candidate, Mapping) and candidate.get("code")
         }
@@ -558,6 +1760,16 @@ class AICandidateService:
             )
 
         existing_codes = await self._favorites.get_favorite_codes(user_id)
+        unavailable_codes = [
+            code
+            for code in requested_codes
+            if code not in existing_codes
+            and not bool(candidate_map[code].get("can_add_to_favorites"))
+        ]
+        if unavailable_codes:
+            raise InvalidAICandidateSelectionError(
+                "candidate_not_trackable:" + ",".join(unavailable_codes)
+            )
         added: List[str] = []
         already_exists: List[str] = []
         failed: List[str] = []
@@ -572,6 +1784,12 @@ class AICandidateService:
             if code in existing_codes:
                 already_exists.append(code)
                 continue
+            lifecycle_state = (
+                str(candidate.get("actionability"))
+                if candidate.get("actionability")
+                in {"expired", "invalidated", "target_reached"}
+                else "current"
+            )
             ai_metadata = {
                 "run_id": run_id,
                 "generated_at": generated_at_text,
@@ -586,13 +1804,32 @@ class AICandidateService:
                 "horizon": (document.get("context") or {}).get("horizon"),
                 "source": document.get("source"),
                 "is_reference_only": True,
+                "tracking_enabled": True,
+                "actionability": candidate.get("actionability"),
+                "actionability_label": candidate.get("actionability_label"),
+                "rank_score": candidate.get("rank_score"),
+                "performance": deepcopy(candidate.get("performance")),
+                "last_checked_at": candidate.get("quote_checked_at"),
+                "lifecycle_state": lifecycle_state,
+                "is_current": lifecycle_state == "current",
+                "superseded_at": None,
+                "superseded_by_run_id": None,
             }
+            candidate_plan = (
+                candidate.get("price_plan")
+                if isinstance(candidate.get("price_plan"), Mapping)
+                else {}
+            )
+            entry_price = _finite_number(candidate_plan.get("entry_price"))
+            strategy = str(candidate_plan.get("entry_strategy") or "")
             success = await self._favorites.add_favorite(
                 user_id=str(user_id),
                 stock_code=code,
                 stock_name=str(candidate.get("name") or code),
                 market="A股",
                 tags=[AI_CANDIDATE_TAG],
+                alert_price_low=entry_price if strategy == "pullback" else None,
+                alert_price_high=entry_price if strategy == "breakout" else None,
                 source=AI_CANDIDATE_SOURCE,
                 ai_metadata=ai_metadata,
             )

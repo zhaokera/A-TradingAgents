@@ -15,33 +15,89 @@
     </div>
 
     <el-row :gutter="16" class="dashboard-metrics">
-      <el-col :xs="24" :sm="12" :lg="8">
+      <el-col :xs="24" :sm="12" :lg="6">
         <div class="metric-card">
-          <div class="metric-label">分析任务</div>
-          <div class="metric-value">{{ userStats.totalAnalyses }}</div>
-          <div class="metric-meta">最近任务总数</div>
+          <div class="metric-label">账户总资产</div>
+          <div class="metric-value">{{ formatMoney(briefing?.account?.total_assets) }}</div>
+          <div class="metric-meta">可用现金 {{ formatMoney(briefing?.account?.available_cash) }}</div>
         </div>
       </el-col>
-      <el-col :xs="24" :sm="12" :lg="8">
+      <el-col :xs="24" :sm="12" :lg="6">
         <div class="metric-card">
-          <div class="metric-label">已完成</div>
-          <div class="metric-value">{{ userStats.successfulAnalyses }}</div>
-          <div class="metric-meta">可查看报告</div>
+          <div class="metric-label">股票持仓</div>
+          <div class="metric-value">{{ briefing?.holdings?.count || 0 }}</div>
+          <div class="metric-meta">市值 {{ formatMoney(briefing?.holdings?.market_value) }}</div>
         </div>
       </el-col>
-      <el-col :xs="24" :sm="12" :lg="8">
+      <el-col :xs="24" :sm="12" :lg="6">
         <div class="metric-card">
-          <div class="metric-label">自选股</div>
-          <div class="metric-value">{{ favoriteStocks.length }}</div>
-          <div class="metric-meta">当前关注</div>
+          <div class="metric-label">组合可执行候选</div>
+          <div class="metric-value">{{ briefing?.candidate_run?.executable_count || 0 }}</div>
+          <div class="metric-meta">已分配 {{ formatMoney(briefing?.candidate_run?.portfolio_plan?.allocated_amount) }}</div>
+        </div>
+      </el-col>
+      <el-col :xs="24" :sm="12" :lg="6">
+        <div class="metric-card">
+          <div class="metric-label">综合市场门控</div>
+          <div class="metric-value regime-value">{{ getRegimeLabel(briefing?.market?.combined_regime) }}</div>
+          <div class="metric-meta">国际风险 {{ getRegimeLabel(briefing?.market?.macro_risk?.regime) }}</div>
         </div>
       </el-col>
     </el-row>
 
+    <el-card class="candidate-action-card" shadow="never">
+      <template #header>
+        <div class="card-header">
+          <div>
+            <strong>AI 候选待处理</strong>
+            <span v-if="candidateRun" class="candidate-updated-at">
+              行情更新 {{ formatTime(candidateRun.quote_refreshed_at || candidateRun.generated_at) }}
+            </span>
+            <span v-if="candidatePerformance?.sample_count" class="candidate-updated-at">
+              跟踪 {{ candidatePerformance.sample_count }} 个样本 · 平均 {{ formatPerformance(candidatePerformance.average_return_pct) }}
+            </span>
+          </div>
+          <el-button type="primary" plain @click="router.push('/screening')">
+            查看选股 <el-icon><ArrowRight /></el-icon>
+          </el-button>
+        </div>
+      </template>
+      <div v-if="candidateRun" class="candidate-overview">
+        <div class="candidate-state ready">
+          <span>价格已到</span>
+          <strong>{{ candidateRun.actionability_counts?.ready_now || 0 }}</strong>
+        </div>
+        <div class="candidate-state waiting">
+          <span>条件提醒</span>
+          <strong>{{ candidateRun.actionability_counts?.condition_order || 0 }}</strong>
+        </div>
+        <div class="candidate-state blocked">
+          <span>风险阻断</span>
+          <strong>{{ candidateRun.actionability_counts?.blocked || 0 }}</strong>
+        </div>
+        <div class="candidate-list">
+          <button
+            v-for="candidate in dashboardCandidates"
+            :key="candidate.code"
+            type="button"
+            class="candidate-row"
+            @click="router.push(`/analysis/single?stock_code=${candidate.code}`)"
+          >
+            <span><strong>{{ candidate.code }}</strong>{{ candidate.name }}</span>
+            <span>{{ candidate.portfolio_allocation?.status === 'allocated' ? `${candidate.portfolio_allocation.quantity}股` : candidate.actionability_label }}</span>
+            <span>现价 {{ formatCandidatePrice(candidate.reference_price) }}</span>
+            <span>条件 {{ formatCandidatePrice(candidate.price_plan.entry_price) }}</span>
+          </button>
+          <div v-if="dashboardCandidates.length === 0" class="candidate-empty">当前没有待处理候选</div>
+        </div>
+      </div>
+      <div v-else class="candidate-empty">尚未运行 AI 选股</div>
+    </el-card>
+
     <!-- 主要功能区域 -->
     <el-row :gutter="24" class="main-content">
       <!-- 左侧：最近分析 -->
-      <el-col :span="16">
+      <el-col :xs="24" :lg="16">
         <el-card class="recent-analyses-card" header="最近分析">
           <el-table :data="recentAnalyses" style="width: 100%">
             <el-table-column prop="stock_code" label="股票代码" width="120" />
@@ -106,7 +162,7 @@
       </el-col>
 
       <!-- 右侧：自选股和快讯 -->
-      <el-col :span="8">
+      <el-col :xs="24" :lg="8">
         <!-- 我的自选股 -->
         <el-card class="favorites-card">
           <template #header>
@@ -164,7 +220,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { ArrowRight, InfoFilled, Odometer, Refresh } from '@element-plus/icons-vue'
@@ -174,6 +230,12 @@ import MultiSourceSyncCard from '@/components/Dashboard/MultiSourceSyncCard.vue'
 import { favoritesApi } from '@/api/favorites'
 import { analysisApi } from '@/api/analysis'
 import { newsApi } from '@/api/news'
+import { briefingApi, type DailyBriefing } from '@/api/briefing'
+import {
+  screeningApi,
+  type AICandidatePerformance,
+  type AICandidateRun
+} from '@/api/screening'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -196,6 +258,15 @@ const favoriteStocks = ref<any[]>([])
 const marketNews = ref<any[]>([])
 
 const dashboardLoading = ref(false)
+const candidateRun = ref<AICandidateRun | null>(null)
+const candidatePerformance = ref<AICandidatePerformance | null>(null)
+const briefing = ref<DailyBriefing | null>(null)
+
+const dashboardCandidates = computed(() =>
+  (candidateRun.value?.candidates || [])
+    .filter(item => item.portfolio_allocation?.status === 'allocated')
+    .slice(0, 5)
+)
 
 
 
@@ -282,6 +353,48 @@ import { formatDateTime } from '@/utils/datetime'
 
 const formatTime = (time: string) => {
   return formatDateTime(time)
+}
+
+const formatCandidatePrice = (value?: number | null) =>
+  value === null || value === undefined ? '-' : `¥${Number(value).toFixed(2)}`
+
+const formatMoney = (value?: number | null) =>
+  value === null || value === undefined
+    ? '-'
+    : `¥${Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+
+const getRegimeLabel = (value?: string) => ({ green: '低风险', yellow: '谨慎', red: '高风险' }[value || ''] || '待更新')
+
+const loadBriefing = async () => {
+  try {
+    const response = await briefingApi.today(false)
+    briefing.value = ((response as any)?.data || null) as DailyBriefing | null
+  } catch (error) {
+    console.warn('加载每日简报失败:', error)
+  }
+}
+
+const formatPerformance = (value?: number | null) =>
+  value === null || value === undefined
+    ? '-'
+    : `${value > 0 ? '+' : ''}${Number(value).toFixed(2)}%`
+
+const loadCandidateRun = async () => {
+  try {
+    const response = await screeningApi.getLatestAiCandidates(false)
+    candidateRun.value = ((response as any)?.data || null) as AICandidateRun | null
+  } catch (error) {
+    console.warn('加载 AI 候选状态失败:', error)
+  }
+}
+
+const loadCandidatePerformance = async () => {
+  try {
+    const response = await screeningApi.getAiCandidatePerformance()
+    candidatePerformance.value = ((response as any)?.data || null) as AICandidatePerformance | null
+  } catch (error) {
+    console.warn('加载 AI 候选跟踪表现失败:', error)
+  }
 }
 
 // 自选股相关方法
@@ -372,7 +485,10 @@ const reloadDashboard = async () => {
     await Promise.all([
       loadFavoriteStocks(),
       loadRecentAnalyses(),
-      loadMarketNews()
+      loadMarketNews(),
+      loadCandidateRun(),
+      loadCandidatePerformance(),
+      loadBriefing()
     ])
   } finally {
     dashboardLoading.value = false
@@ -412,12 +528,97 @@ onMounted(async () => {
         font-variant-numeric: tabular-nums;
       }
 
+      .regime-value { font-size: 22px; }
+
       .metric-meta {
         margin-top: 6px;
         color: var(--ta-text-muted, var(--el-text-color-secondary));
         font-size: 12px;
       }
     }
+  }
+
+  .candidate-action-card {
+    margin-bottom: 16px;
+
+    .card-header,
+    .card-header > div {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .candidate-updated-at {
+      color: var(--el-text-color-secondary);
+      font-size: 12px;
+      font-weight: 400;
+    }
+  }
+
+  .candidate-overview {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(96px, 130px)) minmax(360px, 1fr);
+    gap: 12px;
+  }
+
+  .candidate-state {
+    display: flex;
+    min-height: 76px;
+    justify-content: center;
+    flex-direction: column;
+    padding: 12px;
+    border-left: 3px solid var(--el-border-color);
+    background: var(--el-fill-color-light);
+
+    span { color: var(--el-text-color-secondary); font-size: 12px; }
+    strong { margin-top: 5px; font-size: 24px; }
+    &.ready { border-color: var(--el-color-success); }
+    &.waiting { border-color: var(--el-color-warning); }
+    &.blocked { border-color: var(--el-color-danger); }
+  }
+
+  .candidate-list {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--el-border-color-lighter);
+  }
+
+  .candidate-row {
+    display: grid;
+    grid-template-columns: minmax(150px, 1fr) 100px 100px 100px;
+    align-items: center;
+    gap: 10px;
+    min-height: 38px;
+    padding: 6px 10px;
+    border: 0;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+    color: var(--el-text-color-regular);
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+
+    &:last-child { border-bottom: 0; }
+    &:hover { background: var(--el-fill-color-light); }
+    > span { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+    > span:first-child { display: flex; gap: 7px; }
+  }
+
+  .candidate-empty {
+    padding: 20px;
+    color: var(--el-text-color-secondary);
+    text-align: center;
+  }
+
+  @media (max-width: 1100px) {
+    .candidate-overview { grid-template-columns: repeat(3, 1fr); }
+    .candidate-list { grid-column: 1 / -1; }
+  }
+
+  @media (max-width: 720px) {
+    .candidate-overview { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .candidate-row { grid-template-columns: 1fr 90px; }
+    .candidate-row > span:nth-child(n + 3) { display: none; }
   }
 
   .recent-analyses-card {

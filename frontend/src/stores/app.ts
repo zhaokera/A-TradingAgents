@@ -95,7 +95,7 @@ export const useAppStore = defineStore('app', {
     
     // 当前页面标题
     currentPageTitle(): string {
-      return this.currentRoute?.meta?.title as string || 'TradingAgents-CN'
+      return this.currentRoute?.meta?.title as string || 'Agent管理平台'
     },
     
     // 应用信息

@@ -1,5 +1,3 @@
-version: '3.8'
-
 # TradingAgents-CN v1.0.0-preview Docker Compose配置
 # 支持前后端分离部署
 
@@ -69,7 +67,6 @@ services:
     image: tradingagents-frontend:v1.0.0-preview
     container_name: tradingagents-frontend
     ports:
-      - "80:80"
       - "3000:80"
     environment:
       TZ: "Asia/Shanghai"
@@ -98,8 +95,6 @@ services:
     image: mongo:4.4
     container_name: tradingagents-mongodb
     restart: unless-stopped
-    ports:
-      - "27017:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: admin
       MONGO_INITDB_ROOT_PASSWORD: tradingagents123
@@ -127,8 +122,6 @@ services:
     image: redis:7-alpine
     container_name: tradingagents-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
     environment:
       TZ: "Asia/Shanghai"
       REDISCLI_AUTH: tradingagents123

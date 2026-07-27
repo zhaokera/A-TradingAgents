@@ -24,7 +24,7 @@ def _candidate(symbol="600406", **updates):
         "software_baseline_action": "avoid",
         "software_reason_codes": ["market_red"],
         "quote": {
-            "price": 21.10,
+            "price": 21.30,
             "source": "tencent",
             "trade_at": "2026-07-24T14:30:00+08:00",
             "status": "fresh",
@@ -114,6 +114,13 @@ def _packet(*, phase="live_pm", candidates=None, **updates):
             "max_new_positions": 2,
             "primary_position_count": 1,
         },
+        "execution_capabilities": {
+            "condition_order": {
+                "verified": True,
+                "independent_trigger_price_supported": True,
+                "separate_order_limit_price_supported": True,
+            }
+        },
         "hard_risk_policy": {
             "available_new_exposure_pct": 60.0,
             "hard_single_symbol_cap_pct": 45.0,
@@ -143,6 +150,7 @@ def _selection(symbol="600406", **updates):
         "requested_quantity": 100,
         "entry_strategy": "pullback",
         "trigger_price": "21.20",
+        "order_limit_price": "21.20",
         "stop_price": "20.90",
         "target_price": "23.80",
         "expires_at": "2026-07-28T15:00:00+08:00",
@@ -195,6 +203,7 @@ async def test_market_red_override_can_validate():
     assert result["accepted_overrides"][0]["warning_code"] == "market_red"
     assert result["recalculated"]["total_cost"] == 2120.0
     assert result["recalculated"]["total_planned_loss"] == 30.0
+    assert result["valid_until"] == "2026-07-24T14:31:30+08:00"
 
 
 @pytest.mark.asyncio
@@ -326,7 +335,7 @@ async def test_buy_now_requires_live_market_phase():
 
 
 @pytest.mark.asyncio
-async def test_condition_order_can_validate_off_session_with_trigger_recheck():
+async def test_condition_order_requires_a_fresh_live_quote():
     result = await DecisionValidationService().validate_document(
         "owner-1",
         _proposal(),
@@ -334,8 +343,44 @@ async def test_condition_order_can_validate_off_session_with_trigger_recheck():
         now=NOW,
     )
 
-    assert result["status"] == "valid", result["hard_failures"]
-    assert result["trigger_time_revalidation_required"] is True
+    assert result["status"] == "invalid"
+    assert "condition_order_quote_stale" in _failure_codes(result)
+
+
+@pytest.mark.asyncio
+async def test_breakout_condition_order_requires_verified_separate_trigger_capability():
+    candidate = _candidate(
+        "002602",
+        quote={
+            "price": 12.45,
+            "source": "tencent",
+            "trade_at": "2026-07-24T14:30:00+08:00",
+            "status": "fresh",
+            "actionable": True,
+        },
+    )
+    selection = _selection(
+        "002602",
+        entry_strategy="breakout",
+        trigger_price="13.35",
+        order_limit_price="13.40",
+        stop_price="12.70",
+        target_price="14.20",
+    )
+
+    result = await DecisionValidationService().validate_document(
+        "owner-1",
+        _proposal(selections=[selection]),
+        _packet(candidates=[candidate], execution_capabilities={}),
+        now=NOW,
+    )
+
+    assert result["status"] == "invalid"
+    assert (
+        "condition_order_execution_capability_unverified"
+        in _failure_codes(result)
+    )
+    assert "condition_order_plan_already_invalidated" in _failure_codes(result)
 
 
 @pytest.mark.asyncio

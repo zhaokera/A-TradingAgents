@@ -39,6 +39,13 @@ def _packet():
             "max_new_positions": 2,
             "primary_position_count": 1,
         },
+        "execution_capabilities": {
+            "condition_order": {
+                "verified": True,
+                "independent_trigger_price_supported": True,
+                "separate_order_limit_price_supported": True,
+            }
+        },
         "hard_risk_policy": {
             "available_new_exposure_pct": 60.0,
             "hard_single_symbol_cap_pct": 45.0,
@@ -71,7 +78,7 @@ def _packet():
                 "software_baseline_action": "avoid",
                 "software_reason_codes": ["market_red"],
                 "quote": {
-                    "price": 21.10,
+                    "price": 21.30,
                     "source": "tencent",
                     "trade_at": "2026-07-24T14:30:00+08:00",
                     "status": "fresh",
@@ -161,6 +168,7 @@ def _proposal(*, quantity=100):
                     "requested_quantity": quantity,
                     "entry_strategy": "pullback",
                     "trigger_price": "21.20",
+                    "order_limit_price": "21.20",
                     "stop_price": "20.90",
                     "target_price": "23.80",
                     "expires_at": "2026-07-28T15:00:00+08:00",

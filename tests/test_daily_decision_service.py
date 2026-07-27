@@ -129,6 +129,18 @@ def _briefing() -> dict:
     }
 
 
+def _condition_order_briefing() -> dict:
+    briefing = _briefing()
+    briefing["account"]["execution_capabilities"] = {
+        "condition_order": {
+            "verified": True,
+            "independent_trigger_price_supported": True,
+            "separate_order_limit_price_supported": True,
+        }
+    }
+    return briefing
+
+
 class FakeBriefingService:
     def __init__(self, payload=None):
         self.payload = payload or _briefing()
@@ -413,12 +425,12 @@ def _service(*, phase="live_am", run=None, briefing=None, profiles=None, db=None
 @pytest.mark.parametrize(
     ("phase", "expected_bucket"),
     [
-        ("pre_open", "condition_order"),
+        ("pre_open", "wait"),
         ("live_am", "buy_now"),
-        ("midday_break", "condition_order"),
+        ("midday_break", "wait"),
         ("live_pm", "buy_now"),
-        ("post_close", "condition_order"),
-        ("closed_day", "condition_order"),
+        ("post_close", "wait"),
+        ("closed_day", "wait"),
         ("calendar_unknown", "wait"),
     ],
 )
@@ -548,23 +560,23 @@ async def test_real_diversification_reasons_map_to_exact_wait_codes(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("trade_at", [None, "stale"])
-async def test_missing_or_stale_live_quote_remains_condition_order(trade_at):
+async def test_missing_or_stale_live_quote_waits_for_recheck(trade_at):
     candidate = _candidate(trade_at=trade_at)
     if trade_at == "stale":
         candidate["quote_fresh"] = False
     packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
 
-    item = packet["condition_order"][0]
+    item = packet["wait"][0]
     assert "live_quote_recheck_required" in item["reason_codes"]
-    assert not packet["wait"]
+    assert not packet["condition_order"]
 
 
 @pytest.mark.asyncio
-async def test_live_quote_without_positive_price_remains_condition_order():
+async def test_live_quote_without_positive_price_waits_for_recheck():
     candidate = _candidate(reference_price=None)
     packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
 
-    item = packet["condition_order"][0]
+    item = packet["wait"][0]
     assert "live_quote_recheck_required" in item["reason_codes"]
     assert not packet["buy_now"]
 
@@ -582,10 +594,7 @@ async def test_non_tencent_or_wrong_day_quote_never_becomes_buy_now(candidate_up
         "user-1", now=NOW
     )
 
-    assert packet["condition_order"][0]["reason_codes"] == [
-        "valid_allocated_plan",
-        "live_quote_recheck_required",
-    ]
+    assert packet["wait"][0]["reason_codes"] == ["live_quote_recheck_required"]
     assert not packet["buy_now"]
 
 
@@ -593,9 +602,42 @@ async def test_non_tencent_or_wrong_day_quote_never_becomes_buy_now(candidate_up
 async def test_unmet_live_price_condition_is_condition_order():
     candidate = _candidate()
     candidate["price_plan"]["price_condition_met"] = False
-    packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
+    candidate["price_plan"]["order_limit_price"] = 63.0
+    packet = await _service(
+        run=_run([candidate]),
+        briefing=_condition_order_briefing(),
+    ).today("user-1", now=NOW)
 
     assert packet["condition_order"][0]["action"] == "condition_order"
+
+
+@pytest.mark.asyncio
+async def test_unmet_live_price_waits_when_condition_order_capability_is_unverified():
+    candidate = _candidate()
+    candidate["price_plan"]["price_condition_met"] = False
+    briefing = _briefing()
+    briefing["account"].pop("execution_capabilities", None)
+
+    packet = await _service(
+        run=_run([candidate]),
+        briefing=briefing,
+    ).today("user-1", now=NOW)
+
+    assert not packet["condition_order"]
+    assert packet["wait"][0]["reason_codes"] == [
+        "condition_order_capability_unverified"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_price_at_or_below_stop_invalidates_plan_before_buying():
+    candidate = _candidate(reference_price=61.50)
+
+    packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
+
+    assert packet["avoid"][0]["reason_codes"] == ["plan_invalidated"]
+    assert not packet["buy_now"]
+    assert not packet["condition_order"]
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
@@ -17,6 +18,7 @@ SOURCE_PRIORITY = {"tushare": 0, "baostock": 1, "akshare": 2}
 NORMALIZATION_VERSION = "cn-sector-v1"
 PROFILE_MAX_AGE = timedelta(days=30)
 REVENUE_MAX_AGE = timedelta(days=550)
+REFRESH_RETRY_BACKOFF = timedelta(hours=24)
 ALLOWED_ENDPOINTS = {
     "tushare": {"stock_basic", "stock_company", "fina_mainbz"},
     "baostock": {"query_stock_basic"},
@@ -65,8 +67,17 @@ SECTOR_ALIASES = {
 
 
 def _normalise_code(value: Any) -> str:
-    text = str(value or "").strip()
-    return text.zfill(6) if text else ""
+    text = str(value or "").strip().upper()
+    for pattern in (
+        r"(?:SH|SZ)\.(\d{1,6})",
+        r"(\d{1,6})\.(?:SH|SZ)",
+        r"(?:SH|SZ)(\d{1,6})",
+        r"(\d{1,6})",
+    ):
+        match = re.fullmatch(pattern, text)
+        if match:
+            return match.group(1).zfill(6)
+    return text
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -356,6 +367,7 @@ def select_evidence_profile(
         "industry": [],
         "provider_sector": [],
         "main_business": [],
+        "business_scope": [],
     }
     revenue_candidates = []
     for document in candidates:
@@ -368,6 +380,11 @@ def select_evidence_profile(
             )
             if business:
                 field_candidates["main_business"].append(business)
+            business_scope = _field_candidate(
+                document, "business_scope", document.get("business_scope")
+            )
+            if business_scope:
+                field_candidates["business_scope"].append(business_scope)
             raw_sector = (
                 document.get("provider_sector")
                 or document.get("sector")
@@ -472,8 +489,11 @@ def select_evidence_profile(
 
     industry = selected["industry"]
     business = selected["main_business"]
+    business_scope = selected["business_scope"]
     sector = selected["provider_sector"]
-    selected_evidence = [item for item in (sector, industry, business, selected_revenue) if item]
+    selected_evidence = [
+        item for item in (sector, industry, business, business_scope, selected_revenue) if item
+    ]
     complete = all(selected[field] is not None for field in ("provider_sector", "industry", "main_business"))
     status = "verified" if complete else "incomplete" if selected_evidence else "missing"
     confidence = "high" if complete else "medium" if selected_evidence else "low"
@@ -482,6 +502,7 @@ def select_evidence_profile(
         "code": normalized_code,
         "industry": industry.get("value") if industry else None,
         "main_business": business.get("value") if business else None,
+        "business_scope": business_scope.get("value") if business_scope else None,
         "provider_sector": sector.get("value") if sector else None,
         "source": min(
             (str(item.get("source")) for item in selected_evidence),
@@ -494,6 +515,7 @@ def select_evidence_profile(
         "provider_sector_evidence": sector,
         "industry_evidence": industry,
         "main_business_evidence": business,
+        "business_scope_evidence": business_scope,
         "revenue_composition": selected_revenue,
         "data_quality": {
             "complete": complete,
@@ -516,9 +538,17 @@ class CompanyProfileEnrichmentService:
         provider_fetchers: Mapping[str, ProviderFetcher] | None = None,
     ) -> None:
         self.db = db
+        if provider_fetchers is None:
+            # Keep adapter imports lazy: the adapter module imports provider
+            # implementations, while those implementations may import app code.
+            from app.services.company_profile_provider_adapters import (
+                build_default_profile_fetchers,
+            )
+
+            provider_fetchers = build_default_profile_fetchers()
         self.provider_fetchers = {
             str(source).lower(): fetcher
-            for source, fetcher in (provider_fetchers or {}).items()
+            for source, fetcher in provider_fetchers.items()
         }
 
     async def _get_db(self) -> Any:
@@ -608,7 +638,12 @@ class CompanyProfileEnrichmentService:
         else:
             rows = list(cursor or [])
         grouped = {
-            code: {"source_documents": [], "provider_errors": [], "display_only": []}
+            code: {
+                "source_documents": [],
+                "provider_errors": [],
+                "display_only": [],
+                "last_refresh_at": None,
+            }
             for code in codes
         }
         for row in rows or []:
@@ -624,6 +659,13 @@ class CompanyProfileEnrichmentService:
                 quality.get("provider_errors") or row.get("provider_errors") or []
             )
             grouped[code]["display_only"].extend(quality.get("display_only") or [])
+            refresh_at = row.get("refresh_started_at") or row.get("last_refresh_at")
+            parsed_refresh_at = _parse_datetime(refresh_at)
+            current_refresh_at = _parse_datetime(grouped[code].get("last_refresh_at"))
+            if parsed_refresh_at and (
+                current_refresh_at is None or parsed_refresh_at > current_refresh_at
+            ):
+                grouped[code]["last_refresh_at"] = parsed_refresh_at
         for code in codes:
             grouped[code]["provider_errors"] = _sort_provider_errors(
                 grouped[code]["provider_errors"]
@@ -661,7 +703,12 @@ class CompanyProfileEnrichmentService:
                     source, code, result, validation_now
                 )
                 documents = self._merge_documents(documents, fresh_documents)
-                display_only = _merge_display_only(display_only, fresh_display_only)
+                display_only = _merge_display_only(
+                    display_only,
+                    fresh_display_only,
+                    getattr(result, "display_only", []),
+                )
+                errors.extend(getattr(result, "provider_errors", []))
             except Exception as exc:  # provider failures are part of the result contract
                 if isinstance(exc, TimeoutError):
                     error_code = "provider_timeout"
@@ -696,7 +743,17 @@ class CompanyProfileEnrichmentService:
             documents = cached[code]["source_documents"]
             provider_errors = cached[code]["provider_errors"]
             display_only = cached[code]["display_only"]
-            if refresh:
+            cached_profile = select_evidence_profile(code, documents, now=now)
+            needs_refresh = not bool(
+                cached_profile.get("data_quality", {}).get("complete")
+            ) or cached_profile.get("revenue_composition") is None
+            validation_now = now
+            last_refresh_at = _parse_datetime(cached[code].get("last_refresh_at"))
+            retry_blocked = bool(
+                last_refresh_at is not None
+                and datetime.now(timezone.utc) - last_refresh_at < REFRESH_RETRY_BACKOFF
+            )
+            if refresh and needs_refresh and not retry_blocked:
                 refresh_started_at = datetime.now(timezone.utc)
                 documents, provider_errors, display_only, validation_now = await self._refresh_code(
                     code, cached[code], now
@@ -711,6 +768,7 @@ class CompanyProfileEnrichmentService:
                         },
                         "updated_at": now,
                         "refresh_started_at": refresh_started_at,
+                        "last_refresh_at": refresh_started_at,
                     }
                 }
                 lost_write = False

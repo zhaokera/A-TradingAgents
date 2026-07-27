@@ -40,7 +40,7 @@ from app.routers import notifications as notifications_router
 from app.routers import websocket_notifications as websocket_notifications_router
 from app.routers import scheduler as scheduler_router
 from app.services.basics_sync_service import get_basics_sync_service
-from app.services.multi_source_basics_sync_service import MultiSourceBasicsSyncService
+from app.services.multi_source_basics_sync_service import get_multi_source_sync_service
 from app.services.scheduler_service import set_scheduler_instance
 from app.services.decision_scheduler_service import (
     DecisionSchedulerRuntime,
@@ -74,6 +74,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from app.services.quotes_ingestion_service import QuotesIngestionService
+from app.services.ai_candidate_service import ai_candidate_service
 from app.routers import paper as paper_router
 
 
@@ -283,7 +284,7 @@ async def lifespan(app: FastAPI):
         scheduler = AsyncIOScheduler(timezone=settings.TIMEZONE)
 
         # 使用多数据源同步服务（支持自动切换）
-        multi_source_service = MultiSourceBasicsSyncService()
+        multi_source_service = get_multi_source_sync_service()
 
         # 根据 TUSHARE_ENABLED 配置决定优先数据源
         # 如果 Tushare 被禁用，系统会自动使用其他可用数据源（AKShare/BaoStock）
@@ -300,7 +301,9 @@ async def lifespan(app: FastAPI):
 
         # 立即在启动后尝试一次（不阻塞）
         async def run_sync_with_sources():
-            await multi_source_service.run_full_sync(force=False, preferred_sources=preferred_sources)
+            await multi_source_service.run_incremental_sync(
+                force=False, preferred_sources=preferred_sources
+            )
 
         asyncio.create_task(run_sync_with_sources())
 
@@ -309,7 +312,7 @@ async def lifespan(app: FastAPI):
             if settings.SYNC_STOCK_BASICS_CRON:
                 # 如果提供了cron表达式
                 scheduler.add_job(
-                    lambda: multi_source_service.run_full_sync(force=False, preferred_sources=preferred_sources),
+                    lambda: multi_source_service.run_incremental_sync(force=False, preferred_sources=preferred_sources),
                     CronTrigger.from_crontab(settings.SYNC_STOCK_BASICS_CRON, timezone=settings.TIMEZONE),
                     id="basics_sync_service",
                     name="股票基础信息同步（多数据源）"
@@ -318,7 +321,7 @@ async def lifespan(app: FastAPI):
             else:
                 hh, mm = (settings.SYNC_STOCK_BASICS_TIME or "06:30").split(":")
                 scheduler.add_job(
-                    lambda: multi_source_service.run_full_sync(force=False, preferred_sources=preferred_sources),
+                    lambda: multi_source_service.run_incremental_sync(force=False, preferred_sources=preferred_sources),
                     CronTrigger(hour=int(hh), minute=int(mm), timezone=settings.TIMEZONE),
                     id="basics_sync_service",
                     name="股票基础信息同步（多数据源）"
@@ -336,6 +339,40 @@ async def lifespan(app: FastAPI):
                 name="实时行情入库服务"
             )
             logger.info(f"⏱ 实时行情入库任务已启动: 每 {settings.QUOTES_INGEST_INTERVAL_SECONDS}s")
+
+        decision_runtime = DecisionSchedulerRuntime(
+            max_symbols=settings.DECISION_TRACKING_MAX_SYMBOLS
+        )
+        decision_jobs = await register_decision_scheduler_jobs(
+            scheduler,
+            config=settings,
+            runtime=decision_runtime,
+        )
+        logger.info("Decision scheduler configuration: %s", decision_jobs)
+
+        scheduler.add_job(
+            ai_candidate_service.refresh_all_active_runs,
+            IntervalTrigger(minutes=5, timezone=settings.TIMEZONE),
+            id="ai_candidate_tracking",
+            name="AI候选腾讯行情与生命周期复核",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("AI candidate tracking scheduled every 5 minutes")
+        scheduler.add_job(
+            ai_candidate_service.start_daily_research_for_active_users,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=9,
+                minute=40,
+                timezone=settings.TIMEZONE,
+            ),
+            id="ai_candidate_daily_research",
+            name="AI候选每日全市场重分析",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("AI candidate daily research scheduled at 09:40 on trading weekdays")
 
         # Tushare统一数据同步任务配置
         logger.info("🔄 配置Tushare统一数据同步任务...")

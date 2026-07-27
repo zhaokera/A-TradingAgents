@@ -24,6 +24,9 @@
 
     <!-- 操作栏 -->
     <el-card class="action-card" shadow="never">
+      <div class="lifecycle-filter">
+        <el-segmented v-model="selectedLifecycle" :options="lifecycleOptions" />
+      </div>
       <el-row :gutter="10" align="middle" class="filter-row">
         <el-col :xs="24" :sm="12" :md="8" :lg="7" :xl="6">
           <el-input
@@ -82,7 +85,7 @@
               :loading="syncRealtimeLoading"
             >
               <el-icon><Refresh /></el-icon>
-              同步实时行情
+              刷新腾讯行情
             </el-button>
             <!-- 只有选中的股票都是A股时才显示批量同步按钮 -->
             <el-button
@@ -119,7 +122,7 @@
         </el-table-column>
 
         <el-table-column prop="stock_name" label="股票名称" width="150" />
-        <el-table-column label="来源" width="150">
+        <el-table-column label="来源与状态" width="175">
           <template #default="{ row }">
             <div v-if="row.source === 'ai_screening'" class="ai-source-cell">
               <el-tooltip
@@ -138,6 +141,21 @@
                 size="small"
               >
                 {{ row.ai_metadata.objective_tier_label }}
+              </el-tag>
+              <el-tag
+                v-if="row.ai_metadata?.actionability_label"
+                :type="getActionabilityTagType(row.ai_metadata?.actionability)"
+                effect="plain"
+                size="small"
+              >
+                {{ row.ai_metadata.actionability_label }}
+              </el-tag>
+              <el-tag
+                :type="row.lifecycle_state === 'current' ? 'success' : 'info'"
+                effect="plain"
+                size="small"
+              >
+                {{ getLifecycleLabel(row.lifecycle_state) }}
               </el-tag>
             </div>
             <span v-else class="manual-source">手动</span>
@@ -159,10 +177,13 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="current_price" label="当前价格" width="100">
+        <el-table-column prop="current_price" label="腾讯行情" width="135">
           <template #default="{ row }">
-            <span v-if="row.current_price !== null && row.current_price !== undefined">¥{{ formatPrice(row.current_price) }}</span>
-            <span v-else>-</span>
+            <div class="quote-cell">
+              <strong v-if="row.current_price !== null && row.current_price !== undefined">¥{{ formatPrice(row.current_price) }}</strong>
+              <strong v-else>-</strong>
+              <small>{{ row.quote_source || '待刷新' }} · {{ formatQuoteTime(row.quote_trade_at) }}</small>
+            </div>
           </template>
         </el-table-column>
 
@@ -175,6 +196,25 @@
               {{ formatPercent(row.change_percent) }}
             </span>
             <span v-else>-</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="AI价格计划" min-width="245">
+          <template #default="{ row }">
+            <div v-if="row.source === 'ai_screening' && row.ai_metadata?.price_plan" class="ai-plan-cell">
+              <div>
+                <span>入手 {{ formatPrice(row.ai_metadata.price_plan.entry_price) }}</span>
+                <small>{{ formatEntryDistance(row) }}</small>
+              </div>
+              <div>
+                <span>失效 {{ formatPrice(row.ai_metadata.price_plan.stop_price) }}</span>
+                <span>目标 {{ formatPrice(row.ai_metadata.price_plan.target_price) }}</span>
+              </div>
+              <small v-if="row.ai_metadata?.position_sizing?.status === 'sized'">
+                仓位上限 {{ row.ai_metadata.position_sizing.suggested_quantity }}股 / {{ row.ai_metadata.position_sizing.suggested_position_pct }}%
+              </small>
+            </div>
+            <span v-else class="manual-source">-</span>
           </template>
         </el-table-column>
 
@@ -567,6 +607,20 @@ const selectedTag = ref('')
 const selectedMarket = ref('')
 const selectedBoard = ref('')
 const selectedExchange = ref('')
+const selectedLifecycle = ref<'all' | 'current' | 'history' | 'manual'>('all')
+const lifecycleOptions = [
+  { label: '全部', value: 'all' },
+  { label: '当前 AI', value: 'current' },
+  { label: 'AI 历史', value: 'history' },
+  { label: '手动', value: 'manual' }
+]
+const getLifecycleLabel = (value?: string) => ({
+  current: '当前批次',
+  superseded: '历史批次',
+  expired: '已过期',
+  invalidated: '已失效',
+  target_reached: '目标已达'
+}[value || ''] || 'AI 历史')
 
 // 批量选择
 const selectedStocks = ref<FavoriteItem[]>([])
@@ -668,6 +722,14 @@ const editForm = ref({
 const filteredFavorites = computed<FavoriteItem[]>(() => {
   let result: FavoriteItem[] = favorites.value
 
+  if (selectedLifecycle.value === 'current') {
+    result = result.filter(item => item.source === 'ai_screening' && item.lifecycle_state === 'current')
+  } else if (selectedLifecycle.value === 'history') {
+    result = result.filter(item => item.source === 'ai_screening' && item.lifecycle_state !== 'current')
+  } else if (selectedLifecycle.value === 'manual') {
+    result = result.filter(item => item.source !== 'ai_screening')
+  }
+
   // 关键词搜索
   if (searchKeyword.value) {
     const keyword = searchKeyword.value.toLowerCase()
@@ -733,7 +795,7 @@ const loadFavorites = async () => {
   }
 }
 
-// 同步实时行情
+// 列表接口统一使用腾讯行情优先链路。
 const syncRealtimeLoading = ref(false)
 const syncAllRealtime = async () => {
   if (favorites.value.length === 0) {
@@ -743,19 +805,11 @@ const syncAllRealtime = async () => {
 
   syncRealtimeLoading.value = true
   try {
-    const res = await favoritesApi.syncRealtime('tushare')
-    const data = (res as any)?.data
-
-    if ((res as any)?.success) {
-      ElMessage.success(data?.message || `同步完成: 成功 ${data?.success_count} 只`)
-      // 重新加载自选股列表以获取最新价格
-      await loadFavorites()
-    } else {
-      ElMessage.error((res as any)?.message || '同步失败')
-    }
+    await loadFavorites()
+    ElMessage.success('腾讯行情已刷新')
   } catch (error: any) {
-    console.error('同步实时行情失败:', error)
-    ElMessage.error(error.message || '同步失败，请稍后重试')
+    console.error('刷新腾讯行情失败:', error)
+    ElMessage.error(error.message || '刷新失败，请稍后重试')
   } finally {
     syncRealtimeLoading.value = false
   }
@@ -1201,6 +1255,13 @@ const getObjectiveTagType = (tier?: string): 'success' | 'warning' | 'info' => {
   return 'info'
 }
 
+const getActionabilityTagType = (status?: string): 'success' | 'warning' | 'danger' | 'info' => {
+  if (status === 'ready_now') return 'success'
+  if (status === 'condition_order') return 'warning'
+  if (status === 'blocked' || status === 'invalidated') return 'danger'
+  return 'info'
+}
+
 
 const formatPrice = (value: any): string => {
   const n = Number(value)
@@ -1216,6 +1277,22 @@ const formatPercent = (value: any): string => {
 
 const formatDate = (dateStr: string) => {
   return new Date(dateStr).toLocaleDateString('zh-CN')
+}
+
+const formatQuoteTime = (value?: string | null) => {
+  if (!value) return '时间缺失'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? '时间缺失'
+    : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
+const formatEntryDistance = (row: any) => {
+  const current = Number(row.current_price)
+  const entry = Number(row.ai_metadata?.price_plan?.entry_price)
+  if (!Number.isFinite(current) || !Number.isFinite(entry) || current <= 0) return '距离待刷新'
+  const distance = ((entry - current) / current) * 100
+  return `距条件 ${distance > 0 ? '+' : ''}${distance.toFixed(2)}%`
 }
 
 // 生命周期
@@ -1248,6 +1325,30 @@ onMounted(() => {
   .manual-source {
     color: var(--el-text-color-secondary);
     font-size: 13px;
+  }
+
+  .quote-cell,
+  .ai-plan-cell {
+    display: flex;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+
+    strong,
+    span {
+      font-variant-numeric: tabular-nums;
+    }
+
+    small {
+      color: var(--el-text-color-secondary);
+      font-size: 11px;
+    }
+  }
+
+  .ai-plan-cell > div {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
   .page-header {
@@ -1290,6 +1391,19 @@ onMounted(() => {
 
     .filter-row {
       row-gap: 10px;
+    }
+
+    .lifecycle-filter {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding-bottom: 10px;
+
+      span {
+        color: var(--el-text-color-secondary);
+        font-size: 12px;
+      }
     }
 
     :deep(.el-select),

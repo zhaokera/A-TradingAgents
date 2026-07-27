@@ -8,6 +8,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Union
@@ -185,10 +186,12 @@ class TradingAgentsLogger:
     
     def _setup_logging(self):
         """设置日志系统"""
-        # 创建日志目录
-        if self.config['handlers']['file']['enabled']:
-            log_dir = Path(self.config['handlers']['file']['directory'])
-            log_dir.mkdir(parents=True, exist_ok=True)
+        file_logging_enabled = (
+            not self.config['docker']['enabled']
+            or not self.config['docker']['stdout_only']
+        )
+        if file_logging_enabled:
+            self._prepare_log_directories()
         
         # 设置根日志级别
         root_logger = logging.getLogger()
@@ -208,6 +211,48 @@ class TradingAgentsLogger:
         
         # 配置特定日志器
         self._configure_specific_loggers()
+
+    def _prepare_log_directories(self) -> None:
+        """Create configured log directories, falling back outside containers."""
+        handler_names = ("file", "error", "structured")
+        file_directory = self.config["handlers"].get("file", {}).get(
+            "directory", "./logs"
+        )
+        enabled_handlers = []
+        for name in handler_names:
+            handler = self.config["handlers"].setdefault(name, {})
+            default_enabled = name == "error"
+            if not handler.get("enabled", default_enabled):
+                continue
+            handler.setdefault("directory", file_directory)
+            enabled_handlers.append(handler)
+        try:
+            for handler in enabled_handlers:
+                Path(handler["directory"]).mkdir(parents=True, exist_ok=True)
+            return
+        except OSError as exc:
+            fallback = Path(tempfile.gettempdir()) / "a-tradingagents-logs"
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                for handler in enabled_handlers:
+                    handler["enabled"] = False
+                _bootstrap_logger.warning(
+                    "无法创建日志目录，已禁用文件日志: %s",
+                    exc,
+                )
+                return
+
+            for handler in enabled_handlers:
+                handler["directory"] = str(fallback)
+                filename = handler.get("filename")
+                if filename and Path(str(filename)).is_absolute():
+                    handler["filename"] = Path(str(filename)).name
+            _bootstrap_logger.warning(
+                "日志目录不可写，已回退到 %s: %s",
+                fallback,
+                exc,
+            )
     
     def _add_console_handler(self, logger: logging.Logger):
         """添加控制台处理器"""
