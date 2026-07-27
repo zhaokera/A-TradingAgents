@@ -143,19 +143,36 @@ async def get_task_status_new(
 
                 # 计算时间信息
                 start_time = task_result.get("started_at") or task_result.get("created_at")
-                current_time = datetime.utcnow()
+                end_time = task_result.get("completed_at")
+                terminal_statuses = {"completed", "failed", "cancelled"}
+                elapsed_until = (
+                    end_time
+                    if status in terminal_statuses and end_time
+                    else datetime.utcnow()
+                )
                 elapsed_time = 0
                 if start_time:
-                    elapsed_time = (current_time - start_time).total_seconds()
+                    elapsed_time = max(
+                        0,
+                        (elapsed_until - start_time).total_seconds(),
+                    )
+                status_messages = {
+                    "pending": "任务等待执行",
+                    "processing": "任务分析中",
+                    "running": "任务分析中",
+                    "completed": "分析完成",
+                    "failed": "分析失败",
+                    "cancelled": "任务已取消",
+                }
 
                 status_data = {
                     "task_id": task_id,
                     "status": status,
                     "progress": progress,
-                    "message": f"任务{status}中...",
+                    "message": status_messages.get(status, f"任务状态：{status}"),
                     "current_step": status,
                     "start_time": start_time,
-                    "end_time": task_result.get("completed_at"),
+                    "end_time": end_time,
                     "elapsed_time": elapsed_time,
                     "remaining_time": 0,  # 无法准确估算
                     "estimated_total_time": 0,
