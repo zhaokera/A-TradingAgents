@@ -64,6 +64,8 @@ MAINTAINED_ROOT_TESTS = {
     "test_portfolio_diversification_service.py",
     "test_portfolio_target_analysis.py",
     "test_product_optimization_contracts.py",
+    "test_public_candidate_discovery_service.py",
+    "test_stocks_kline_contract.py",
     "test_public_candidate_pipeline.py",
     "test_public_candidate_pipeline_contract.py",
     "test_public_candidate_pipeline_integration.py",

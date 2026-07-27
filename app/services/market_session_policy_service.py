@@ -12,6 +12,7 @@ from app.services.a_share_calendar_service import AShareCalendarService
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 LIVE_PHASES = frozenset({"live_am", "live_pm"})
 QUOTE_MAX_AGE_SECONDS = 90
+EVENT_MAX_FUTURE_SKEW_SECONDS = 5
 
 
 def _as_shanghai_datetime(value: Any) -> Optional[datetime]:
@@ -123,10 +124,29 @@ class MarketSessionPolicyService:
         source = str(quote.get("source") or "unknown").strip().lower()
         trade_at = _as_shanghai_datetime(quote.get("trade_at"))
         age_seconds = (local_now - trade_at).total_seconds() if trade_at else None
+        event_confirmation_required = (
+            quote.get("event_confirmation_required") is True
+        )
+        event_observed_at = _as_shanghai_datetime(quote.get("event_observed_at"))
+        event_age_seconds = (
+            (local_now - event_observed_at).total_seconds()
+            if event_observed_at
+            else None
+        )
         serialized_age = (
             int(age_seconds)
             if age_seconds is not None and age_seconds.is_integer()
             else age_seconds
+        )
+        bounded_event_age = (
+            max(0.0, event_age_seconds)
+            if event_age_seconds is not None
+            else None
+        )
+        serialized_event_age = (
+            int(bounded_event_age)
+            if bounded_event_age is not None and bounded_event_age.is_integer()
+            else bounded_event_age
         )
         result = {
             "actionable": False,
@@ -137,6 +157,13 @@ class MarketSessionPolicyService:
             "trade_date": trade_at.date().isoformat() if trade_at else None,
             "age_seconds": serialized_age,
             "max_age_seconds": self.quote_max_age_seconds,
+            "event_confirmation_required": event_confirmation_required,
+            "event_observed_at": (
+                event_observed_at.isoformat(timespec="seconds")
+                if event_observed_at
+                else None
+            ),
+            "event_age_seconds": serialized_event_age,
         }
 
         if phase == "calendar_unknown":
@@ -165,6 +192,21 @@ class MarketSessionPolicyService:
             return {**result, "status": "future_trade_at"}
         if age_seconds is not None and age_seconds > self.quote_max_age_seconds:
             return {**result, "status": "stale_trade_at"}
+        if event_confirmation_required:
+            if event_observed_at is None:
+                return {**result, "status": "missing_event_confirmation"}
+            if event_observed_at.date() != local_now.date():
+                return {**result, "status": "wrong_event_confirmation_date"}
+            if (
+                event_age_seconds is not None
+                and event_age_seconds < -EVENT_MAX_FUTURE_SKEW_SECONDS
+            ):
+                return {**result, "status": "future_event_confirmation"}
+            if (
+                event_age_seconds is not None
+                and event_age_seconds > self.quote_max_age_seconds
+            ):
+                return {**result, "status": "stale_event_confirmation"}
         return {**result, "actionable": True, "status": "fresh"}
 
 

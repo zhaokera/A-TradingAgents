@@ -4,7 +4,8 @@
 - 所有端点均需鉴权 (Bearer Token)
 - 路径前缀在 main.py 中挂载为 /api，当前路由自身前缀为 /stocks
 """
-from typing import Optional, Dict, Any, List, Tuple
+from datetime import date, datetime
+from typing import Optional, Dict, Any, List, Mapping, Tuple
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 import logging
 import re
@@ -12,10 +13,79 @@ import re
 from app.routers.auth_db import get_current_user
 from app.core.database import get_mongo_db
 from app.core.response import ok
+from app.services.tencent_quote_service import (
+    fetch_tencent_daily_bars_sync,
+    merge_tencent_quote_into_bars,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/stocks", tags=["stocks"])
+
+
+def _quote_trade_date(value: Mapping[str, Any]) -> Optional[str]:
+    raw = value.get("trade_date") or value.get("trade_at")
+    if isinstance(raw, datetime):
+        return raw.date().isoformat()
+    if isinstance(raw, date):
+        return raw.isoformat()
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        digits = "".join(character for character in text if character.isdigit())
+        if len(digits) < 8:
+            return None
+        try:
+            return datetime.strptime(digits[:8], "%Y%m%d").date().isoformat()
+        except ValueError:
+            return None
+
+
+def _merge_same_day_tencent_quote(
+    items: List[Dict[str, Any]],
+    quote: Mapping[str, Any],
+    *,
+    expected_trade_date: str,
+) -> Tuple[List[Dict[str, Any]], str]:
+    source = str(quote.get("source") or quote.get("data_source") or "").lower()
+    if source != "tencent":
+        return items, "unsupported_quote_source"
+    if _quote_trade_date(quote) != expected_trade_date:
+        return items, "wrong_quote_trade_date"
+    bars = [
+        {
+            "date": item.get("time"),
+            "open": item.get("open"),
+            "high": item.get("high"),
+            "low": item.get("low"),
+            "close": item.get("close"),
+            "volume": item.get("volume"),
+            "amount": item.get("amount"),
+        }
+        for item in items
+    ]
+    merged = merge_tencent_quote_into_bars(
+        bars,
+        {**dict(quote), "trade_date": expected_trade_date},
+    )
+    if merged.get("ok") is not True:
+        return items, str(merged.get("status") or "quote_merge_rejected")
+    normalized = [
+        {
+            "time": bar.get("date"),
+            "open": bar.get("open"),
+            "high": bar.get("high"),
+            "low": bar.get("low"),
+            "close": bar.get("close"),
+            "volume": bar.get("volume"),
+            "amount": bar.get("amount"),
+        }
+        for bar in merged.get("bars", [])
+    ]
+    return normalized, str(merged.get("merge_action") or "merged")
 
 
 def _zfill_code(code: str) -> str:
@@ -508,35 +578,61 @@ async def get_kline(
     today_str_yyyymmdd = now.strftime("%Y%m%d")  # 格式：20251028（用于查询）
     today_str_formatted = now.strftime("%Y-%m-%d")  # 格式：2025-10-28（用于返回）
 
+    # 强制刷新前复权日线时直接使用腾讯历史源，避免旧缓存或跨源拼接污染。
+    if force_refresh and period == "day" and adj_norm == "qfq":
+        import asyncio
+
+        result = await asyncio.to_thread(
+            fetch_tencent_daily_bars_sync,
+            code_padded,
+            min_rows=1,
+        )
+        bars = result.get("bars") if isinstance(result, Mapping) else None
+        if isinstance(bars, list) and bars:
+            items = [
+                {
+                    "time": bar.get("date"),
+                    "open": bar.get("open"),
+                    "high": bar.get("high"),
+                    "low": bar.get("low"),
+                    "close": bar.get("close"),
+                    "volume": bar.get("volume"),
+                    "amount": bar.get("amount"),
+                }
+                for bar in bars[-limit:]
+            ]
+            source = "tencent_qfq_daily"
+
     # 1. 优先从 MongoDB 缓存获取
-    try:
-        from tradingagents.dataflows.cache.mongodb_cache_adapter import get_mongodb_cache_adapter
-        adapter = get_mongodb_cache_adapter()
+    if not items and not force_refresh:
+        try:
+            from tradingagents.dataflows.cache.mongodb_cache_adapter import get_mongodb_cache_adapter
+            adapter = get_mongodb_cache_adapter()
 
-        # 计算日期范围
-        end_date = now.strftime("%Y-%m-%d")
-        start_date = (now - timedelta(days=limit * 2)).strftime("%Y-%m-%d")
+            # 计算日期范围
+            end_date = now.strftime("%Y-%m-%d")
+            start_date = (now - timedelta(days=limit * 2)).strftime("%Y-%m-%d")
 
-        logger.info(f"🔍 尝试从 MongoDB 获取 K 线数据: {code_padded}, period={period} (MongoDB: {mongodb_period}), limit={limit}")
-        df = adapter.get_historical_data(code_padded, start_date, end_date, period=mongodb_period)
+            logger.info(f"🔍 尝试从 MongoDB 获取 K 线数据: {code_padded}, period={period} (MongoDB: {mongodb_period}), limit={limit}")
+            df = adapter.get_historical_data(code_padded, start_date, end_date, period=mongodb_period)
 
-        if df is not None and not df.empty:
-            # 转换 DataFrame 为列表格式
-            items = []
-            for _, row in df.tail(limit).iterrows():
-                items.append({
-                    "time": row.get("trade_date", row.get("date", "")),  # 前端期望 time 字段
-                    "open": float(row.get("open", 0)),
-                    "high": float(row.get("high", 0)),
-                    "low": float(row.get("low", 0)),
-                    "close": float(row.get("close", 0)),
-                    "volume": float(row.get("volume", row.get("vol", 0))),
-                    "amount": float(row.get("amount", 0)) if "amount" in row else None,
-                })
-            source = "mongodb"
-            logger.info(f"✅ 从 MongoDB 获取到 {len(items)} 条 K 线数据")
-    except Exception as e:
-        logger.warning(f"⚠️ MongoDB 获取 K 线失败: {e}")
+            if df is not None and not df.empty:
+                # 转换 DataFrame 为列表格式
+                items = []
+                for _, row in df.tail(limit).iterrows():
+                    items.append({
+                        "time": row.get("trade_date", row.get("date", "")),  # 前端期望 time 字段
+                        "open": float(row.get("open", 0)),
+                        "high": float(row.get("high", 0)),
+                        "low": float(row.get("low", 0)),
+                        "close": float(row.get("close", 0)),
+                        "volume": float(row.get("volume", row.get("vol", 0))),
+                        "amount": float(row.get("amount", 0)) if "amount" in row else None,
+                    })
+                source = "mongodb"
+                logger.info(f"✅ 从 MongoDB 获取到 {len(items)} 条 K 线数据")
+        except Exception as e:
+            logger.warning(f"⚠️ MongoDB 获取 K 线失败: {e}")
 
     # 2. 如果 MongoDB 没有数据，降级到外部 API（带超时保护）
     if not items:
@@ -559,7 +655,7 @@ async def get_kline(
             raise HTTPException(status_code=500, detail=f"获取K线数据失败: {str(e)}")
 
     # 🔥 3. 检查是否需要添加当天实时数据（仅针对日线）
-    if period == "day" and items:
+    if period == "day" and adj_norm is None and items:
         try:
             # 检查历史数据中是否已有当天的数据（支持两种日期格式）
             has_today_data = any(
@@ -594,28 +690,19 @@ async def get_kline(
                 realtime_quote = await market_quotes_coll.find_one({"code": code_padded})
 
                 if realtime_quote:
-                    # 🔥 构造当天的K线数据（使用统一的日期格式 YYYY-MM-DD）
-                    today_kline = {
-                        "time": today_str_formatted,  # 🔥 使用 YYYY-MM-DD 格式，与历史数据保持一致
-                        "open": float(realtime_quote.get("open", 0)),
-                        "high": float(realtime_quote.get("high", 0)),
-                        "low": float(realtime_quote.get("low", 0)),
-                        "close": float(realtime_quote.get("close", 0)),
-                        "volume": float(realtime_quote.get("volume", 0)),
-                        "amount": float(realtime_quote.get("amount", 0)),
-                    }
-
-                    # 如果历史数据中已有当天数据，替换；否则追加
-                    if has_today_data:
-                        # 替换最后一条数据（假设最后一条是当天的）
-                        items[-1] = today_kline
-                        logger.info(f"✅ 替换当天K线数据: {code_padded}")
+                    items, merge_status = _merge_same_day_tencent_quote(
+                        items,
+                        realtime_quote,
+                        expected_trade_date=today_str_formatted,
+                    )
+                    if merge_status in {"append", "replace"}:
+                        source = f"{source}+market_quotes_tencent_same_day"
                     else:
-                        # 追加到末尾
-                        items.append(today_kline)
-                        logger.info(f"✅ 追加当天K线数据: {code_padded}")
-
-                    source = f"{source}+market_quotes"
+                        logger.warning(
+                            "忽略不可用于当天K线的行情: code=%s status=%s",
+                            code_padded,
+                            merge_status,
+                        )
                 else:
                     logger.warning(f"⚠️ market_quotes 中未找到当天数据: {code_padded}")
         except Exception as e:

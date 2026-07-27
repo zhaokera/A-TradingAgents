@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
+import json
 import logging
 import math
 import re
@@ -55,8 +58,8 @@ _BLOCKING_RISK_CODES = {
 }
 
 _ACTIONABILITY_LABELS = {
-    "ready_now": "价格条件已满足",
-    "condition_order": "可设置条件提醒",
+    "ready_now": "研究价格条件已满足",
+    "condition_order": "研究条件待触发",
     "blocked": "风险阻断",
     "invalidated": "计划失效",
     "target_reached": "已达到目标价",
@@ -116,6 +119,107 @@ def _finite_number(*values: Any) -> Optional[float]:
         if math.isfinite(number):
             return round(number, 4)
     return None
+
+
+def _quote_event_changed(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    for field in ("price", "volume", "amount"):
+        before = _finite_number(previous.get(field))
+        after = _finite_number(current.get(field))
+        if before is not None and after is not None and before != after:
+            return True
+    return False
+
+
+def _normalized_code_set(value: Any) -> set[str]:
+    if not isinstance(value, Iterable) or isinstance(value, (str, bytes, Mapping)):
+        return set()
+    return {
+        str(code or "").strip()
+        for code in value
+        if _A_SHARE_CODE.fullmatch(str(code or "").strip())
+    }
+
+
+def _candidate_governance_reason(
+    code: Any,
+    governance: Mapping[str, Any],
+) -> Optional[str]:
+    normalized = str(code or "").strip()
+    if normalized in _normalized_code_set(governance.get("excluded_codes")):
+        return "user_excluded"
+    if normalized.startswith(("688", "689")):
+        star = governance.get("star_market")
+        star = star if isinstance(star, Mapping) else {}
+        if star.get("eligible") is not True:
+            return (
+                "star_market_permission_denied"
+                if star.get("verified") is True
+                else "star_market_permission_unverified"
+            )
+    return None
+
+
+def _candidate_governance_from_settings(
+    settings: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    settings = settings if isinstance(settings, Mapping) else {}
+    capabilities = settings.get("execution_capabilities")
+    capabilities = capabilities if isinstance(capabilities, Mapping) else {}
+    market_permissions = capabilities.get("market_permissions")
+    market_permissions = (
+        market_permissions if isinstance(market_permissions, Mapping) else {}
+    )
+    star = market_permissions.get("star_market")
+    star = star if isinstance(star, Mapping) else {}
+    star_verified = star.get("verified") is True
+    star_tradable = star.get("tradable") is True
+    return {
+        "excluded_codes": sorted(
+            _normalized_code_set(settings.get("excluded_codes"))
+        ),
+        "star_market": {
+            "verified": star_verified,
+            "tradable": star_tradable,
+            "eligible": star_verified and star_tradable,
+        },
+    }
+
+
+def _shadow_plan_identity(
+    document: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> str:
+    explicit = str(candidate.get("plan_id") or "").strip()
+    if explicit:
+        return explicit
+    plan = (
+        candidate.get("price_plan")
+        if isinstance(candidate.get("price_plan"), Mapping)
+        else {}
+    )
+    payload = {
+        "code": str(candidate.get("code") or "").strip(),
+        "entry_strategy": plan.get("entry_strategy"),
+        "entry_price": _finite_number(plan.get("entry_price")),
+        "stop_price": _finite_number(plan.get("stop_price")),
+        "target_price": _finite_number(plan.get("target_price")),
+        "order_limit_price": _finite_number(plan.get("order_limit_price")),
+        "plan_expires_at": str(
+            candidate.get("plan_expires_at")
+            or document.get("plan_expires_at")
+            or ""
+        ),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
 
 
 def _normalize_observation_zone(value: Any) -> Optional[List[float]]:
@@ -253,7 +357,10 @@ def _apply_candidate_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "ready_now",
         "condition_order",
     }
-    candidate["condition_order_ready"] = actionability == "condition_order"
+    candidate["research_condition_ready"] = actionability == "condition_order"
+    candidate["condition_order_ready"] = False
+    candidate["execution_actionable"] = False
+    candidate["execution_status"] = "research_only"
     return candidate
 
 
@@ -603,6 +710,23 @@ def normalize_ai_candidate(
         "initial_reference_price": reference_price,
         "pct_change": _finite_number(quote.get("pct_change"), tencent.get("pct_change")),
         "trade_at": quote.get("trade_at"),
+        "quote": {
+            "price": reference_price,
+            "source": str(
+                quote.get("source")
+                or quote.get("data_source")
+                or tencent.get("source")
+                or tencent.get("data_source")
+                or "unknown"
+            ).strip().lower(),
+            "trade_at": quote.get("trade_at"),
+            "quote_checked_at": quote.get("quote_checked_at"),
+            "volume": _finite_number(quote.get("volume")),
+            "amount": _finite_number(quote.get("amount")),
+            "event_confirmation_required": True,
+            "event_change_detected": False,
+            "event_observed_at": None,
+        },
         "price_plan": price_plan,
         "plans": _build_horizon_plans(price_plan),
         "reason_summary": _candidate_reason(candidate),
@@ -684,6 +808,11 @@ def normalize_ai_candidate_run(
         "status": "completed",
         "source": "public_full_market",
         "source_detail": meta.get("source"),
+        "execution": {
+            "actionable": False,
+            "status": "research_only",
+            "requires_daily_decision": True,
+        },
         "candidate_count": len(candidates),
         "candidates": candidates,
         "actionability_counts": actionability_counts,
@@ -702,6 +831,12 @@ def normalize_ai_candidate_run(
             "technical_passed_count": discovery.get("technical_passed_count"),
             "earnings_selected_count": discovery.get("earnings_selected_count"),
             "total_coverage_ratio": discovery.get("total_coverage_ratio"),
+            "permission_prefilter_excluded_count": discovery.get(
+                "permission_prefilter_excluded_count", 0
+            ),
+            "permission_prefilter_excluded": deepcopy(
+                discovery.get("permission_prefilter_excluded") or []
+            ),
         },
         "market": {
             "session": market_session.get("session"),
@@ -914,6 +1049,102 @@ class AICandidateService:
         performance["shadow_trade"] = shadow
         candidate["performance"] = performance
 
+    async def _candidate_governance(self, user_id: str) -> Dict[str, Any]:
+        db = await self._get_db()
+        try:
+            settings = await db["user_holding_settings"].find_one(
+                {"user_id": str(user_id)}
+            )
+        except Exception:
+            settings = None
+        return _candidate_governance_from_settings(settings)
+
+    async def _run_research(
+        self,
+        governance: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {}
+        try:
+            parameters = inspect.signature(self._research_runner).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if accepts_kwargs or "excluded_code_reasons" in parameters:
+            kwargs["excluded_code_reasons"] = {
+                code: "user_excluded"
+                for code in governance.get("excluded_codes") or []
+            }
+        if accepts_kwargs or "star_market_exclusion_reason" in parameters:
+            star = governance.get("star_market")
+            star = star if isinstance(star, Mapping) else {}
+            if star.get("eligible") is not True:
+                kwargs["star_market_exclusion_reason"] = (
+                    "star_market_permission_denied"
+                    if star.get("verified") is True
+                    else "star_market_permission_unverified"
+                )
+        result = await run_in_threadpool(self._research_runner, **kwargs)
+        return dict(result) if isinstance(result, Mapping) else {}
+
+    @staticmethod
+    def _apply_candidate_governance(
+        document: Dict[str, Any],
+        governance: Mapping[str, Any],
+    ) -> None:
+        permitted: List[Dict[str, Any]] = []
+        excluded: List[Dict[str, Any]] = []
+        for candidate in document.get("candidates", []):
+            if not isinstance(candidate, Mapping):
+                continue
+            item = deepcopy(dict(candidate))
+            reason = _candidate_governance_reason(item.get("code"), governance)
+            if reason:
+                item["plan_id"] = _shadow_plan_identity(document, item)
+                excluded.append(
+                    {
+                        **item,
+                        "governance_status": "excluded",
+                        "governance_reason": reason,
+                        "execution_actionable": False,
+                        "execution_status": "governance_excluded",
+                    }
+                )
+            else:
+                permitted.append(item)
+        existing_excluded = [
+            deepcopy(dict(item))
+            for item in document.get("governance_excluded_candidates", [])
+            if isinstance(item, Mapping)
+        ]
+        known = {
+            (
+                str(item.get("code") or ""),
+                str(item.get("plan_id") or ""),
+                str(item.get("governance_reason") or ""),
+            )
+            for item in existing_excluded
+        }
+        for item in excluded:
+            key = (
+                str(item.get("code") or ""),
+                str(item.get("plan_id") or ""),
+                str(item.get("governance_reason") or ""),
+            )
+            if key not in known:
+                existing_excluded.append(item)
+                known.add(key)
+        document["candidates"] = permitted
+        document["governance"] = {
+            "excluded_codes": list(governance.get("excluded_codes") or []),
+            "star_market": deepcopy(dict(governance.get("star_market") or {})),
+            "excluded_count": len(existing_excluded),
+            "execution_scope": "candidate_research_only",
+        }
+        document["governance_excluded_candidates"] = existing_excluded
+
     async def _account_context(self, user_id: str) -> Dict[str, Any]:
         db = await self._get_db()
         try:
@@ -956,6 +1187,12 @@ class AICandidateService:
             "available_cash": round(available_cash, 2),
             "current_exposure_pct": round(exposure_pct, 2),
             "holding_values": holding_values,
+            "execution_capabilities": deepcopy(
+                (settings_doc or {}).get("execution_capabilities") or {}
+            ),
+            "excluded_codes": sorted(
+                _normalized_code_set((settings_doc or {}).get("excluded_codes"))
+            ),
         }
 
     async def _apply_objective_profiles(self, document: Dict[str, Any]) -> None:
@@ -1177,6 +1414,10 @@ class AICandidateService:
         persist: bool = True,
         notify: bool = True,
     ) -> Dict[str, Any]:
+        governance = await self._candidate_governance(str(user_id))
+        self._apply_candidate_governance(document, governance)
+        refresh_now = datetime.now(timezone.utc)
+        checked_at = refresh_now.isoformat()
         candidates = [
             item for item in document.get("candidates", []) if isinstance(item, dict)
         ]
@@ -1199,14 +1440,13 @@ class AICandidateService:
                 * 100,
                 2,
             )
-            benchmark["checked_at"] = datetime.now(timezone.utc).isoformat()
+            benchmark["checked_at"] = checked_at
         favorite_codes = await self._favorites.get_favorite_codes(user_id)
-        checked_at = datetime.now(timezone.utc).isoformat()
         plan_expires_at = document.get("plan_expires_at")
         if isinstance(plan_expires_at, datetime):
             if plan_expires_at.tzinfo is None:
                 plan_expires_at = plan_expires_at.replace(tzinfo=timezone.utc)
-            plan_expired = datetime.now(timezone.utc) >= plan_expires_at
+            plan_expired = refresh_now >= plan_expires_at
         else:
             plan_expired = False
         for candidate in candidates:
@@ -1215,11 +1455,43 @@ class AICandidateService:
                 enriched_before.get("actionability") or ""
             ) if isinstance(enriched_before, Mapping) else None
             quote = quote_map.get(str(candidate.get("code") or ""), {})
+            previous_quote = (
+                candidate.get("quote")
+                if isinstance(candidate.get("quote"), Mapping)
+                else {}
+            )
             current_price = _finite_number(
                 quote.get("price") if isinstance(quote, Mapping) else None,
                 quote.get("close") if isinstance(quote, Mapping) else None,
                 quote.get("current_price") if isinstance(quote, Mapping) else None,
             )
+            quote_source = str(
+                quote.get("source") or quote.get("data_source") or "unknown"
+            ).strip().lower()
+            current_quote = {
+                "price": current_price,
+                "source": quote_source,
+                "trade_at": quote.get("trade_at"),
+                "quote_checked_at": checked_at,
+                "volume": _finite_number(quote.get("volume")),
+                "amount": _finite_number(quote.get("amount")),
+            }
+            event_change_detected = _quote_event_changed(
+                previous_quote,
+                current_quote,
+            )
+            current_quote.update(
+                {
+                    "event_confirmation_required": True,
+                    "event_change_detected": event_change_detected,
+                    "event_observed_at": (
+                        checked_at
+                        if event_change_detected
+                        else previous_quote.get("event_observed_at")
+                    ),
+                }
+            )
+            candidate["quote"] = current_quote
             if current_price is not None:
                 candidate.setdefault(
                     "initial_reference_price", candidate.get("reference_price")
@@ -1227,31 +1499,34 @@ class AICandidateService:
                 candidate["reference_price"] = current_price
                 candidate["pct_change"] = _finite_number(quote.get("pct_chg"))
                 candidate["trade_at"] = quote.get("trade_at")
-                candidate["quote_source"] = str(
-                    quote.get("source") or quote.get("data_source") or "unknown"
-                )
+                candidate["quote_source"] = quote_source
                 candidate["quote_checked_at"] = checked_at
             refreshed = _enrich_saved_candidate(candidate)
             if isinstance(refreshed, dict):
                 candidate.clear()
                 candidate.update(refreshed)
             candidate["plan_expired"] = plan_expired
-            self._update_performance(
-                candidate,
-                current_price=current_price,
-                checked_at=checked_at,
-                observation_key=str(
-                    (quote.get("trade_at") if isinstance(quote, Mapping) else None)
-                    or checked_at
-                ),
-                session_high=_finite_number(
-                    quote.get("high") if isinstance(quote, Mapping) else None
-                ),
-                session_low=_finite_number(
-                    quote.get("low") if isinstance(quote, Mapping) else None
-                ),
-                benchmark_price=benchmark_price,
-            )
+            if event_change_detected:
+                self._update_performance(
+                    candidate,
+                    current_price=current_price,
+                    checked_at=checked_at,
+                    observation_key=str(
+                        (
+                            quote.get("trade_at")
+                            if isinstance(quote, Mapping)
+                            else None
+                        )
+                        or checked_at
+                    ),
+                    session_high=_finite_number(
+                        quote.get("high") if isinstance(quote, Mapping) else None
+                    ),
+                    session_low=_finite_number(
+                        quote.get("low") if isinstance(quote, Mapping) else None
+                    ),
+                    benchmark_price=benchmark_price,
+                )
             if plan_expired:
                 performance = candidate.get("performance")
                 if isinstance(performance, dict):
@@ -1266,7 +1541,7 @@ class AICandidateService:
                 if candidate.get("code") in favorite_codes
                 else "not_added"
             )
-            if notify:
+            if notify and event_change_detected:
                 await self._publish_transition(
                     user_id=user_id,
                     candidate=candidate,
@@ -1274,6 +1549,37 @@ class AICandidateService:
                 )
         await self._apply_objective_profiles(document)
         await self._apply_macro_policy(document)
+        market = document.setdefault("market", {})
+        discovery_snapshot = market.get("discovery_snapshot")
+        if not isinstance(discovery_snapshot, Mapping):
+            market["discovery_snapshot"] = {
+                key: deepcopy(market.get(key))
+                for key in (
+                    "session",
+                    "is_trading_hours",
+                    "local_time",
+                    "decision",
+                    "reason_code",
+                )
+            }
+        market.update(
+            {
+                "session": "quote_refresh_only",
+                "is_trading_hours": False,
+                "local_time": refresh_now.astimezone(
+                    timezone(timedelta(hours=8))
+                ).isoformat(),
+                "execution_usable": False,
+                "execution_status": "research_snapshot_not_execution_decision",
+                "decision": None,
+                "reason_code": "daily_decision_required",
+            }
+        )
+        document["execution"] = {
+            "actionable": False,
+            "status": "research_only",
+            "requires_daily_decision": True,
+        }
         candidates.sort(
             key=lambda item: (
                 _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
@@ -1320,6 +1626,11 @@ class AICandidateService:
                         "account": deepcopy(document.get("account")),
                         "portfolio_plan": deepcopy(document.get("portfolio_plan")),
                         "market": deepcopy(document.get("market")),
+                        "execution": deepcopy(document.get("execution")),
+                        "governance": deepcopy(document.get("governance")),
+                        "governance_excluded_candidates": deepcopy(
+                            document.get("governance_excluded_candidates")
+                        ),
                         "benchmark": deepcopy(document.get("benchmark")),
                         "updated_at": document["updated_at"],
                         "quote_refreshed_at": checked_at,
@@ -1330,7 +1641,8 @@ class AICandidateService:
 
     async def run(self, user_id: str, *, max_candidates: int = 5) -> Dict[str, Any]:
         favorite_codes = await self._favorites.get_favorite_codes(user_id)
-        payload = await run_in_threadpool(self._research_runner)
+        governance = await self._candidate_governance(str(user_id))
+        payload = await self._run_research(governance)
         normalized = normalize_ai_candidate_run(
             payload,
             max_candidates=max(20, max_candidates * 4),
@@ -1345,6 +1657,7 @@ class AICandidateService:
             "expires_at": now + timedelta(days=AI_CANDIDATE_RUN_TTL_DAYS),
             **normalized,
         }
+        self._apply_candidate_governance(document, governance)
         await self._apply_objective_profiles(document)
         await self._apply_macro_policy(document)
         await self._apply_account_policy(document, user_id=str(user_id))
@@ -1418,6 +1731,10 @@ class AICandidateService:
             )
         except Exception as exc:
             logger.exception("AI candidate background research failed")
+            details = getattr(exc, "details", None)
+            stage = getattr(exc, "stage", None)
+            if not stage and isinstance(details, Mapping):
+                stage = details.get("stage")
             await jobs.update_one(
                 {"_id": job_id, "user_id": str(user_id)},
                 {
@@ -1427,7 +1744,7 @@ class AICandidateService:
                         "error": {
                             "code": getattr(exc, "code", "candidate_research_failed"),
                             "message": str(getattr(exc, "message", exc))[:500],
-                            "stage": getattr(exc, "stage", None),
+                            "stage": str(stage) if stage else None,
                         },
                         "progress": {"stage": "failed", "percent": 100},
                     }
@@ -1604,12 +1921,17 @@ class AICandidateService:
 
     async def performance_summary(self, user_id: str) -> Dict[str, Any]:
         db = await self._get_db()
+        governance = await self._candidate_governance(str(user_id))
         cursor = db["ai_candidate_runs"].find(
             {"user_id": str(user_id)},
-            {"candidates": 1, "generated_at": 1},
+            {"candidates": 1, "generated_at": 1, "plan_expires_at": 1},
         ).sort("generated_at", -1).limit(30)
         documents = await cursor.to_list(length=30)
         rows: List[Dict[str, Any]] = []
+        seen_plan_ids: set[str] = set()
+        excluded_by_reason: Dict[str, int] = {}
+        duplicate_plan_count = 0
+        raw_tracked_item_count = 0
         for document in documents:
             for candidate in document.get("candidates", []):
                 if not isinstance(candidate, Mapping):
@@ -1617,6 +1939,21 @@ class AICandidateService:
                 performance = candidate.get("performance")
                 if not isinstance(performance, Mapping):
                     continue
+                raw_tracked_item_count += 1
+                governance_reason = _candidate_governance_reason(
+                    candidate.get("code"),
+                    governance,
+                )
+                if governance_reason:
+                    excluded_by_reason[governance_reason] = (
+                        excluded_by_reason.get(governance_reason, 0) + 1
+                    )
+                    continue
+                plan_identity = _shadow_plan_identity(document, candidate)
+                if plan_identity in seen_plan_ids:
+                    duplicate_plan_count += 1
+                    continue
+                seen_plan_ids.add(plan_identity)
                 shadow = performance.get("shadow_trade")
                 if isinstance(shadow, Mapping):
                     value = _finite_number(
@@ -1648,6 +1985,7 @@ class AICandidateService:
                 rows.append(
                     {
                         "run_id": str(document.get("_id") or ""),
+                        "plan_id": plan_identity,
                         "generated_at": document.get("generated_at"),
                         "code": candidate.get("code"),
                         "name": candidate.get("name"),
@@ -1663,6 +2001,10 @@ class AICandidateService:
                         "target_hit": target_hit,
                         "stop_hit": stop_hit,
                         "observation_count": performance.get("observation_count", 0),
+                        "statistics_scope": "candidate_shadow_diagnostic",
+                        "counts_as_governed_decision_sample": False,
+                        "eligible_for_learning": False,
+                        "represents_real_account_position": False,
                     }
                 )
         shadow_rows = [row for row in rows if row["metric_basis"] == "shadow_trade"]
@@ -1679,9 +2021,21 @@ class AICandidateService:
             row for row in triggered if str(row.get("status") or "").startswith("closed_")
         ]
         return {
+            "statistics_scope": "candidate_shadow_diagnostics",
+            "description": (
+                "候选影子结果仅用于诊断候选生成，不代表真实账户持仓，"
+                "不进入受治理决策绩效或学习样本。"
+            ),
             "sample_count": len(shadow_rows),
+            "diagnostic_sample_count": len(shadow_rows),
+            "governed_decision_sample_count": 0,
+            "learning_eligible_count": 0,
             "legacy_baseline_count": len(legacy_rows),
             "total_item_count": len(rows),
+            "raw_tracked_item_count": raw_tracked_item_count,
+            "duplicate_plan_count": duplicate_plan_count,
+            "governance_excluded_count": sum(excluded_by_reason.values()),
+            "governance_excluded_by_reason": dict(sorted(excluded_by_reason.items())),
             "triggered_count": len(triggered),
             "closed_count": len(closed),
             "average_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
@@ -1718,6 +2072,13 @@ class AICandidateService:
                 user_id=str(user_id),
             )
         else:
+            governance = await self._candidate_governance(str(user_id))
+            self._apply_candidate_governance(document, governance)
+            document["execution"] = {
+                "actionable": False,
+                "status": "research_only",
+                "requires_daily_decision": True,
+            }
             favorite_codes = await self._favorites.get_favorite_codes(user_id)
             for candidate in document.get("candidates", []):
                 if isinstance(candidate, dict):
@@ -1747,10 +2108,19 @@ class AICandidateService:
         if not document:
             raise AICandidateRunNotFoundError(run_id)
 
+        governance = await self._candidate_governance(str(user_id))
         candidate_map = {
             candidate["code"]: _enrich_saved_candidate(candidate)
             for candidate in document.get("candidates", [])
-            if isinstance(candidate, Mapping) and candidate.get("code")
+            if (
+                isinstance(candidate, Mapping)
+                and candidate.get("code")
+                and _candidate_governance_reason(
+                    candidate.get("code"),
+                    governance,
+                )
+                is None
+            )
         }
         requested_codes = list(dict.fromkeys(str(code).strip() for code in codes))
         invalid_codes = [code for code in requested_codes if code not in candidate_map]

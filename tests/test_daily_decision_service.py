@@ -78,6 +78,12 @@ def _candidate(code: str = "000977", **updates) -> dict:
         "quote_source": "tencent",
         "trade_at": "2026-07-22T10:00:00+08:00",
         "quote_checked_at": "2026-07-22T10:00:01+08:00",
+        "quote": {
+            "price": 63.005,
+            "source": "tencent",
+            "trade_at": "2026-07-22T10:00:00+08:00",
+            "quote_checked_at": "2026-07-22T10:00:01+08:00",
+        },
         "price_plan": {
             "entry_strategy": "pullback",
             "entry_price": 63.0,
@@ -450,6 +456,14 @@ async def test_daily_decision_explicitly_identifies_software_baseline_authority(
 
 
 @pytest.mark.asyncio
+async def test_packet_separates_current_briefing_time_from_candidate_generation_time():
+    packet = await _service().today("user-1", now=NOW)
+
+    assert packet["briefing_as_of"] == "2026-07-22T10:00:00+08:00"
+    assert packet["candidate_generated_at"] == "2026-07-22T09:55:00+08:00"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reason_code",
     [
@@ -562,6 +576,7 @@ async def test_real_diversification_reasons_map_to_exact_wait_codes(
 @pytest.mark.parametrize("trade_at", [None, "stale"])
 async def test_missing_or_stale_live_quote_waits_for_recheck(trade_at):
     candidate = _candidate(trade_at=trade_at)
+    candidate["quote"]["trade_at"] = trade_at
     if trade_at == "stale":
         candidate["quote_fresh"] = False
     packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
@@ -572,8 +587,79 @@ async def test_missing_or_stale_live_quote_waits_for_recheck(trade_at):
 
 
 @pytest.mark.asyncio
+async def test_top_level_reference_price_without_bound_quote_snapshot_is_not_actionable():
+    candidate = _candidate()
+    candidate.pop("quote")
+
+    packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
+
+    item = packet["wait"][0]
+    assert item["reason_codes"] == ["live_quote_recheck_required"]
+    assert item["quote"]["price"] is None
+    assert item["quote"]["trade_at"] is None
+    assert not packet["buy_now"]
+    assert not packet["condition_order"]
+
+
+@pytest.mark.asyncio
+async def test_unverified_star_market_permission_prefilters_candidate_before_decision():
+    packet = await _service(run=_run([_candidate(code="688115")])).today(
+        "user-1",
+        now=NOW,
+    )
+
+    assert not packet["avoid"]
+    assert not packet["wait"]
+    assert not packet["buy_now"]
+    assert not packet["condition_order"]
+    assert packet["summary"]["permission_prefilter_excluded_count"] == 1
+    assert packet["permission_prefilter_excluded"] == [
+        {
+            "code": "688115",
+            "name": "浪潮信息",
+            "board": "STAR",
+            "reason_code": "star_market_permission_unverified",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_exclusion_prefilters_candidate_before_profile_and_allocation():
+    briefing = _briefing()
+    briefing["account"]["excluded_codes"] = ["600406"]
+    service = _service(
+        run=_run(
+            [
+                _candidate(code="600406", name="国电南瑞"),
+                _candidate(code="000977", name="浪潮信息"),
+            ]
+        ),
+        briefing=briefing,
+    )
+
+    packet = await service.today("user-1", now=NOW)
+
+    assert packet["permission_prefilter_excluded"] == [
+        {
+            "code": "600406",
+            "name": "国电南瑞",
+            "board": "A_SHARE",
+            "reason_code": "user_excluded",
+        }
+    ]
+    resolved_codes, _ = service.profile_resolver.calls[0]
+    assert resolved_codes == ("000977",)
+    assert [
+        item["identity"]["code"]
+        for bucket in ("avoid", "wait", "buy_now", "condition_order")
+        for item in packet[bucket]
+    ] == ["000977"]
+
+
+@pytest.mark.asyncio
 async def test_live_quote_without_positive_price_waits_for_recheck():
     candidate = _candidate(reference_price=None)
+    candidate["quote"]["price"] = None
     packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
 
     item = packet["wait"][0]
@@ -590,7 +676,12 @@ async def test_live_quote_without_positive_price_waits_for_recheck():
     ],
 )
 async def test_non_tencent_or_wrong_day_quote_never_becomes_buy_now(candidate_updates):
-    packet = await _service(run=_run([_candidate(**candidate_updates)])).today(
+    candidate = _candidate(**candidate_updates)
+    if "quote_source" in candidate_updates:
+        candidate["quote"]["source"] = candidate_updates["quote_source"]
+    if "trade_at" in candidate_updates:
+        candidate["quote"]["trade_at"] = candidate_updates["trade_at"]
+    packet = await _service(run=_run([candidate])).today(
         "user-1", now=NOW
     )
 
@@ -632,6 +723,7 @@ async def test_unmet_live_price_waits_when_condition_order_capability_is_unverif
 @pytest.mark.asyncio
 async def test_fresh_price_at_or_below_stop_invalidates_plan_before_buying():
     candidate = _candidate(reference_price=61.50)
+    candidate["quote"]["price"] = 61.50
 
     packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
 
@@ -788,7 +880,8 @@ async def test_request_and_briefing_build_times_do_not_create_new_revision():
     assert first["decision_id"] == second["decision_id"]
     assert len(db.decisions.rows) == 1
     assert "classified_at" not in first["market_session"]
-    assert first["briefing_as_of"] == "2026-07-22T09:55:00+08:00"
+    assert first["briefing_as_of"] == "2026-07-22T10:00:00+08:00"
+    assert first["candidate_generated_at"] == "2026-07-22T09:55:00+08:00"
 
 
 @pytest.mark.asyncio
@@ -803,7 +896,10 @@ async def test_missing_candidate_generated_time_never_falls_back_to_build_time()
     second = await service.today("user-1", now=NOW.replace(minute=1))
 
     assert first["decision_id"] == second["decision_id"]
-    assert first["briefing_as_of"] is None
+    assert first["candidate_generated_at"] is None
+    assert second["candidate_generated_at"] is None
+    assert first["briefing_as_of"] == "2026-07-22T10:00:00+08:00"
+    assert second["briefing_as_of"] == first["briefing_as_of"]
 
 
 @pytest.mark.asyncio
