@@ -97,7 +97,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
+import { useWindowSize } from '@vueuse/core'
+import { useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import SidebarMenu from '@/components/Layout/SidebarMenu.vue'
 import UserProfile from '@/components/Layout/UserProfile.vue'

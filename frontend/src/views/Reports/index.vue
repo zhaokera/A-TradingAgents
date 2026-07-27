@@ -133,7 +133,7 @@
             <el-dropdown
               v-if="row.status === 'completed'"
               trigger="click"
-              @command="(format) => downloadReport(row, format)"
+              @command="(format: string) => downloadReport(row, format)"
             >
               <el-button type="text" size="small">
                 下载 <el-icon class="el-icon--right"><arrow-down /></el-icon>

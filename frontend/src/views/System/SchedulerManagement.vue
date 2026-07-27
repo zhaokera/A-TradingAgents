@@ -273,7 +273,7 @@
       width="1200px"
       :close-on-click-modal="false"
     >
-      <el-tabs v-model="activeHistoryTab" @tab-change="(name) => handleHistoryTabChange(name as string)">
+      <el-tabs v-model="activeHistoryTab" @tab-change="(name: string) => handleHistoryTabChange(name)">
         <!-- 手动操作历史 -->
         <el-tab-pane label="手动操作历史" name="manual">
           <el-table :data="historyList" v-loading="historyLoading" stripe max-height="500">
