@@ -222,6 +222,34 @@ def _shadow_plan_identity(
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
+def _stop_governance_shadow_tracking(
+    candidate: Dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    performance = candidate.get("performance")
+    if not isinstance(performance, Mapping):
+        return
+    performance = deepcopy(dict(performance))
+    shadow = performance.get("shadow_trade")
+    if not isinstance(shadow, Mapping):
+        return
+    shadow = deepcopy(dict(shadow))
+    status = str(shadow.get("status") or "").strip()
+    if status.startswith("closed_") or status == "stopped_governance":
+        return
+    shadow.update(
+        {
+            "previous_status": status or None,
+            "status": "stopped_governance",
+            "tracking_stop_reason": reason,
+            "tracking_stopped_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    performance["shadow_trade"] = shadow
+    candidate["performance"] = performance
+
+
 def _normalize_observation_zone(value: Any) -> Optional[List[float]]:
     if isinstance(value, Mapping):
         low = _finite_number(value.get("low"), value.get("min"))
@@ -1103,6 +1131,7 @@ class AICandidateService:
             reason = _candidate_governance_reason(item.get("code"), governance)
             if reason:
                 item["plan_id"] = _shadow_plan_identity(document, item)
+                _stop_governance_shadow_tracking(item, reason=reason)
                 excluded.append(
                     {
                         **item,
@@ -1119,6 +1148,13 @@ class AICandidateService:
             for item in document.get("governance_excluded_candidates", [])
             if isinstance(item, Mapping)
         ]
+        for item in existing_excluded:
+            reason = str(
+                item.get("governance_reason")
+                or _candidate_governance_reason(item.get("code"), governance)
+                or "governance_excluded"
+            )
+            _stop_governance_shadow_tracking(item, reason=reason)
         known = {
             (
                 str(item.get("code") or ""),
@@ -1825,18 +1861,50 @@ class AICandidateService:
 
     async def refresh_all_active_runs(self) -> Dict[str, Any]:
         db = await self._get_db()
-        cursor = db["ai_candidate_runs"].find(
+        runs = db["ai_candidate_runs"]
+        cursor = runs.find(
             {"expires_at": {"$gt": datetime.now(timezone.utc)}}
         ).sort("generated_at", -1)
         documents = await cursor.to_list(length=500)
         refreshed_users: set[str] = set()
         refreshed_historical_runs = 0
+        governance_cleaned_runs = 0
         failed_users: List[str] = []
+        governance_by_user: Dict[str, Dict[str, Any]] = {}
         today = datetime.now(timezone.utc).date()
         for document in documents:
             user_id = str(document.get("user_id") or "")
             if not user_id:
                 continue
+            governance = governance_by_user.get(user_id)
+            if governance is None:
+                governance = await self._candidate_governance(user_id)
+                governance_by_user[user_id] = governance
+            candidate_count_before = len(document.get("candidates") or [])
+            excluded_count_before = len(
+                document.get("governance_excluded_candidates") or []
+            )
+            self._apply_candidate_governance(document, governance)
+            governance_changed = (
+                len(document.get("candidates") or []) != candidate_count_before
+                or len(document.get("governance_excluded_candidates") or [])
+                != excluded_count_before
+            )
+            if governance_changed:
+                await runs.update_one(
+                    {"_id": document["_id"], "user_id": user_id},
+                    {
+                        "$set": {
+                            "candidates": deepcopy(document.get("candidates") or []),
+                            "governance": deepcopy(document.get("governance") or {}),
+                            "governance_excluded_candidates": deepcopy(
+                                document.get("governance_excluded_candidates") or []
+                            ),
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    },
+                )
+                governance_cleaned_runs += 1
             is_latest = user_id not in refreshed_users
             refreshed_at = document.get("quote_refreshed_at")
             if isinstance(refreshed_at, str):
@@ -1866,6 +1934,7 @@ class AICandidateService:
         return {
             "refreshed_user_count": len(refreshed_users) - len(failed_users),
             "refreshed_historical_run_count": refreshed_historical_runs,
+            "governance_cleaned_run_count": governance_cleaned_runs,
             "failed_user_count": len(failed_users),
         }
 

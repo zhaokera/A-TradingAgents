@@ -1015,6 +1015,14 @@ def test_governance_stops_old_star_and_user_excluded_shadow_plans():
         item["execution_status"] == "governance_excluded"
         for item in excluded.values()
     )
+    assert all(
+        item["performance"]["shadow_trade"]["status"] == "stopped_governance"
+        for item in excluded.values()
+    )
+    assert all(
+        item["performance"]["shadow_trade"]["previous_status"] == "active"
+        for item in excluded.values()
+    )
 
 
 @pytest.mark.asyncio
@@ -1222,6 +1230,25 @@ async def test_scheduler_entry_never_polls_governance_excluded_codes():
             },
         ],
     }
+    historical_document = {
+        "_id": ObjectId(),
+        "user_id": "admin-id",
+        "generated_at": datetime(2026, 7, 26, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 7, 30, tzinfo=timezone.utc),
+        "quote_refreshed_at": datetime.now(timezone.utc).isoformat(),
+        "candidates": [
+            {
+                "code": "688208",
+                "price_plan": {},
+                "performance": {"shadow_trade": {"status": "active"}},
+            },
+            {
+                "code": "600406",
+                "price_plan": {},
+                "performance": {"shadow_trade": {"status": "active"}},
+            },
+        ],
+    }
 
     class Cursor:
         def sort(self, *_args):
@@ -1229,7 +1256,7 @@ async def test_scheduler_entry_never_polls_governance_excluded_codes():
 
         async def to_list(self, *, length):
             assert length == 500
-            return [document]
+            return [document, historical_document]
 
     runs = SimpleNamespace(
         find=MagicMock(return_value=Cursor()),
@@ -1264,11 +1291,31 @@ async def test_scheduler_entry_never_polls_governance_excluded_codes():
     assert result == {
         "refreshed_user_count": 1,
         "refreshed_historical_run_count": 0,
+        "governance_cleaned_run_count": 2,
         "failed_user_count": 0,
     }
     assert requested == ["000977", "sh000300"]
-    persisted = runs.update_one.await_args.args[1]["$set"]
+    persisted_updates = [
+        call.args[1]["$set"] for call in runs.update_one.await_args_list
+    ]
+    persisted = next(
+        update
+        for update in persisted_updates
+        if [item["code"] for item in update.get("candidates", [])]
+        == ["000977"]
+        and "quote_refreshed_at" in update
+    )
     assert [item["code"] for item in persisted["candidates"]] == ["000977"]
     assert {
         item["code"] for item in persisted["governance_excluded_candidates"]
     } == {"688208", "600406"}
+    historical_update = next(
+        update
+        for update in persisted_updates
+        if update.get("candidates") == []
+        and len(update.get("governance_excluded_candidates") or []) == 2
+    )
+    assert all(
+        item["performance"]["shadow_trade"]["status"] == "stopped_governance"
+        for item in historical_update["governance_excluded_candidates"]
+    )
