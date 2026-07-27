@@ -13,6 +13,7 @@ from app.services.model_capability_service import (
 from app.services.simple_analysis_service import (
     ModelConnectivityError,
     _credential_candidates,
+    _normalize_terminal_task_status,
     _propagate_trading_graph,
     _select_verified_model_credential,
 )
@@ -222,3 +223,21 @@ def test_terminal_task_details_use_terminal_message_and_elapsed_time(monkeypatch
 
     assert result["data"]["message"] == "分析失败"
     assert result["data"]["elapsed_time"] == 2
+
+
+def test_terminal_in_memory_status_freezes_elapsed_time():
+    result = {
+        "status": "completed",
+        "message": "stale",
+        "start_time": "2026-07-28T01:00:59",
+        "end_time": "2026-07-28T01:01:09",
+        "elapsed_time": 999,
+        "remaining_time": 123,
+    }
+
+    normalized = _normalize_terminal_task_status(result)
+
+    assert normalized["message"] == "分析完成"
+    assert normalized["elapsed_time"] == 10
+    assert normalized["estimated_total_time"] == 10
+    assert normalized["remaining_time"] == 0

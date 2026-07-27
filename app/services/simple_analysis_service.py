@@ -175,6 +175,40 @@ def _propagate_trading_graph(
     )
 
 
+def _normalize_terminal_task_status(result: Optional[Dict[str, Any]]):
+    """Freeze terminal task timing so Redis cannot keep increasing elapsed time."""
+    if not result:
+        return result
+    status = getattr(result.get("status"), "value", result.get("status"))
+    terminal_messages = {
+        "completed": "分析完成",
+        "failed": "分析失败",
+        "cancelled": "任务已取消",
+    }
+    if status not in terminal_messages:
+        return result
+
+    result["message"] = terminal_messages[status]
+    result["remaining_time"] = 0
+    start_time = result.get("start_time")
+    end_time = result.get("end_time")
+    if isinstance(start_time, str):
+        try:
+            start_time = datetime.fromisoformat(start_time)
+        except ValueError:
+            start_time = None
+    if isinstance(end_time, str):
+        try:
+            end_time = datetime.fromisoformat(end_time)
+        except ValueError:
+            end_time = None
+    if start_time and end_time:
+        elapsed_time = max(0, (end_time - start_time).total_seconds())
+        result["elapsed_time"] = elapsed_time
+        result["estimated_total_time"] = elapsed_time
+    return result
+
+
 async def get_provider_by_model_name(model_name: str) -> str:
     """
     根据模型名称从数据库配置中查找对应的供应商（异步版本）
@@ -2152,7 +2186,7 @@ class SimpleAnalysisService:
         else:
             logger.warning(f"❌ 未找到任务: {task_id}")
 
-        return result
+        return _normalize_terminal_task_status(result)
 
     async def list_all_tasks(
         self,
