@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import pymongo
 from bson import ObjectId
+from click import unstyle
 from typer.testing import CliRunner
 
 import app.services.holdings_cli as holdings_cli_module
@@ -9654,7 +9655,7 @@ def test_opportunities_help_documents_automatic_public_discovery_and_manual_cand
     )
 
     assert result.exit_code == 0
-    normalized_help = " ".join(result.stdout.replace("│", " ").split())
+    normalized_help = " ".join(unstyle(result.stdout).replace("│", " ").split())
     assert "--external-risk-level" in normalized_help
     assert "green/yellow/red" in normalized_help
     assert "不传按 unknown 0% 处理" in normalized_help
