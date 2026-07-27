@@ -90,7 +90,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-qianfan = ["qianfan>=0.4.20"]
+qianfan = ["qianfan>=0.4.12.3,<0.5"]
+
+[dependency-groups]
+dev = [
+    "build>=1.2.2,<2",
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.24,<2",
+]
 
 [project.scripts]
 agentctl = "cli.agent:main"

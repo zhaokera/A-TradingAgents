@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pymongo import UpdateOne
+from pymongo import ReturnDocument, UpdateOne
 
 from app.core.database import get_mongo_db
 from app.services.basics_sync import add_financial_metrics as _add_financial_metrics_util
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 COLLECTION_NAME = "stock_basic_info"
 STATUS_COLLECTION = "sync_status"
 JOB_KEY = "stock_basics_multi_source"
+LOCK_COLLECTION = "job_locks"
+FRESHNESS_HOURS = 20
+MIN_HEALTHY_STOCK_COUNT = 3000
 
 
 class DataSourcePriority(Enum):
@@ -62,6 +66,89 @@ class MultiSourceBasicsSyncService:
         self._lock = asyncio.Lock()
         self._running = False
         self._last_status: Optional[Dict[str, Any]] = None
+        self._owner = f"stock-basics-{uuid.uuid4().hex}"
+
+    async def _is_fresh(self, db: AsyncIOMotorDatabase) -> bool:
+        try:
+            count = await db[COLLECTION_NAME].count_documents({})
+            if count < MIN_HEALTHY_STOCK_COUNT:
+                return False
+            latest = await db[COLLECTION_NAME].find_one(
+                {}, {"updated_at": 1}, sort=[("updated_at", -1)]
+            )
+            updated_at = (latest or {}).get("updated_at")
+            if not isinstance(updated_at, datetime):
+                return False
+            return updated_at >= datetime.now() - timedelta(hours=FRESHNESS_HOURS)
+        except Exception:
+            return False
+
+    async def _acquire_lease(
+        self, db: AsyncIOMotorDatabase, *, force: bool = False
+    ) -> bool:
+        now = datetime.now()
+        try:
+            document = await db[LOCK_COLLECTION].find_one_and_update(
+                {
+                    "_id": JOB_KEY,
+                    "$or": [
+                        {"lease_until": {"$lte": now}},
+                        {"lease_until": {"$exists": False}},
+                        {"owner": self._owner},
+                    ],
+                },
+                {
+                    "$set": {
+                        "owner": self._owner,
+                        "lease_until": now + timedelta(hours=2),
+                        "updated_at": now,
+                    }
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            return bool(document and document.get("owner") == self._owner)
+        except Exception as exc:
+            if force:
+                logger.warning("Distributed sync lease unavailable; force run continues: %s", exc)
+                return True
+            logger.info("Stock basics sync lease not acquired: %s", exc)
+            return False
+
+    async def _release_lease(self, db: AsyncIOMotorDatabase) -> None:
+        try:
+            await db[LOCK_COLLECTION].update_one(
+                {"_id": JOB_KEY, "owner": self._owner},
+                {
+                    "$set": {
+                        "lease_until": datetime.now(),
+                        "released_at": datetime.now(),
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.warning("Failed to release stock basics sync lease: %s", exc)
+
+    async def run_incremental_sync(
+        self,
+        force: bool = False,
+        preferred_sources: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Refresh master data only when stale; never block on daily metrics."""
+
+        db = get_mongo_db()
+        if not force and await self._is_fresh(db):
+            status = await self.get_status()
+            return {
+                **status,
+                "status": "skipped_fresh",
+                "message": f"stock_basic_info is fresh within {FRESHNESS_HOURS} hours",
+            }
+        return await self.run_full_sync(
+            force=force,
+            preferred_sources=preferred_sources,
+            include_financial_metrics=False,
+        )
 
     async def get_status(self) -> Dict[str, Any]:
         """获取同步状态"""
@@ -140,7 +227,13 @@ class MultiSourceBasicsSyncService:
 
         return inserted, updated
 
-    async def run_full_sync(self, force: bool = False, preferred_sources: List[str] = None) -> Dict[str, Any]:
+    async def run_full_sync(
+        self,
+        force: bool = False,
+        preferred_sources: Optional[List[str]] = None,
+        *,
+        include_financial_metrics: bool = True,
+    ) -> Dict[str, Any]:
         """
         运行完整同步
 
@@ -155,6 +248,11 @@ class MultiSourceBasicsSyncService:
             self._running = True
 
         db = get_mongo_db()
+        if not await self._acquire_lease(db, force=force):
+            async with self._lock:
+                self._running = False
+            status = await self.get_status()
+            return {**status, "status": "skipped_locked"}
         stats = SyncStats()
         stats.started_at = datetime.now().isoformat()
         stats.status = "running"
@@ -186,14 +284,15 @@ class MultiSourceBasicsSyncService:
             logger.info(f"Successfully fetched {len(stock_df)} stocks from {source_used}")
 
             # Step 3: 获取最新交易日期和财务数据
-            latest_trade_date = await asyncio.to_thread(
-                manager.find_latest_trade_date_with_fallback, preferred_sources
-            )
-            stats.last_trade_date = latest_trade_date
-
             daily_data_map = {}
             daily_source = ""
-            if latest_trade_date:
+            latest_trade_date = None
+            if include_financial_metrics:
+                latest_trade_date = await asyncio.to_thread(
+                    manager.find_latest_trade_date_with_fallback, preferred_sources
+                )
+                stats.last_trade_date = latest_trade_date
+            if include_financial_metrics and latest_trade_date:
                 daily_df, daily_source = await asyncio.to_thread(
                     manager.get_daily_basic_with_fallback, latest_trade_date, preferred_sources
                 )
@@ -330,6 +429,7 @@ class MultiSourceBasicsSyncService:
         finally:
             async with self._lock:
                 self._running = False
+            await self._release_lease(db)
 
 
 

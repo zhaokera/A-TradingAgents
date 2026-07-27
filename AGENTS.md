@@ -13,7 +13,11 @@ TradingAgents-CN 的既有实现与版权说明；目录名和参考项目名都
 - `app/`: FastAPI 后端，负责认证、任务、报告、配置、数据同步、缓存、SSE/WebSocket、定时任务和数据库访问。
 - `frontend/`: Vue 3 + Vite + Element Plus 前端，负责 Web 控制台和分析交互。
 
-根目录 `main.py` 是硬编码 NVDA/Gemini 的演示脚本，会调用外部 LLM/数据源；不要把它当作后端启动入口，也不要在普通验证中运行它。
+根目录 `main.py` 是统一 JSON CLI 的兼容入口，不是后端启动入口。正式自动化入口为
+`agentctl`、`tradingagents` 或 `python -m cli.agent`；旧交互界面源码仍可通过
+`python -m cli.main` 在完整开发环境中手动运行，但不再安装为产品命令。
+统一 CLI 必须通过 `/api/auth/login` 使用账号密码建立会话，默认访问会话至少 7 天；不得
+恢复本地读取 JWT 密钥、自行签发令牌或按 `user_id` 绕过认证的实现。
 
 ## 版权与边界
 
@@ -125,7 +129,7 @@ yarn build
 
 ## 测试注意事项
 
-- `tests/pytest.ini` 默认只收集 `tests/`，默认跳过 `integration` 标记，并排除 `test_server_config`、`test_stock_codes`。
+- 根目录 `pytest.ini` 默认只收集 `tests/`，默认跳过 `integration` 标记，并排除 `test_server_config`、`test_stock_codes`。
 - 优先跑与改动直接相关的测试，再按风险补充 `python -m pytest`。
 - 涉及前端类型、路由、API 封装时至少跑 `yarn type-check`；改构建配置或依赖时跑 `yarn build`。
 - 涉及 Dockerfile、nginx 或 compose 时，至少做对应服务的 build 或容器启动验证。

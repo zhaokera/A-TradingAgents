@@ -8,6 +8,7 @@ import csv
 import gzip
 import shutil
 import logging
+import tempfile
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from bson import ObjectId
@@ -30,10 +31,17 @@ class DatabaseService:
     """数据库管理服务"""
 
     def __init__(self):
-        self.backup_dir = os.path.join(settings.TRADINGAGENTS_DATA_DIR, "backups")
-        self.export_dir = os.path.join(settings.TRADINGAGENTS_DATA_DIR, "exports")
+        data_dir = settings.TRADINGAGENTS_DATA_DIR
+        try:
+            self._prepare_directories(data_dir)
+        except OSError as exc:
+            data_dir = os.path.join(tempfile.gettempdir(), "a-tradingagents-data")
+            self._prepare_directories(data_dir)
+            logger.warning("数据目录不可写，已回退到 %s: %s", data_dir, exc)
 
-        # 确保目录存在
+    def _prepare_directories(self, data_dir: str) -> None:
+        self.backup_dir = os.path.join(data_dir, "backups")
+        self.export_dir = os.path.join(data_dir, "exports")
         os.makedirs(self.backup_dir, exist_ok=True)
         os.makedirs(self.export_dir, exist_ok=True)
 

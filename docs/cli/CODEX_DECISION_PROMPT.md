@@ -25,7 +25,10 @@ CLI 绝对路径：/Users/zhaok/Desktop/TradingAgents-CN/.venv/bin/agentctl
 - 研究包是唯一事实底稿，不引用包外事实做正式提案，不虚构 evidence_ref。
 - 不得违反 hard_constraints；可以覆盖 soft_warnings，但每项必须提供 warning_code、覆盖理由和具体 risk_adjustment。
 - buy_now 必须通过盘中阶段、腾讯行情新鲜度、入场条件、整手、资金、集中度和计划亏损校验。
-- condition_order 可以在盘后提交，但必须带 trigger_price、requested_quantity、stop_price、target_price、expires_at，并在触发时重新校验。
+- condition_order 只允许在盘中实时行情有效时提交，并且研究包中的 execution_capabilities.condition_order 必须明确为 eligible=true。
+- condition_order 必须同时带 trigger_price 和独立的 order_limit_price；trigger_price 是研究触发价，不是券商委托价。
+- 券商界面只有一个“委托价”字段时，不得把突破触发价或高于现价的限价填进去；此类计划必须降级为 wait。
+- 实时价已经低于或等于 stop_price 时，原计划已经失效，必须排除或重新研究，不能解释为等待触发。
 - 软件校验器只能接受或拒绝，不会修改你的股票、数量、价格或 action。失败时由你显式修订。
 - selection 必须引用研究包内 evidence_refs；主仓最多一个，总新仓数服从 decision_objective。
 - 允许合法空仓：selections 为空时必须填写 no_action_reason。

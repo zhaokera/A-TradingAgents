@@ -139,8 +139,13 @@ def _sample_decision() -> Dict[str, Any]:
         "quote": {
             "price": 22.5,
             "source": "tencent",
+            "trade_at": "2026-07-23T09:44:59+08:00",
             "status": "fresh",
             "quote_checked_at": "2026-07-23T09:45:00+08:00",
+        },
+        "execution": {
+            "status": "condition_order_eligible",
+            "order_limit_price": 22.1,
         },
         "plans": {
             "short": {
@@ -168,6 +173,14 @@ def _sample_decision() -> Dict[str, Any]:
         "candidate_run_id": "run-1",
         "briefing_as_of": "2026-07-23T09:44:00+08:00",
         "account": {"total_assets": 10_685.41},
+        "execution_capabilities": {
+            "condition_order": {
+                "verified": True,
+                "independent_trigger_price_supported": True,
+                "separate_order_limit_price_supported": True,
+                "eligible": True,
+            }
+        },
         "market": {"combined_regime": "green"},
         "summary": {
             "buy_now_count": 0,
@@ -201,6 +214,7 @@ def test_decision_today_summary_is_compact_and_machine_readable(
     assert data["view"] == "summary"
     assert data["authority"] == "software_baseline"
     assert data["is_final_decision"] is False
+    assert data["execution_capabilities"]["condition_order"]["eligible"] is True
     assert data["condition_order"][0] == {
         "code": "600406",
         "name": "国电南瑞",
@@ -209,10 +223,15 @@ def test_decision_today_summary_is_compact_and_machine_readable(
         "objective_segment": "电力设备",
         "objective_match_score": 1.0,
         "price": 22.5,
+        "current_price": 22.5,
+        "current_price_trade_at": "2026-07-23T09:44:59+08:00",
         "quote_source": "tencent",
         "quote_status": "fresh",
         "quote_checked_at": "2026-07-23T09:45:00+08:00",
         "entry_price": 22.1,
+        "entry_reference_price": 22.1,
+        "order_limit_price": 22.1,
+        "execution_status": "condition_order_eligible",
         "stop_price": 21.4,
         "target_price": 23.8,
         "plan_status": "waiting_pullback",

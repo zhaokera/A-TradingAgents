@@ -36,7 +36,7 @@ _TENCENT_ASSIGNMENT_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 _TENCENT_MAJOR_INDEX_SYMBOLS = frozenset(
-    {"sh000001", "sz399001", "sz399006", "sh000688"}
+    {"sh000001", "sh000300", "sz399001", "sz399006", "sh000688"}
 )
 
 
@@ -947,14 +947,16 @@ class TencentQuoteService:
         self._lock = asyncio.Lock()
 
     async def get_quote(self, code: str) -> Optional[Dict[str, Any]]:
-        normalized = normalize_cn_code(code)
+        raw = str(code or "").strip().lower()
+        provider_code = raw if raw in _TENCENT_MAJOR_INDEX_SYMBOLS else normalize_cn_code(code)
+        normalized = provider_code if provider_code in _TENCENT_MAJOR_INDEX_SYMBOLS else normalize_cn_code(provider_code)
         now = time.time()
         async with self._lock:
             cached = self._cache.get(normalized)
             if cached and (now - self._cache_ts.get(normalized, 0)) < self._ttl:
                 return dict(cached)
 
-        quote = await asyncio.to_thread(fetch_tencent_quote_sync, normalized)
+        quote = await asyncio.to_thread(fetch_tencent_quote_sync, provider_code)
         if not quote:
             return None
 
@@ -967,7 +969,7 @@ class TencentQuoteService:
         result: Dict[str, Dict[str, Any]] = {}
         for code in codes:
             normalized = normalize_cn_code(code)
-            quote = await self.get_quote(normalized)
+            quote = await self.get_quote(str(code))
             if quote:
                 result[normalized] = quote
         return result

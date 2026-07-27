@@ -315,7 +315,15 @@
               <p class="selection-thesis">{{ selection.thesis }}</p>
               <div class="selection-plan">
                 <span>数量 <strong>{{ selection.requested_quantity || 0 }} 股</strong></span>
-                <span>触发 <strong>{{ formatPrice(selection.trigger_price) }}</strong></span>
+                <span>
+                  实时行情
+                  <strong>{{ formatPrice(selectionCandidate(selection.symbol)?.quote?.price) }}</strong>
+                </span>
+                <span>研究触发 <strong>{{ formatPrice(selection.trigger_price) }}</strong></span>
+                <span>
+                  独立委托限价
+                  <strong>{{ formatPrice(selection.order_limit_price) }}</strong>
+                </span>
                 <span>止损 <strong>{{ formatPrice(selection.stop_price) }}</strong></span>
                 <span>目标 <strong>{{ formatPrice(selection.target_price) }}</strong></span>
               </div>
@@ -713,7 +721,7 @@ const authorityLabel = (value?: string) =>
 const actionLabel = (value?: DecisionAction | string) =>
   ({
     buy_now: '立即买入',
-    condition_order: '条件单',
+    condition_order: '独立触发限价',
     wait: '等待',
     avoid: '回避'
   })[String(value)] || value || '未知'
@@ -742,10 +750,11 @@ const regimeLabel = (value?: string) =>
     String(value || '').toLowerCase()
   ] || '未判定'
 
-const selectionName = (symbol: string) => {
-  const candidate = research.value.candidates.find(item => item.symbol === symbol)
-  return candidate?.name || symbol
-}
+const selectionCandidate = (symbol: string) =>
+  research.value.candidates.find(item => item.symbol === symbol)
+
+const selectionName = (symbol: string) =>
+  selectionCandidate(symbol)?.name || symbol
 
 const failureDetail = (details?: Record<string, unknown>) => {
   if (!details || !Object.keys(details).length) return '请按失败码修订提案'

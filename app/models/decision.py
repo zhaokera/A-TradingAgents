@@ -52,6 +52,7 @@ class CodexSelection(BaseModel):
     requested_quantity: Optional[int] = Field(default=None, ge=0)
     entry_strategy: Optional[Literal["pullback", "breakout", "reference"]] = None
     trigger_price: Optional[Decimal] = Field(default=None, gt=0)
+    order_limit_price: Optional[Decimal] = Field(default=None, gt=0)
     stop_price: Optional[Decimal] = Field(default=None, gt=0)
     target_price: Optional[Decimal] = Field(default=None, gt=0)
     expires_at: Optional[datetime] = None
@@ -106,6 +107,8 @@ class CodexSelection(BaseModel):
         else:
             if self.requested_quantity not in (None, 0):
                 raise ValueError("wait/avoid selection cannot carry executable quantity")
+            if self.order_limit_price is not None:
+                raise ValueError("wait/avoid selection cannot carry an order limit price")
             if self.position_role != "none":
                 raise ValueError("wait/avoid selection position_role must be none")
         return self

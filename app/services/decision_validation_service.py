@@ -18,7 +18,7 @@ from app.services.decision_research_service import decision_research_service
 from app.services.decision_workflow_errors import DecisionWorkflowError
 
 
-VALIDATOR_VERSION = "decision-validator-v1"
+VALIDATOR_VERSION = "decision-validator-v2"
 LIVE_PHASES = frozenset({"live_am", "live_pm"})
 ACTIONABLE_ACTIONS = frozenset({"buy_now", "condition_order"})
 STALE_FAILURE_CODES = frozenset(
@@ -150,6 +150,18 @@ def _fallback_correlation(
     if left.get("theme") and left["theme"] == right.get("theme"):
         return 0.85
     return 0.50
+
+
+def _condition_order_capability(packet: Mapping[str, Any]) -> bool:
+    capabilities = packet.get("execution_capabilities")
+    capabilities = capabilities if isinstance(capabilities, Mapping) else {}
+    condition = capabilities.get("condition_order")
+    condition = condition if isinstance(condition, Mapping) else {}
+    return bool(
+        condition.get("verified") is True
+        and condition.get("independent_trigger_price_supported") is True
+        and condition.get("separate_order_limit_price_supported") is True
+    )
 
 
 class DecisionValidationService:
@@ -372,6 +384,7 @@ class DecisionValidationService:
 
             quantity = int(selection.get("requested_quantity") or 0)
             trigger = _decimal(selection.get("trigger_price")) or Decimal(0)
+            order_limit = _decimal(selection.get("order_limit_price"))
             stop = _decimal(selection.get("stop_price")) or Decimal(0)
             target = _decimal(selection.get("target_price")) or Decimal(0)
             risk_envelope = candidate.get("risk_envelope")
@@ -412,6 +425,68 @@ class DecisionValidationService:
                             details={"field": field, "value": str(price)},
                         )
                     )
+            if action == DecisionAction.CONDITION_ORDER.value:
+                if not _condition_order_capability(packet):
+                    failures.append(
+                        _failure(
+                            "condition_order_execution_capability_unverified",
+                            symbol=symbol,
+                            message="券商条件单能力未核实，不能生成可执行条件单",
+                        )
+                    )
+                if order_limit is None:
+                    failures.append(
+                        _failure(
+                            "condition_order_order_limit_price_missing",
+                            symbol=symbol,
+                            message="条件单缺少独立委托限价",
+                        )
+                    )
+                elif (
+                    order_limit <= 0
+                    or order_limit != order_limit.quantize(MONEY_QUANTIZER)
+                ):
+                    failures.append(
+                        _failure(
+                            "invalid_price_tick",
+                            symbol=symbol,
+                            details={
+                                "field": "order_limit_price",
+                                "value": str(order_limit),
+                            },
+                        )
+                    )
+                elif selection.get("entry_strategy") == "breakout" and not (
+                    trigger <= order_limit < target
+                ):
+                    failures.append(
+                        _failure(
+                            "invalid_condition_order_price_plan",
+                            symbol=symbol,
+                            details={
+                                "expected": (
+                                    "trigger_price <= order_limit_price "
+                                    "< target_price"
+                                )
+                            },
+                        )
+                    )
+                elif selection.get("entry_strategy") in {
+                    "pullback",
+                    "reference",
+                } and not (stop < order_limit <= trigger):
+                    failures.append(
+                        _failure(
+                            "invalid_condition_order_price_plan",
+                            symbol=symbol,
+                            details={
+                                "expected": (
+                                    "stop_price < order_limit_price "
+                                    "<= trigger_price"
+                                )
+                            },
+                        )
+                    )
             if not stop < trigger < target:
                 failures.append(
                     _failure("invalid_price_plan", symbol=symbol)
@@ -423,8 +498,14 @@ class DecisionValidationService:
             elif earliest_valid_until is None or expires_at < earliest_valid_until:
                 earliest_valid_until = expires_at
 
-            cost = trigger * quantity
-            planned_loss = (trigger - stop) * quantity
+            entry_cost_price = (
+                order_limit
+                if action == DecisionAction.CONDITION_ORDER.value
+                and order_limit is not None
+                else trigger
+            )
+            cost = entry_cost_price * quantity
+            planned_loss = (entry_cost_price - stop) * quantity
             selection_calc.update(
                 total_cost=_money(cost),
                 planned_loss=_money(planned_loss),
@@ -658,6 +739,74 @@ class DecisionValidationService:
                     )
             else:
                 has_condition_order = True
+                phase = str(
+                    (packet.get("market_session") or {}).get("phase") or ""
+                )
+                trade_at = _as_datetime(quote.get("trade_at"))
+                freshness = int(
+                    (packet.get("market_session") or {}).get(
+                        "quote_freshness_required_seconds"
+                    )
+                    or 90
+                )
+                quote_valid_until = (
+                    trade_at + timedelta(seconds=freshness) if trade_at else None
+                )
+                fresh = bool(
+                    phase in LIVE_PHASES
+                    and str(quote.get("source") or "").lower() == "tencent"
+                    and quote.get("actionable") is True
+                    and quote.get("status") == "fresh"
+                    and quote_valid_until is not None
+                    and quote_valid_until >= effective_now
+                    and trade_at.astimezone(SHANGHAI_TIMEZONE).date()
+                    == effective_now.astimezone(SHANGHAI_TIMEZONE).date()
+                )
+                if not fresh:
+                    failures.append(
+                        _failure("condition_order_quote_stale", symbol=symbol)
+                    )
+                else:
+                    if earliest_valid_until is None or (
+                        quote_valid_until
+                        and quote_valid_until < earliest_valid_until
+                    ):
+                        earliest_valid_until = quote_valid_until
+                    current_price = _decimal(quote.get("price"))
+                    strategy = selection.get("entry_strategy")
+                    if current_price is not None and current_price <= stop:
+                        failures.append(
+                            _failure(
+                                "condition_order_plan_already_invalidated",
+                                symbol=symbol,
+                                details={
+                                    "current_price": str(current_price),
+                                    "stop_price": str(stop),
+                                },
+                            )
+                        )
+                    condition_already_met = bool(
+                        current_price is not None
+                        and current_price > stop
+                        and (
+                            (
+                                strategy in {"pullback", "reference"}
+                                and current_price <= trigger
+                            )
+                            or (
+                                strategy == "breakout"
+                                and current_price >= trigger
+                            )
+                        )
+                    )
+                    if condition_already_met:
+                        failures.append(
+                            _failure(
+                                "condition_order_trigger_already_met",
+                                symbol=symbol,
+                                details={"current_price": str(current_price)},
+                            )
+                        )
 
         failures = _dedupe_failures(failures)
         failure_codes = {value["code"] for value in failures}

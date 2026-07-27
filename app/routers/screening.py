@@ -1,6 +1,6 @@
 
 import logging
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from app.routers.auth_db import get_current_user
@@ -63,16 +63,16 @@ async def run_ai_candidates(
     request: AICandidateRunRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Run the bounded public-market research pipeline and persist the batch."""
+    """Start the bounded public-market research pipeline in the background."""
     try:
-        result = await ai_candidate_service.run(
+        result = await ai_candidate_service.start_run(
             str(user["id"]),
             max_candidates=request.max_candidates,
         )
         return {
             "success": True,
             "data": result,
-            "message": "AI候选分析完成",
+            "message": "AI候选分析任务已启动",
         }
     except CLIError as exc:
         logger.warning(
@@ -91,13 +91,37 @@ async def run_ai_candidates(
 
 
 @router.get("/ai-candidates/latest", response_model=dict)
-async def get_latest_ai_candidates(user: dict = Depends(get_current_user)):
-    result = await ai_candidate_service.latest(str(user["id"]))
+async def get_latest_ai_candidates(
+    refresh: bool = Query(default=True),
+    user: dict = Depends(get_current_user),
+):
+    result = await ai_candidate_service.latest(
+        str(user["id"]),
+        refresh_quotes=refresh,
+    )
     return {
         "success": True,
         "data": result,
         "message": "ok",
     }
+
+
+@router.get("/ai-candidates/jobs/{job_id}", response_model=dict)
+async def get_ai_candidate_job(
+    job_id: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        result = await ai_candidate_service.get_job(str(user["id"]), job_id)
+        return {"success": True, "data": result, "message": "ok"}
+    except AICandidateRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="AI候选任务不存在") from exc
+
+
+@router.get("/ai-candidates/performance", response_model=dict)
+async def get_ai_candidate_performance(user: dict = Depends(get_current_user)):
+    result = await ai_candidate_service.performance_summary(str(user["id"]))
+    return {"success": True, "data": result, "message": "ok"}
 
 
 @router.post("/ai-candidates/{run_id}/favorites", response_model=dict)
@@ -121,7 +145,12 @@ async def add_ai_candidates_to_favorites(
     except AICandidateRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail="AI候选批次不存在") from exc
     except InvalidAICandidateSelectionError as exc:
-        raise HTTPException(status_code=400, detail="候选股票不属于该批次") from exc
+        detail = (
+            "候选当前被风险阻断、已失效或计划不完整，不能加入自选"
+            if str(exc).startswith("candidate_not_trackable:")
+            else "候选股票不属于该批次"
+        )
+        raise HTTPException(status_code=400, detail=detail) from exc
 
 
 @router.get("/fields", response_model=FieldConfigResponse)
