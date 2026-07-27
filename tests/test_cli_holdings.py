@@ -9647,7 +9647,11 @@ def test_opportunities_command_uses_public_research_when_database_config_fails(
 
 
 def test_opportunities_help_documents_automatic_public_discovery_and_manual_candidates():
-    result = CliRunner().invoke(holdings_app, ["opportunities", "--help"])
+    result = CliRunner().invoke(
+        holdings_app,
+        ["opportunities", "--help"],
+        terminal_width=240,
+    )
 
     assert result.exit_code == 0
     normalized_help = " ".join(result.stdout.replace("│", " ").split())
