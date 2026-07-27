@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -179,3 +180,45 @@ def test_analysis_details_uses_the_same_contract_as_status(monkeypatch):
         "task_id": "visible-task",
         "status": "running",
     }
+
+
+def test_terminal_task_details_use_terminal_message_and_elapsed_time(monkeypatch):
+    started_at = datetime(2026, 7, 27, 15, 5, 5)
+    completed_at = started_at + timedelta(seconds=2)
+
+    class Service:
+        async def get_task_status(self, _task_id):
+            return None
+
+    class Collection:
+        def __init__(self, document):
+            self.document = document
+
+        async def find_one(self, _query):
+            return self.document
+
+    database = SimpleNamespace(
+        analysis_tasks=Collection(
+            {
+                "task_id": "failed-task",
+                "status": "failed",
+                "progress": 0,
+                "stock_code": "600562",
+                "started_at": started_at,
+                "completed_at": completed_at,
+            }
+        ),
+        analysis_reports=Collection(None),
+    )
+    monkeypatch.setattr(analysis_router, "get_simple_analysis_service", Service)
+    monkeypatch.setattr("app.core.database.get_mongo_db", lambda: database)
+
+    result = asyncio.run(
+        analysis_router.get_task_status_new(
+            task_id="failed-task",
+            user={"id": "admin"},
+        )
+    )
+
+    assert result["data"]["message"] == "分析失败"
+    assert result["data"]["elapsed_time"] == 2
