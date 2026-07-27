@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tradingagents.agents.utils.google_tool_handler import GoogleToolCallHandler
 from tradingagents.agents.utils.agent_utils import Toolkit
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 # 配置日志
 os.makedirs(os.path.join('data', 'logs'), exist_ok=True)

@@ -273,7 +273,7 @@
       width="1200px"
       :close-on-click-modal="false"
     >
-      <el-tabs v-model="activeHistoryTab" @tab-change="(name: string) => handleHistoryTabChange(name)">
+      <el-tabs v-model="activeHistoryTab" @tab-change="handleHistoryTabChange">
         <!-- 手动操作历史 -->
         <el-tab-pane label="手动操作历史" name="manual">
           <el-table :data="historyList" v-loading="historyLoading" stripe max-height="500">
@@ -575,7 +575,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, reactive, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, type TabPaneName } from 'element-plus'
 import {
   Timer,
   List,
@@ -867,8 +867,8 @@ const handleHistoryPageChange = (page: number) => {
   loadHistory()
 }
 
-const handleHistoryTabChange = (tabName: string) => {
-  if (tabName === 'execution') {
+const handleHistoryTabChange = (tabName: TabPaneName) => {
+  if (String(tabName) === 'execution') {
     executionPage.value = 1
     loadExecutions()
   } else {
