@@ -312,7 +312,11 @@ def get_provider_and_url_by_model_sync(
                             raise
                     if credential_source:
                         logger.info(
-                            "✅ [同步查询] 模型 %s 使用凭据来源: %s",
+                            (
+                                "✅ [同步查询] 模型 %s 已验证凭据来源: %s"
+                                if verify_connectivity
+                                else "ℹ️ [同步查询] 模型 %s 候选凭据来源（未验证）: %s"
+                            ),
                             model_name,
                             credential_source,
                         )
