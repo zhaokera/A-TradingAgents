@@ -199,15 +199,9 @@ class DecisionConfirmationService:
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         owner = str(user_id or "").strip()
-        research = (
-            await self.research_service.today(owner, refresh=True, now=now)
-            if refresh
-            else await self.research_service.latest(owner)
-        )
-        if research is None:
-            research = await self.research_service.today(
-                owner, refresh=False, now=now
-            )
+        effective_now = now or datetime.now(timezone.utc)
+        if effective_now.tzinfo is None:
+            effective_now = effective_now.replace(tzinfo=timezone.utc)
         baseline = self.baseline_service.today(
             owner,
             refresh=False,
@@ -219,6 +213,29 @@ class DecisionConfirmationService:
         baseline.setdefault("authority", "software_baseline")
         baseline.setdefault("is_final_decision", False)
         baseline_id = str(baseline.get("decision_id") or "")
+
+        latest_research = (
+            await self.research_service.today(owner, refresh=True, now=now)
+            if refresh
+            else await self.research_service.latest(owner)
+        )
+        proposal = await self.proposal_service.latest(owner)
+        if proposal:
+            research = await self.research_service.get(
+                owner,
+                str(proposal.get("research_packet_id") or ""),
+            )
+            if not isinstance(research, Mapping):
+                research = {}
+        else:
+            research = latest_research
+            if research is None:
+                research = await self.research_service.today(
+                    owner,
+                    refresh=False,
+                    now=now,
+                )
+
         research_baseline = research.get("software_baseline")
         research_baseline = (
             research_baseline if isinstance(research_baseline, Mapping) else {}
@@ -228,17 +245,27 @@ class DecisionConfirmationService:
             or research_baseline.get("baseline_id")
             or ""
         )
-        if baseline_id and research_baseline_id != baseline_id:
+        if (
+            proposal is None
+            and baseline_id
+            and research_baseline_id != baseline_id
+        ):
             research = await self.research_service.today(
                 owner,
                 refresh=False,
                 now=now,
             )
-
-        proposal = await self.proposal_service.latest(
-            owner,
-            research_packet_id=str(research.get("research_packet_id") or ""),
-        )
+            research_baseline = research.get("software_baseline")
+            research_baseline = (
+                research_baseline
+                if isinstance(research_baseline, Mapping)
+                else {}
+            )
+            research_baseline_id = str(
+                research.get("source_baseline_id")
+                or research_baseline.get("baseline_id")
+                or ""
+            )
         validation = (
             await self._latest_validation(owner, proposal["proposal_id"])
             if proposal
@@ -249,7 +276,35 @@ class DecisionConfirmationService:
             if proposal
             else None
         )
-        valid_codex = bool(validation and validation.get("status") == "valid")
+        revalidation_reasons = []
+        if proposal:
+            if not research:
+                revalidation_reasons.append("proposal_research_packet_missing")
+            if (
+                str(proposal.get("research_packet_id") or "")
+                != str(research.get("research_packet_id") or "")
+            ):
+                revalidation_reasons.append("proposal_research_packet_mismatch")
+            if baseline_id and research_baseline_id != baseline_id:
+                revalidation_reasons.append("software_baseline_changed")
+            if validation is None:
+                revalidation_reasons.append("validation_missing")
+            elif validation.get("status") != "valid":
+                revalidation_reasons.append(
+                    str(validation.get("status") or "validation_not_valid")
+                )
+            else:
+                valid_until = _parse_datetime(validation.get("valid_until"))
+                if valid_until is not None and valid_until <= effective_now:
+                    revalidation_reasons.append("validation_expired")
+        revalidation_reasons = list(dict.fromkeys(revalidation_reasons))
+        revalidation_required = bool(proposal and revalidation_reasons)
+        valid_codex = bool(
+            proposal
+            and validation
+            and validation.get("status") == "valid"
+            and not revalidation_required
+        )
         codex_is_primary = bool(
             self.authority_mode == "codex_validated" and valid_codex
         )
@@ -262,6 +317,25 @@ class DecisionConfirmationService:
             "is_final_decision": codex_is_primary,
             "requires_user_confirmation": bool(codex_is_primary and not confirmed),
             "is_confirmed": confirmed,
+            "workflow_status": (
+                "proposal_revalidation_required"
+                if revalidation_required
+                else "proposal_validated"
+                if valid_codex
+                else "proposal_not_valid"
+                if proposal
+                else "software_baseline_only"
+            ),
+            "revalidation_required": revalidation_required,
+            "revalidation_reasons": revalidation_reasons,
+            "proposal_research_packet_id": (
+                proposal.get("research_packet_id") if proposal else None
+            ),
+            "latest_research_packet_id": (
+                latest_research.get("research_packet_id")
+                if isinstance(latest_research, Mapping)
+                else None
+            ),
             "research_packet": deepcopy(research),
             "software_baseline": baseline,
             "codex_proposal": proposal,

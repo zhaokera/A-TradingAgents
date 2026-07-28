@@ -1257,7 +1257,7 @@ const getObjectiveTagType = (tier?: string): 'success' | 'warning' | 'info' => {
 
 const getActionabilityTagType = (status?: string): 'success' | 'warning' | 'danger' | 'info' => {
   if (status === 'ready_now') return 'success'
-  if (status === 'condition_order') return 'warning'
+  if (status === 'watch_trigger') return 'warning'
   if (status === 'blocked' || status === 'invalidated') return 'danger'
   return 'info'
 }

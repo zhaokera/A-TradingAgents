@@ -96,7 +96,7 @@ export interface AICandidateRiskFlag {
 export type AICandidateObjectiveTier = 'core' | 'related' | 'non_core'
 export type AICandidateActionability =
   | 'ready_now'
-  | 'condition_order'
+  | 'watch_trigger'
   | 'blocked'
   | 'invalidated'
   | 'target_reached'
@@ -114,6 +114,7 @@ export interface AICandidateItem {
   actionability: AICandidateActionability
   actionability_label: string
   can_add_to_favorites: boolean
+  watch_trigger_ready: boolean
   condition_order_ready: boolean
   rank_score: number
   objective_id?: string

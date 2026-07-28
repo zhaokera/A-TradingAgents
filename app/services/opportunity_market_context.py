@@ -95,6 +95,11 @@ class OpportunityMarketContext:
         repr=False,
         compare=False,
     )
+    public_snapshot_resilience: Any = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def remaining_seconds(self) -> float:
         return max(0.0, float(self.deadline_at) - float(self.monotonic()))
@@ -131,11 +136,28 @@ class OpportunityMarketContext:
 
         fetcher = self.public_snapshot_fetcher or fetch_sina_public_market_snapshot
         try:
-            result = fetcher(
-                benchmark_trade_date=self.benchmark_trade_date,
-                timeout_seconds=timeout_seconds,
-                now=self.now,
-            )
+            resilience = self.public_snapshot_resilience
+            if resilience is None and self.public_snapshot_fetcher is None:
+                from app.services.public_market_snapshot_resilience import (
+                    PublicMarketSnapshotResilience,
+                )
+
+                resilience = PublicMarketSnapshotResilience()
+                self.public_snapshot_resilience = resilience
+            if resilience is not None:
+                result = resilience.fetch(
+                    fetcher=fetcher,
+                    benchmark_trade_date=self.benchmark_trade_date,
+                    timeout_seconds=timeout_seconds,
+                    now=self.now,
+                    remaining_seconds=self.remaining_seconds,
+                )
+            else:
+                result = fetcher(
+                    benchmark_trade_date=self.benchmark_trade_date,
+                    timeout_seconds=timeout_seconds,
+                    now=self.now,
+                )
         except Exception as exc:
             logger.exception("Public market snapshot fetch failed unexpectedly")
             result = {
@@ -370,6 +392,7 @@ def build_opportunity_market_context(
     monotonic: Callable[[], float] = time.monotonic,
     quote_fetcher: Optional[QuoteFetcher] = None,
     public_snapshot_fetcher: Optional[SnapshotFetcher] = None,
+    public_snapshot_resilience: Any = None,
 ) -> OpportunityMarketContext:
     started_at = float(monotonic())
     context = OpportunityMarketContext(
@@ -380,6 +403,7 @@ def build_opportunity_market_context(
         benchmark_trade_date=None,
         monotonic=monotonic,
         public_snapshot_fetcher=public_snapshot_fetcher,
+        public_snapshot_resilience=public_snapshot_resilience,
     )
     timeout_seconds = context.stage_timeout("tencent_market_context")
     if timeout_seconds <= 0:

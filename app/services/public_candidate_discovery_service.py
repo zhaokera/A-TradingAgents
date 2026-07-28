@@ -883,7 +883,33 @@ def _empty_snapshot_context() -> Dict[str, Any]:
         "exchange_coverage_ratio": {
             exchange: 0.0 for exchange in _EXCHANGES
         },
+        "checked_at": None,
+        "freshness": "unavailable",
+        "degraded": False,
+        "provider_errors": [],
         "rows": [],
+    }
+
+
+def _snapshot_audit_metadata(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    provider_errors = snapshot.get("provider_errors")
+    return {
+        "checked_at": (
+            str(snapshot.get("checked_at"))
+            if snapshot.get("checked_at") not in (None, "")
+            else None
+        ),
+        "freshness": str(snapshot.get("freshness") or "unknown"),
+        "degraded": snapshot.get("degraded") is True,
+        "provider_errors": (
+            [
+                _json_safe(dict(item))
+                for item in provider_errors
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(provider_errors, list)
+            else []
+        ),
     }
 
 
@@ -1222,8 +1248,12 @@ def _snapshot_context(snapshot: Any) -> tuple[Dict[str, Any], Optional[str]]:
     if raw_status != "ok":
         status = raw_status if isinstance(raw_status, str) and raw_status else "invalid_snapshot_dto"
         validated_failure = _validated_failure_snapshot_context(snapshot)
-        return validated_failure or context, status
+        failure_context = validated_failure or context
+        failure_context.update(_snapshot_audit_metadata(snapshot))
+        return failure_context, status
     validated = _validated_success_snapshot_context(snapshot)
+    if validated is not None:
+        validated.update(_snapshot_audit_metadata(snapshot))
     return (
         (validated, None)
         if validated is not None
@@ -1298,6 +1328,10 @@ def _discovery_output(
         "exchange_counts": dict(context["exchange_counts"]),
         "total_coverage_ratio": context["total_coverage_ratio"],
         "exchange_coverage_ratio": dict(context["exchange_coverage_ratio"]),
+        "checked_at": context.get("checked_at"),
+        "freshness": context.get("freshness") or "unknown",
+        "degraded": context.get("degraded") is True,
+        "provider_errors": list(context.get("provider_errors") or []),
         **stage_counts,
         "technical_checked_count": 0,
         "technical_screened_count": 0,
@@ -1326,6 +1360,10 @@ def _discovery_output(
             "public_snapshot": {
                 "provider": context["source"],
                 "status": public_stage_status,
+                "checked_at": context.get("checked_at"),
+                "freshness": context.get("freshness") or "unknown",
+                "degraded": context.get("degraded") is True,
+                "provider_errors": list(context.get("provider_errors") or []),
             },
             "tencent_verification": {
                 "provider": "tencent_batch_quotes",

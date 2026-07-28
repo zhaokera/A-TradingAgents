@@ -9,7 +9,7 @@ import re
 import time
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -30,6 +30,11 @@ QUOTE_MAX_AGE_SECONDS = 300
 QUOTE_MAX_FUTURE_SKEW_SECONDS = 60
 TENCENT_QUOTE_BATCH_SIZE = 40
 MAX_TENCENT_BATCHED_CODES = 160
+TENCENT_HISTORY_CACHE_COLLECTION = "candidate_technical_history_cache"
+TENCENT_HISTORY_FETCH_ATTEMPTS = 2
+TENCENT_HISTORY_RETRY_SECONDS = 0.25
+TENCENT_HISTORY_CACHE_MAX_AGE_SECONDS = 72 * 60 * 60
+TENCENT_HISTORY_MAX_BAR_LAG_DAYS = 7
 _TENCENT_ASSIGNMENT_PATTERN = re.compile(
     r'(?m)(?:^|;)[ \t]*v_(?P<provider_symbol>(?:sh|sz|bj)[0-9]{6})'
     r'[ \t]*=[ \t]*"(?P<payload>[^"\r\n]*)"[ \t]*(?=;|$)',
@@ -464,40 +469,150 @@ def fetch_tencent_daily_bars_sync(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     min_rows: int = 60,
+    now: Optional[datetime] = None,
+    db_factory: Optional[Callable[[], Any]] = None,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> Dict[str, Any]:
     """Fetch qfq daily bars from AKShare's Tencent history adapter."""
-    local_today = datetime.now(CN_MARKET_TIMEZONE).date()
+    checked_at = now or datetime.now(timezone.utc)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    checked_at = checked_at.astimezone(timezone.utc)
+    local_today = checked_at.astimezone(CN_MARKET_TIMEZONE).date()
     start = (start_date or (local_today - timedelta(days=120)).strftime("%Y%m%d")).replace("-", "")
     end = (end_date or local_today.strftime("%Y%m%d")).replace("-", "")
     symbol = to_tencent_symbol(code)
-    try:
-        import akshare as ak
+    normalized_code = normalize_cn_code(code)
 
-        frame = ak.stock_zh_a_hist_tx(
-            symbol=symbol,
-            start_date=start,
-            end_date=end,
-            adjust="qfq",
-        )
-        raw_rows = [] if frame is None or getattr(frame, "empty", False) else frame.to_dict("records")
-        bars = normalize_tencent_daily_bars(raw_rows)
-    except Exception as exc:
-        logger.info("Tencent daily bars failed: code=%s symbol=%s error=%s", code, symbol, exc)
+    def get_db() -> Any:
+        if db_factory is not None:
+            return db_factory()
+        from app.core.database import get_mongo_db_sync
+
+        return get_mongo_db_sync()
+
+    def cache_error(status: str, reason: str) -> Dict[str, Any]:
+        return {
+            "provider": "tencent",
+            "status": status,
+            "error_type": reason,
+            "checked_at": checked_at.isoformat(),
+        }
+
+    def load_cache(provider_error: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            row = get_db()[TENCENT_HISTORY_CACHE_COLLECTION].find_one(
+                {"_id": f"{normalized_code}:qfq"}
+            )
+        except Exception:
+            return None
+        if not isinstance(row, Mapping):
+            return None
+        cached_at = row.get("checked_at")
+        if isinstance(cached_at, str):
+            text = cached_at[:-1] + "+00:00" if cached_at.endswith("Z") else cached_at
+            try:
+                cached_at = datetime.fromisoformat(text)
+            except ValueError:
+                return None
+        if not isinstance(cached_at, datetime):
+            return None
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.replace(tzinfo=timezone.utc)
+        age_seconds = (
+            checked_at - cached_at.astimezone(timezone.utc)
+        ).total_seconds()
+        cached_bars = normalize_tencent_daily_bars(row.get("bars") or [])
+        if (
+            age_seconds < 0
+            or age_seconds > TENCENT_HISTORY_CACHE_MAX_AGE_SECONDS
+            or len(cached_bars) < min_rows
+        ):
+            return None
+        try:
+            requested_end = datetime.strptime(end, "%Y%m%d").date()
+            latest_bar = date.fromisoformat(cached_bars[-1]["date"])
+        except (TypeError, ValueError):
+            return None
+        bar_lag_days = (requested_end - latest_bar).days
+        if bar_lag_days < 0 or bar_lag_days > TENCENT_HISTORY_MAX_BAR_LAG_DAYS:
+            return None
+        return {
+            "ok": True,
+            "status": "ok",
+            "code": normalized_code,
+            "symbol": symbol,
+            "source": f"mongo.{TENCENT_HISTORY_CACHE_COLLECTION}",
+            "original_source": row.get("source") or "tencent",
+            "adjust": "qfq",
+            "start_date": start,
+            "end_date": end,
+            "required_rows": min_rows,
+            "available_rows": len(cached_bars),
+            "bars": cached_bars,
+            "checked_at": cached_at.astimezone(timezone.utc).isoformat(),
+            "freshness": "cached_fresh",
+            "degraded": True,
+            "cache_age_seconds": round(age_seconds, 3),
+            "provider_errors": [provider_error],
+        }
+
+    bars: List[Dict[str, Any]] = []
+    fetch_error: Optional[Exception] = None
+    for attempt in range(TENCENT_HISTORY_FETCH_ATTEMPTS):
+        try:
+            import akshare as ak
+
+            frame = ak.stock_zh_a_hist_tx(
+                symbol=symbol,
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+            )
+            raw_rows = (
+                []
+                if frame is None or getattr(frame, "empty", False)
+                else frame.to_dict("records")
+            )
+            bars = normalize_tencent_daily_bars(raw_rows)
+            fetch_error = None
+            break
+        except Exception as exc:
+            fetch_error = exc
+            logger.info(
+                "Tencent daily bars failed: code=%s symbol=%s attempt=%s error=%s",
+                code,
+                symbol,
+                attempt + 1,
+                exc,
+            )
+            if attempt + 1 < TENCENT_HISTORY_FETCH_ATTEMPTS:
+                sleeper(TENCENT_HISTORY_RETRY_SECONDS)
+
+    if fetch_error is not None:
+        provider_error = cache_error("fetch_error", type(fetch_error).__name__)
+        cached = load_cache(provider_error)
+        if cached is not None:
+            return cached
         return {
             "ok": False,
             "status": "fetch_error",
-            "reason": str(exc),
-            "code": normalize_cn_code(code),
+            "reason": str(fetch_error),
+            "code": normalized_code,
             "symbol": symbol,
             "source": "tencent",
             "adjust": "qfq",
             "bars": [],
+            "checked_at": checked_at.isoformat(),
+            "freshness": "unavailable",
+            "degraded": False,
+            "provider_errors": [provider_error],
         }
 
     payload = {
         "ok": len(bars) >= min_rows,
         "status": "ok" if len(bars) >= min_rows else "insufficient_history",
-        "code": normalize_cn_code(code),
+        "code": normalized_code,
         "symbol": symbol,
         "source": "tencent",
         "adjust": "qfq",
@@ -506,9 +621,37 @@ def fetch_tencent_daily_bars_sync(
         "required_rows": min_rows,
         "available_rows": len(bars),
         "bars": bars,
+        "checked_at": checked_at.isoformat(),
+        "freshness": "live",
+        "degraded": False,
+        "provider_errors": [],
     }
     if not payload["ok"]:
         payload["reason"] = f"腾讯前复权日线不足 {min_rows} 条。"
+        provider_error = cache_error("insufficient_history", "InsufficientHistory")
+        cached = load_cache(provider_error)
+        if cached is not None:
+            return cached
+        payload["provider_errors"] = [provider_error]
+        return payload
+    try:
+        get_db()[TENCENT_HISTORY_CACHE_COLLECTION].replace_one(
+            {"_id": f"{normalized_code}:qfq"},
+            {
+                "_id": f"{normalized_code}:qfq",
+                "code": normalized_code,
+                "symbol": symbol,
+                "source": "tencent",
+                "adjust": "qfq",
+                "start_date": start,
+                "end_date": end,
+                "bars": deepcopy(bars),
+                "checked_at": checked_at,
+            },
+            upsert=True,
+        )
+    except Exception:
+        pass
     return payload
 
 

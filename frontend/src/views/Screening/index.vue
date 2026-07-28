@@ -66,8 +66,8 @@
           <strong>{{ aiCandidateRun.actionability_counts?.ready_now || 0 }}</strong>
         </div>
         <div class="ai-summary-item">
-          <span>条件提醒</span>
-          <strong>{{ aiCandidateRun.actionability_counts?.condition_order || 0 }}</strong>
+          <span>观察触发</span>
+          <strong>{{ aiCandidateRun.actionability_counts?.watch_trigger || 0 }}</strong>
         </div>
         <div class="ai-summary-item">
           <span>风险阻断</span>
@@ -109,7 +109,7 @@
           <el-radio-group v-model="aiStatusFilter" size="small">
             <el-radio-button value="all">全部 {{ aiCandidateRun.candidate_count }}</el-radio-button>
             <el-radio-button value="ready_now">价格已到</el-radio-button>
-            <el-radio-button value="condition_order">条件提醒</el-radio-button>
+            <el-radio-button value="watch_trigger">观察触发</el-radio-button>
             <el-radio-button value="blocked">风险阻断</el-radio-button>
           </el-radio-group>
           <el-segmented v-model="selectedHorizon" :options="horizonOptions" size="small" />
@@ -758,7 +758,7 @@ const getEntryStatusTagType = (status: AICandidatePricePlan['entry_status']) => 
 
 const getActionabilityTagType = (status: AICandidateActionability) => {
   if (status === 'ready_now') return 'success'
-  if (status === 'condition_order') return 'warning'
+  if (status === 'watch_trigger') return 'warning'
   if (status === 'blocked' || status === 'invalidated') return 'danger'
   return 'info'
 }

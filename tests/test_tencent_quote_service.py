@@ -1,6 +1,6 @@
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -1170,6 +1170,7 @@ def test_fetch_tencent_daily_bars_uses_tx_qfq_contract(monkeypatch):
         start_date="20260701",
         end_date="20260710",
         min_rows=2,
+        db_factory=lambda: {},
     )
 
     assert captured == {
@@ -1201,12 +1202,133 @@ def test_fetch_tencent_daily_bars_returns_structured_insufficient_history(monkey
         start_date="20260701",
         end_date="20260710",
         min_rows=60,
+        db_factory=lambda: {},
     )
 
     assert result["ok"] is False
     assert result["status"] == "insufficient_history"
     assert result["required_rows"] == 60
     assert result["available_rows"] == 1
+
+
+def test_fetch_tencent_daily_bars_retries_then_uses_fresh_audited_cache(monkeypatch):
+    now = datetime(2026, 7, 28, 2, 0, tzinfo=timezone.utc)
+    calls = []
+    sleeps = []
+    bars = [
+        {
+            "date": (datetime(2026, 5, 29) + timedelta(days=index)).date().isoformat(),
+            "open": 10.0,
+            "close": 10.1,
+            "high": 10.2,
+            "low": 9.9,
+        }
+        for index in range(60)
+    ]
+
+    def failing_history(**kwargs):
+        calls.append(kwargs)
+        raise ConnectionError("upstream disconnected")
+
+    class Collection:
+        def find_one(self, query):
+            assert query == {"_id": "000977:qfq"}
+            return {
+                "_id": "000977:qfq",
+                "source": "tencent",
+                "checked_at": now - timedelta(hours=1),
+                "bars": bars,
+            }
+
+    class Database:
+        def __getitem__(self, name):
+            assert name == quote_service.TENCENT_HISTORY_CACHE_COLLECTION
+            return Collection()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        SimpleNamespace(stock_zh_a_hist_tx=failing_history),
+    )
+
+    result = fetch_tencent_daily_bars_sync(
+        "000977",
+        start_date="20260501",
+        end_date="20260728",
+        min_rows=60,
+        now=now,
+        db_factory=Database,
+        sleeper=sleeps.append,
+    )
+
+    assert len(calls) == quote_service.TENCENT_HISTORY_FETCH_ATTEMPTS
+    assert sleeps == [quote_service.TENCENT_HISTORY_RETRY_SECONDS]
+    assert result["ok"] is True
+    assert result["source"] == "mongo.candidate_technical_history_cache"
+    assert result["freshness"] == "cached_fresh"
+    assert result["degraded"] is True
+    assert result["cache_age_seconds"] == 3600.0
+    assert result["provider_errors"] == [
+        {
+            "provider": "tencent",
+            "status": "fetch_error",
+            "error_type": "ConnectionError",
+            "checked_at": now.isoformat(),
+        }
+    ]
+
+
+def test_fetch_tencent_daily_bars_rejects_stale_cache(monkeypatch):
+    now = datetime(2026, 7, 28, 2, 0, tzinfo=timezone.utc)
+    bars = [
+        {
+            "date": (datetime(2026, 5, 29) + timedelta(days=index)).date().isoformat(),
+            "open": 10.0,
+            "close": 10.1,
+            "high": 10.2,
+            "low": 9.9,
+        }
+        for index in range(60)
+    ]
+
+    class Collection:
+        def find_one(self, query):
+            return {
+                "_id": "000977:qfq",
+                "source": "tencent",
+                "checked_at": now - timedelta(hours=73),
+                "bars": bars,
+            }
+
+    class Database:
+        def __getitem__(self, name):
+            return Collection()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        SimpleNamespace(
+            stock_zh_a_hist_tx=lambda **kwargs: (_ for _ in ()).throw(
+                ConnectionError("upstream disconnected")
+            )
+        ),
+    )
+
+    result = fetch_tencent_daily_bars_sync(
+        "000977",
+        start_date="20260501",
+        end_date="20260728",
+        min_rows=60,
+        now=now,
+        db_factory=Database,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "fetch_error"
+    assert result["freshness"] == "unavailable"
+    assert result["degraded"] is False
+    assert result["bars"] == []
 
 
 def test_merge_tencent_quote_replaces_same_day_or_appends_next_day():

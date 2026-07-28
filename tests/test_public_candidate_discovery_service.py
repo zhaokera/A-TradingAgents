@@ -1,7 +1,7 @@
 import json
 import logging
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
@@ -15,6 +15,9 @@ from app.services.public_candidate_discovery_service import (
     discover_public_candidate_universe,
     midrank_percentiles,
     rank_public_candidate_universe,
+)
+from app.services.public_market_snapshot_resilience import (
+    PublicMarketSnapshotResilience,
 )
 from app.services.tencent_quote_service import parse_tencent_quote_batch_payload
 
@@ -217,8 +220,12 @@ def _snapshot(
             exchange_counts[exchange] += 1
     snapshot = {
         "status": "ok",
-        "source": "akshare.sina.stock_zh_a_spot",
-        "benchmark_trade_date": BENCHMARK_TRADE_DATE,
+            "source": "akshare.sina.stock_zh_a_spot",
+            "benchmark_trade_date": BENCHMARK_TRADE_DATE,
+            "checked_at": None,
+            "freshness": "unknown",
+            "degraded": False,
+            "provider_errors": [],
         "provider_trade_date": BENCHMARK_TRADE_DATE,
         "provider_expected_count": len(snapshot_rows),
         "provider_expected_exchange_counts": dict(exchange_counts),
@@ -1546,6 +1553,10 @@ def test_discovery_does_not_call_tencent_when_public_preselection_is_empty():
         "mode": "public_full_market",
         "status": "no_eligible_candidates",
         "source": "akshare.sina.stock_zh_a_spot",
+        "checked_at": None,
+        "freshness": "unknown",
+        "degraded": False,
+        "provider_errors": [],
         "benchmark_trade_date": BENCHMARK_TRADE_DATE,
         "provider_expected_count": MIN_BREADTH_UNIVERSE_SIZE,
         "provider_expected_exchange_counts": {
@@ -1588,10 +1599,14 @@ def test_discovery_does_not_call_tencent_when_public_preselection_is_empty():
             "permission_prefilter_excluded_count": 0,
             "permission_prefilter_excluded": [],
             "stage_sources": {
-            "public_snapshot": {
-                "provider": "akshare.sina.stock_zh_a_spot",
-                "status": "ok",
-            },
+                "public_snapshot": {
+                    "provider": "akshare.sina.stock_zh_a_spot",
+                    "status": "ok",
+                    "checked_at": None,
+                    "freshness": "unknown",
+                    "degraded": False,
+                    "provider_errors": [],
+                },
             "tencent_verification": {
                 "provider": "tencent_batch_quotes",
                 "status": "not_called_no_preselection",
@@ -1728,6 +1743,10 @@ def test_discovery_preserves_valid_real_task_1_failure_coverage_without_tencent(
         "public_snapshot": {
             "provider": "akshare.sina.stock_zh_a_spot",
             "status": "public_snapshot_coverage_incomplete",
+            "checked_at": None,
+            "freshness": "unknown",
+            "degraded": False,
+            "provider_errors": [],
         },
         "tencent_verification": {
             "provider": "tencent_batch_quotes",
@@ -2032,6 +2051,10 @@ def test_discovery_calls_tencent_once_with_public_priority_order_and_builds_full
         "public_snapshot": {
             "provider": "akshare.sina.stock_zh_a_spot",
             "status": "ok",
+            "checked_at": None,
+            "freshness": "unknown",
+            "degraded": False,
+            "provider_errors": [],
         },
         "tencent_verification": {
             "provider": "tencent_batch_quotes",
@@ -2286,6 +2309,10 @@ def test_discovery_converts_task_3_domain_errors_to_public_preselection_failure(
     assert result["candidate_discovery"]["stage_sources"]["public_snapshot"] == {
         "provider": "akshare.sina.stock_zh_a_spot",
         "status": "ok",
+        "checked_at": None,
+        "freshness": "unknown",
+        "degraded": False,
+        "provider_errors": [],
     }
     assert result["candidate_discovery"]["stage_sources"][
         "tencent_verification"
@@ -2572,3 +2599,231 @@ def test_discovery_output_is_strict_json_and_has_no_executable_trade_fields():
 
     visit(result)
     assert json.dumps(result, allow_nan=False)
+
+
+class _SnapshotCacheCollection:
+    def __init__(self):
+        self.rows = {}
+
+    def find_one(self, query):
+        return self.rows.get(query.get("_id"))
+
+    def replace_one(self, query, document, upsert=False):
+        self.rows[query["_id"]] = dict(document)
+
+    def update_one(self, query, update, upsert=False):
+        current = dict(self.rows.get(query["_id"]) or {"_id": query["_id"]})
+        current.update(update.get("$set") or {})
+        self.rows[query["_id"]] = current
+
+
+class _SnapshotCacheDB:
+    def __init__(self):
+        self.collections = {
+            "candidate_market_snapshots": _SnapshotCacheCollection(),
+            "candidate_data_source_health": _SnapshotCacheCollection(),
+        }
+
+    def __getitem__(self, name):
+        return self.collections[name]
+
+
+def test_snapshot_resilience_uses_fresh_complete_cache_after_bounded_failures():
+    db = _SnapshotCacheDB()
+    cached = _snapshot([_row("600610", amount=900_000_000.0)])
+    db["candidate_market_snapshots"].rows[
+        f"public_full_market:{BENCHMARK_TRADE_DATE}"
+    ] = {
+        "_id": f"public_full_market:{BENCHMARK_TRADE_DATE}",
+        "benchmark_trade_date": BENCHMARK_TRADE_DATE,
+        "checked_at": NOW - timedelta(minutes=5),
+        "source": cached["source"],
+        "payload": cached,
+    }
+    attempts = []
+    service = PublicMarketSnapshotResilience(
+        db_factory=lambda: db,
+        sleeper=lambda _seconds: None,
+    )
+
+    def disconnected(**kwargs):
+        attempts.append(kwargs)
+        raise ConnectionError("RemoteDisconnected")
+
+    snapshot = service.fetch(
+        fetcher=disconnected,
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        timeout_seconds=20,
+        now=NOW,
+        remaining_seconds=lambda: 20,
+    )
+
+    result = discover_public_candidate_universe(
+        snapshot,
+        fetch_quotes=lambda codes: {
+            "status": "ok",
+            "requested_codes": list(codes),
+            "rows": [
+                _quote(definition)
+                for definition in rank_public_candidate_universe(
+                    snapshot["rows"],
+                    benchmark_trade_date=BENCHMARK_TRADE_DATE,
+                )["definitions"]
+            ],
+            "error_type": None,
+        },
+        now=NOW,
+    )
+
+    assert len(attempts) == 2
+    assert snapshot["status"] == "ok"
+    assert snapshot["source"] == "mongo.candidate_market_snapshots"
+    assert snapshot["freshness"] == "cached_fresh"
+    assert snapshot["degraded"] is True
+    assert len(snapshot["provider_errors"]) == 2
+    assert result["status"] == "ok"
+    audit = result["candidate_discovery"]
+    assert audit["degraded"] is True
+    assert audit["freshness"] == "cached_fresh"
+    assert audit["stage_sources"]["public_snapshot"]["provider"] == (
+        "mongo.candidate_market_snapshots"
+    )
+
+
+def test_snapshot_resilience_fails_closed_when_only_cache_is_stale():
+    db = _SnapshotCacheDB()
+    cached = _snapshot([_row("600610", amount=900_000_000.0)])
+    db["candidate_market_snapshots"].rows[
+        f"public_full_market:{BENCHMARK_TRADE_DATE}"
+    ] = {
+        "_id": f"public_full_market:{BENCHMARK_TRADE_DATE}",
+        "benchmark_trade_date": BENCHMARK_TRADE_DATE,
+        "checked_at": NOW - timedelta(minutes=31),
+        "source": cached["source"],
+        "payload": cached,
+    }
+    service = PublicMarketSnapshotResilience(
+        db_factory=lambda: db,
+        sleeper=lambda _seconds: None,
+    )
+
+    snapshot = service.fetch(
+        fetcher=lambda **_kwargs: {
+            "status": "public_breadth_fetch_failed",
+            "source": "akshare.sina.stock_zh_a_spot",
+            "error_type": "RemoteDisconnected",
+            "rows": [],
+        },
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        timeout_seconds=20,
+        now=NOW,
+        remaining_seconds=lambda: 20,
+    )
+    result = discover_public_candidate_universe(
+        snapshot,
+        fetch_quotes=lambda _codes: pytest.fail("Tencent must not be called"),
+        now=NOW,
+    )
+
+    assert snapshot["status"] == "public_snapshot_unavailable"
+    assert snapshot["freshness"] == "unavailable"
+    assert result["status"] == "candidate_discovery_unavailable"
+    assert result["status"] != "no_eligible_candidates"
+    assert result["candidate_discovery"]["provider_errors"]
+
+
+def test_snapshot_resilience_uses_complete_fresh_market_quotes_fallback():
+    codes = (
+        [f"{600000 + index:06d}" for index in range(200)]
+        + [f"{index + 1:06d}" for index in range(200)]
+        + [f"{430000 + index:06d}" for index in range(100)]
+    )
+
+    class FindCollection:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def find(self, *_args, **_kwargs):
+            return list(self.rows)
+
+    db = _SnapshotCacheDB()
+    db.collections["stock_basic_info"] = FindCollection(
+        [{"code": code, "name": f"样本{code}"} for code in codes]
+    )
+    db.collections["market_quotes"] = FindCollection(
+        [
+            {
+                "code": code,
+                "name": f"样本{code}",
+                "close": 10.0,
+                "pct_chg": 1.0,
+                "amount": 200_000_000.0,
+                "trade_date": BENCHMARK_TRADE_DATE,
+                "updated_at": NOW - timedelta(minutes=2),
+            }
+            for code in codes
+        ]
+    )
+    service = PublicMarketSnapshotResilience(
+        db_factory=lambda: db,
+        sleeper=lambda _seconds: None,
+    )
+
+    snapshot = service.fetch(
+        fetcher=lambda **_kwargs: {
+            "status": "public_breadth_fetch_failed",
+            "source": "akshare.sina.stock_zh_a_spot",
+            "error_type": "RemoteDisconnected",
+            "rows": [],
+        },
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        timeout_seconds=20,
+        now=NOW,
+        remaining_seconds=lambda: 20,
+    )
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["source"] == "mongo.market_quotes"
+    assert snapshot["freshness"] == "cached_fresh"
+    assert snapshot["degraded"] is True
+    assert snapshot["universe_count"] == 500
+    assert snapshot["total_coverage_ratio"] == 1.0
+    assert len(snapshot["provider_errors"]) == 2
+
+
+def test_snapshot_resilience_health_cooldown_skips_repeated_upstream_calls():
+    db = _SnapshotCacheDB()
+    service = PublicMarketSnapshotResilience(
+        db_factory=lambda: db,
+        sleeper=lambda _seconds: None,
+    )
+    attempts = []
+
+    def unavailable(**kwargs):
+        attempts.append(kwargs)
+        return {
+            "status": "public_breadth_fetch_failed",
+            "source": "akshare.sina.stock_zh_a_spot",
+            "error_type": "RemoteDisconnected",
+            "rows": [],
+        }
+
+    first = service.fetch(
+        fetcher=unavailable,
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        timeout_seconds=20,
+        now=NOW,
+        remaining_seconds=lambda: 20,
+    )
+    second = service.fetch(
+        fetcher=unavailable,
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        timeout_seconds=20,
+        now=NOW + timedelta(seconds=10),
+        remaining_seconds=lambda: 20,
+    )
+
+    assert first["status"] == "public_snapshot_unavailable"
+    assert second["status"] == "public_snapshot_unavailable"
+    assert second["provider_health"] == "cooldown"
+    assert len(attempts) == 2

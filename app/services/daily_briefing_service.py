@@ -10,11 +10,20 @@ from app.services.ai_candidate_service import ai_candidate_service
 from app.services.favorites_service import favorites_service
 from app.services.global_macro_risk_service import global_macro_risk_service
 from app.services.notifications_service import get_notifications_service
+from app.services.premarket_intelligence_service import (
+    premarket_intelligence_service,
+)
 from app.services.tencent_quote_service import get_tencent_quote_service
 
 
 class DailyBriefingService:
+    def __init__(self, *, premarket_service: Any = None) -> None:
+        self.premarket_service = (
+            premarket_service or premarket_intelligence_service
+        )
+
     async def build(self, user_id: str, *, refresh: bool = True) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
         db = get_mongo_db()
         candidate_run = await ai_candidate_service.latest(
             str(user_id), refresh_quotes=refresh
@@ -82,13 +91,32 @@ class DailyBriefingService:
             if isinstance(candidate_run, Mapping)
             else []
         )
+        allocated_research = [
+            item
+            for item in candidates
+            if isinstance(item, Mapping)
+            and (item.get("portfolio_allocation") or {}).get("status") == "allocated"
+        ]
         executable = [
             item
             for item in candidates
-            if (item.get("portfolio_allocation") or {}).get("status") == "allocated"
+            if isinstance(item, Mapping)
+            and item.get("execution_actionable") is True
         ]
+        premarket = await self.premarket_service.build(
+            db=db,
+            macro=macro,
+            candidates=[
+                item for item in candidates if isinstance(item, Mapping)
+            ],
+            favorites=[
+                item for item in favorites if isinstance(item, Mapping)
+            ],
+            now=now,
+        )
         return {
-            "as_of": datetime.now(timezone.utc).isoformat(),
+            "as_of": now.isoformat(),
+            "premarket_intelligence": premarket,
             "account": account,
             "holdings": {
                 "count": len(holding_items),
@@ -112,6 +140,8 @@ class DailyBriefingService:
                 "candidate_count": len(candidates),
                 "executable_count": len(executable),
                 "executable_candidates": executable,
+                "allocated_research_count": len(allocated_research),
+                "allocated_research_candidates": allocated_research,
                 "portfolio_plan": portfolio_plan,
             },
             "favorites": {

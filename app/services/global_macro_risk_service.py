@@ -49,7 +49,9 @@ class GlobalMacroRiskService:
         "vix": "^VIX",
         "nasdaq": "^IXIC",
         "sp500": "^GSPC",
+        "semiconductor": "^SOX",
         "usdcnh": "USDCNH=X",
+        "oil": "CL=F",
         "gold": "GC=F",
         "copper": "HG=F",
     }
@@ -88,7 +90,14 @@ class GlobalMacroRiskService:
             latest = float(closes.iloc[-1])
             previous = float(closes.iloc[-2]) if len(closes) >= 2 else latest
             result[key] = round(latest, 4)
-            if key in {"nasdaq", "sp500", "gold", "copper"} and previous:
+            if key in {
+                "nasdaq",
+                "sp500",
+                "semiconductor",
+                "oil",
+                "gold",
+                "copper",
+            } and previous:
                 result[f"{key}_change_pct"] = round(
                     (latest - previous) / previous * 100, 2
                 )
