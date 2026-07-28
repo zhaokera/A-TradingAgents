@@ -42,7 +42,23 @@ def _research_payload():
         "ok": True,
         "data": {
             "candidate_discovery": {
+                "status": "ok",
+                "source": "akshare.sina.stock_zh_a_spot+tencent_batch_quotes",
                 "benchmark_trade_date": "2026-07-17",
+                "checked_at": "2026-07-17T07:00:00+00:00",
+                "freshness": "fresh",
+                "degraded": False,
+                "provider_errors": [],
+                "stage_sources": {
+                    "public_snapshot": {
+                        "provider": "akshare.sina.stock_zh_a_spot",
+                        "status": "ok",
+                    },
+                    "tencent_verification": {
+                        "provider": "tencent_batch_quotes",
+                        "status": "ok",
+                    },
+                },
                 "universe_count": 5527,
                 "eligible_count": 2134,
                 "selected_count": 2,
@@ -155,6 +171,76 @@ def test_normalize_ai_candidate_run_keeps_reference_only_price_evidence():
     assert second["favorite_status"] == "not_added"
     assert "suggested_quantity" not in first
     assert result["disclaimer"].startswith("仅供研究参考")
+    assert result["discovery"] == {
+        "status": "ok",
+        "source": "akshare.sina.stock_zh_a_spot+tencent_batch_quotes",
+        "trade_date": "2026-07-17",
+        "benchmark_trade_date": "2026-07-17",
+        "checked_at": "2026-07-17T07:00:00+00:00",
+        "freshness": "fresh",
+        "degraded": False,
+        "cache_age_seconds": None,
+        "attempt_count": None,
+        "provider_health": None,
+        "provider_errors": [],
+        "stage_sources": {
+            "public_snapshot": {
+                "provider": "akshare.sina.stock_zh_a_spot",
+                "status": "ok",
+            },
+            "tencent_verification": {
+                "provider": "tencent_batch_quotes",
+                "status": "ok",
+            },
+        },
+        "universe_count": 5527,
+        "eligible_count": 2134,
+        "selected_count": 2,
+        "technical_passed_count": 2,
+        "earnings_selected_count": 2,
+        "total_coverage_ratio": 1.0,
+        "permission_prefilter_excluded_count": 0,
+        "permission_prefilter_excluded": [],
+    }
+
+
+def test_normalize_ai_candidate_run_preserves_degraded_discovery_audit():
+    payload = _research_payload()
+    discovery = payload["data"]["candidate_discovery"]
+    discovery.update(
+        {
+            "source": "mongo.candidate_market_snapshots+tencent_batch_quotes",
+            "checked_at": "2026-07-17T06:55:00+00:00",
+            "freshness": "cached_fresh",
+            "degraded": True,
+            "cache_age_seconds": 300.0,
+            "attempt_count": 2,
+            "provider_errors": [
+                {
+                    "provider": "akshare.sina.stock_zh_a_spot",
+                    "status": "public_breadth_fetch_failed",
+                    "error_type": "RemoteDisconnected",
+                    "checked_at": "2026-07-17T07:00:00+00:00",
+                }
+            ],
+        }
+    )
+
+    result = normalize_ai_candidate_run(
+        payload,
+        max_candidates=5,
+        favorite_codes=set(),
+    )
+
+    audit = result["discovery"]
+    assert audit["status"] == "ok"
+    assert audit["source"].startswith("mongo.candidate_market_snapshots")
+    assert audit["trade_date"] == "2026-07-17"
+    assert audit["freshness"] == "cached_fresh"
+    assert audit["degraded"] is True
+    assert audit["cache_age_seconds"] == 300.0
+    assert audit["attempt_count"] == 2
+    assert audit["provider_errors"][0]["error_type"] == "RemoteDisconnected"
 
 
 def test_normalize_ai_candidate_run_sorts_core_objective_before_non_core():
