@@ -59,7 +59,7 @@ _BLOCKING_RISK_CODES = {
 
 _ACTIONABILITY_LABELS = {
     "ready_now": "研究价格条件已满足",
-    "condition_order": "研究条件待触发",
+    "watch_trigger": "观察触发",
     "blocked": "风险阻断",
     "invalidated": "计划失效",
     "target_reached": "已达到目标价",
@@ -70,7 +70,7 @@ _ACTIONABILITY_LABELS = {
 
 _ACTIONABILITY_ORDER = {
     "ready_now": 0,
-    "condition_order": 1,
+    "watch_trigger": 1,
     "blocked": 2,
     "quote_unavailable": 3,
     "incomplete": 4,
@@ -342,7 +342,7 @@ def _derive_actionability(
     if entry_status == "price_ready":
         return "ready_now"
     if entry_status in {"waiting_pullback", "waiting_breakout"}:
-        return "condition_order"
+        return "watch_trigger"
     if entry_status == "price_ready_risk_blocked":
         return "blocked"
     if entry_status == "invalidated":
@@ -369,7 +369,7 @@ def _apply_candidate_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
     )
     if portfolio_gate.get("blocked") and actionability in {
         "ready_now",
-        "condition_order",
+        "watch_trigger",
     }:
         actionability = "blocked"
     elif candidate.get("plan_expired") is True and actionability not in {
@@ -383,12 +383,17 @@ def _apply_candidate_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
     candidate["research_status_label"] = _ACTIONABILITY_LABELS[actionability]
     candidate["can_add_to_favorites"] = actionability in {
         "ready_now",
-        "condition_order",
+        "watch_trigger",
     }
-    candidate["research_condition_ready"] = actionability == "condition_order"
+    candidate["watch_trigger_ready"] = actionability == "watch_trigger"
+    candidate["research_condition_ready"] = False
     candidate["condition_order_ready"] = False
     candidate["execution_actionable"] = False
-    candidate["execution_status"] = "research_only"
+    candidate["execution_status"] = (
+        "price_alert_manual_confirmation"
+        if actionability == "watch_trigger"
+        else "research_only"
+    )
     return candidate
 
 
@@ -396,7 +401,7 @@ def _candidate_rank_score(candidate: Mapping[str, Any]) -> float:
     objective_score = float(candidate.get("objective_match_score") or 0) * 40
     actionability_score = {
         "ready_now": 40,
-        "condition_order": 30,
+        "watch_trigger": 30,
         "blocked": 5,
         "quote_unavailable": 2,
         "incomplete": 0,

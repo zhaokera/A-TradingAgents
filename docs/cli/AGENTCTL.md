@@ -90,6 +90,9 @@ agentctl --pretty decision performance
 软件对照基线，不再冒充 Codex 最终结论。`decision propose` 保存严格结构化的 Codex 提案并
 立即执行首次硬风控校验；`decision validate` 使用最新时间敏感数据再次校验；
 `decision final` 并列返回研究包、软件基线、Codex 提案、校验与用户确认状态。
+已有提案时，`decision final --no-refresh` 固定读取该提案绑定的不可变研究包；若软件基线
+已变化、校验已过期或研究包缺失，返回 `revalidation_required=true` 和明确原因，不会
+静默切换研究包或把已保存提案清空。
 
 `condition_order` 不是普通限价单。只有实时行情有效、券商能力已核实支持独立触发价和
 独立委托限价、且计划同时提供 `trigger_price` 与 `order_limit_price` 时才会出现。
@@ -192,7 +195,7 @@ CLI 通过 Docker 后端 API 读取账户数据，不依赖当前工作目录，
 4. 查询持仓使用 holdings list/summary/get/trades，禁止使用 --user-id 或数据库直连切换用户。
 5. 研究包是唯一事实底稿。不得违反 hard_constraints；可以覆盖 soft_warnings，但每项必须提供 evidence_refs、覆盖理由和风险调整。软件 baseline 只用于对照，不是最终权限。
 6. 查询候选使用 candidates latest --refresh；需要重新扫描全市场时运行 candidates run。run 默认等待后台任务完成，也可以使用 --no-wait 后再用 candidates status --job-id 查询。
-7. 以 actionability 为主结论：ready_now 表示价格条件已满足，condition_order 表示可以设置条件提醒，blocked 表示风险阻断，invalidated 表示原计划失效。
+7. 候选研究页以 actionability 为主结论：ready_now 表示研究价格条件已满足，watch_trigger 表示仅设置价格观察并在触发后人工刷新确认；它不是券商条件单。只有正式 decision 输出同时验证实时行情、账户风险、市场权限和独立触发价/委托限价能力后，才会出现 condition_order。
 8. 研究目标是“科技 + 新质生产力”，同时核对权威主营证据、国际宏观风险、行情时间、失效价、目标价、多周期 plans 和组合分配；不要把 blocked、invalidated 或 incomplete 加入自选。
 9. 需要评估当前决策闭环时运行 decision performance；只使用 metric_basis=shadow_trade_v1 的已关闭样本。candidates performance 仅用于查看旧候选生命周期，不替代决策绩效。
 10. 查询股票使用 stocks quote/fundamentals/kline/news。

@@ -70,7 +70,8 @@ cd /Users/zhaok/Desktop/TradingAgents-CN
 候选的 `actionability` 是主状态：
 
 - `ready_now`：价格条件已满足。
-- `condition_order`：尚未到价，可设置条件提醒。
+- `watch_trigger`：候选研究价尚未触发，只能设置价格观察并在触发后人工刷新确认。
+- `condition_order`：仅存在于正式 decision 包，且券商独立触发价与委托限价能力、实时行情和账户风险门槛均已验证。
 - `blocked`：存在阻断风险。
 - `invalidated`：价格计划已失效。
 - `expired`：计划超过有效窗口，需要重新分析。
@@ -96,7 +97,7 @@ CLI 通过 Docker 后端 API 读取账户数据，不依赖当前工作目录，
 4. 严格按 decision today 的 buy_now、condition_order、wait、avoid 四类输出，不自行把 wait 或 avoid 升级。buy_now 只在盘中腾讯行情新鲜且价格条件已经满足时出现。讨论具体股票前运行 decision explain --code CODE。
 5. 候选先运行 candidates latest --refresh；只有需要重新扫描全市场时才运行 candidates run。
 6. 以 actionability、腾讯行情时间、权威主营证据、macro_risk、plans、entry_price、stop_price、target_price、risk_flags 和 portfolio_allocation 为主结论。
-7. ready_now 单独列为“价格条件已满足”；condition_order 单独列为“可设置条件提醒”；blocked、invalidated、expired 和 incomplete 不得混入前两类。
+7. 候选研究中的 ready_now 单独列为“研究价格条件已满足”，watch_trigger 单独列为“价格观察，触发后人工确认”。只有正式 decision 包中的 condition_order 才可列为“已验证条件单”；blocked、invalidated、expired 和 incomplete 不得混入前三类。
 8. 需要查看决策效果时运行 decision performance，只使用 metric_basis=shadow_trade_v1 的已关闭样本，并报告净收益、胜率、最大回撤、止损率和沪深 300 alpha。样本不足时原样说明 calibration.status。
 9. 加入自选前确认 can_add_to_favorites=true，并保留 AI 来源和 lifecycle_state 标记。
 10. 查询单股使用 stocks quote、fundamentals、kline、news；查询报告使用 reports list/get。

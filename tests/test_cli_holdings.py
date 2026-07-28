@@ -8915,6 +8915,7 @@ def test_public_research_payload_preserves_complete_discovery_and_sanitizes_all_
     )
 
     expected_discovery = deepcopy(discovery["candidate_discovery"])
+    expected_discovery["provider_errors"] = []
     expected_discovery["technical_checked_count"] = 1
     expected_discovery["stage_sources"]["technical_deep_check"] = {
         "provider": "tencent_daily_bars",
@@ -9001,6 +9002,7 @@ def test_public_research_payload_preserves_no_candidate_coverage_without_source_
     )
 
     expected_discovery = deepcopy(discovery["candidate_discovery"])
+    expected_discovery["provider_errors"] = []
     expected_discovery["technical_checked_count"] = 0
     expected_discovery["stage_sources"]["technical_deep_check"] = {
         "provider": "tencent_daily_bars",
@@ -9011,8 +9013,9 @@ def test_public_research_payload_preserves_no_candidate_coverage_without_source_
         "status": "not_called_no_candidates",
     }
     assert payload["data"]["candidate_discovery"] == expected_discovery
-    assert set(payload["data"]["candidate_discovery"]) == set(
-        _make_public_research_discovery()["candidate_discovery"]
+    assert set(payload["data"]["candidate_discovery"]) == (
+        set(_make_public_research_discovery()["candidate_discovery"])
+        | {"provider_errors"}
     )
     assert payload["data"]["candidates"] == []
     assert payload["data"]["candidate_discovery"]["source"] == (
@@ -9733,8 +9736,15 @@ def test_build_market_status_payload_uses_one_command_context_and_schema_one(
         return {
             "status": "ok",
             "source": "akshare.sina.stock_zh_a_spot",
+            "benchmark_trade_date": "2026-07-17",
             "provider_trade_date": "2026-07-17",
             "provider_time": "14:30:00",
+            "provider_expected_count": 500,
+            "provider_expected_exchange_counts": {
+                "sh": 200,
+                "sz": 200,
+                "bj": 100,
+            },
             "rows": [
                 {
                     "code": f"600{index:03d}",

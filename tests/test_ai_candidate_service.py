@@ -133,11 +133,14 @@ def test_normalize_ai_candidate_run_keeps_reference_only_price_evidence():
     assert [item["code"] for item in result["candidates"]] == ["600001", "600000"]
     first = result["candidates"][0]
     second = result["candidates"][1]
-    assert first["research_status"] == "condition_order"
-    assert first["research_condition_ready"] is True
+    assert first["research_status"] == "watch_trigger"
+    assert first["watch_trigger_ready"] is True
+    assert first["research_condition_ready"] is False
     assert first["condition_order_ready"] is False
+    assert first["execution_status"] == "price_alert_manual_confirmation"
+    assert "可设置条件单" not in str(first)
     assert first["execution_actionable"] is False
-    assert first["execution_status"] == "research_only"
+    assert first["execution_status"] == "price_alert_manual_confirmation"
     assert first["is_reference_only"] is True
     assert first["price_plan"]["observation_zone"] == [10.8, 11.1]
     assert first["price_plan"]["entry_price"] == 11.0

@@ -177,6 +177,13 @@ def _screen_candidate_technical_plan(
         quote.get("close") or quote.get("price") or quote.get("current_price")
     )
     history = fetch_tencent_daily_bars_sync(code)
+    history_evidence = {
+        "source": history.get("source"),
+        "checked_at": history.get("checked_at"),
+        "freshness": history.get("freshness"),
+        "degraded": history.get("degraded") is True,
+        "provider_errors": list(history.get("provider_errors") or []),
+    }
     if history.get("ok") is not True:
         raw_status = history.get("status")
         status = (
@@ -193,6 +200,7 @@ def _screen_candidate_technical_plan(
                 "status": status,
                 "actionable": False,
                 "reason": history.get("reason"),
+                "history_evidence": history_evidence,
             },
         }
 
@@ -229,6 +237,7 @@ def _screen_candidate_technical_plan(
     def guard_plan(value: Dict[str, Any]) -> Dict[str, Any]:
         guarded = dict(value)
         guarded["history_status"] = history.get("status")
+        guarded["history_evidence"] = history_evidence
         guarded["quote_merge_action"] = merged.get("merge_action")
         guarded = apply_net_reward_risk_gate(guarded, quantity=100)
         trend_context = (

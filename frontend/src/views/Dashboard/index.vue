@@ -68,8 +68,8 @@
           <strong>{{ candidateRun.actionability_counts?.ready_now || 0 }}</strong>
         </div>
         <div class="candidate-state waiting">
-          <span>条件提醒</span>
-          <strong>{{ candidateRun.actionability_counts?.condition_order || 0 }}</strong>
+          <span>观察触发</span>
+          <strong>{{ candidateRun.actionability_counts?.watch_trigger || 0 }}</strong>
         </div>
         <div class="candidate-state blocked">
           <span>风险阻断</span>

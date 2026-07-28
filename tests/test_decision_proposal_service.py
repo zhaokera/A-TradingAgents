@@ -412,7 +412,7 @@ async def test_workspace_promotes_only_validated_codex_proposal():
     _db, proposals, _validator, confirmations = _services()
     submitted = await proposals.submit("owner-1", _proposal(), now=NOW)
 
-    workspace = await confirmations.workspace("owner-1", refresh=False)
+    workspace = await confirmations.workspace("owner-1", refresh=False, now=NOW)
 
     assert workspace["authority_mode"] == "codex_validated"
     assert workspace["authority"] == "codex_validated"
@@ -431,7 +431,7 @@ async def test_shadow_mode_never_marks_codex_as_final():
     )
     await proposals.submit("owner-1", _proposal(), now=NOW)
 
-    workspace = await confirmations.workspace("owner-1", refresh=False)
+    workspace = await confirmations.workspace("owner-1", refresh=False, now=NOW)
 
     assert workspace["authority"] == "software_baseline"
     assert workspace["is_final_decision"] is False
@@ -454,3 +454,84 @@ async def test_workspace_rebuilds_research_when_latest_baseline_has_rotated():
     assert workspace["software_baseline"]["decision_id"] == "decision-new"
     assert workspace["research_packet"]["source_baseline_id"] == "decision-new"
     assert research.today_calls == 1
+
+
+class ChangedBaselineService:
+    async def today(self, user_id, *, refresh=True, now=None):
+        return {
+            "decision_id": "decision-2",
+            "authority": "software_baseline",
+            "is_final_decision": False,
+            "summary": {},
+        }
+
+
+@pytest.mark.asyncio
+async def test_workspace_preserves_validated_proposal_when_baseline_rotates():
+    db = FakeDatabase()
+    research = FakeResearchService(_packet())
+    validator = DecisionValidationService(
+        db=db,
+        research_service=research,
+        validation_ttl_seconds=60,
+    )
+    proposals = DecisionProposalService(
+        db=db,
+        research_service=research,
+        validator=validator,
+    )
+    submitted = await proposals.submit("owner-1", _proposal(), now=NOW)
+    confirmations = DecisionConfirmationService(
+        db=db,
+        proposal_service=proposals,
+        validation_service=validator,
+        research_service=research,
+        baseline_service=ChangedBaselineService(),
+        authority_mode="codex_validated",
+    )
+
+    workspace = await confirmations.workspace(
+        "owner-1",
+        refresh=False,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert workspace["codex_proposal"]["proposal_id"] == (
+        submitted["proposal"]["proposal_id"]
+    )
+    assert workspace["validation"]["validation_id"] == (
+        submitted["validation"]["validation_id"]
+    )
+    assert workspace["research_packet"]["research_packet_id"] == "research-1"
+    assert workspace["workflow_status"] == "proposal_revalidation_required"
+    assert workspace["revalidation_required"] is True
+    assert set(workspace["revalidation_reasons"]) == {
+        "software_baseline_changed",
+        "validation_expired",
+    }
+    assert workspace["authority"] == "software_baseline"
+    assert workspace["primary_decision"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_keeps_proposal_and_reports_missing_bound_research():
+    db, proposals, _validator, confirmations = _services()
+    submitted = await proposals.submit("owner-1", _proposal(), now=NOW)
+
+    async def missing_research(_user_id, _research_packet_id):
+        return None
+
+    confirmations.research_service.get = missing_research
+    workspace = await confirmations.workspace(
+        "owner-1",
+        refresh=False,
+        now=NOW,
+    )
+
+    assert workspace["codex_proposal"]["proposal_id"] == (
+        submitted["proposal"]["proposal_id"]
+    )
+    assert workspace["research_packet"] == {}
+    assert workspace["revalidation_required"] is True
+    assert "proposal_research_packet_missing" in workspace["revalidation_reasons"]
+    assert workspace["authority"] == "software_baseline"

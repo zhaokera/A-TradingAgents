@@ -4399,6 +4399,12 @@ _PUBLIC_CANDIDATE_DISCOVERY_SCALAR_FIELDS = (
     "status",
     "source",
     "benchmark_trade_date",
+    "checked_at",
+    "freshness",
+    "degraded",
+    "cache_age_seconds",
+    "attempt_count",
+    "provider_health",
     "provider_expected_count",
     "raw_row_count",
     "unique_row_count",
@@ -4651,6 +4657,19 @@ def _sanitize_public_candidate_discovery(value: Any) -> Dict[str, Any]:
             if isinstance(raw_permission_exclusions, list)
             else []
         )
+    raw_provider_errors = value.get("provider_errors")
+    sanitized["provider_errors"] = (
+        [
+            _copy_public_scalar_fields(
+                item,
+                ("provider", "status", "error_type", "checked_at"),
+            )
+            for item in raw_provider_errors
+            if isinstance(item, Mapping)
+        ]
+        if isinstance(raw_provider_errors, list)
+        else []
+    )
     sanitized["earnings_screen_status_counts"] = _sanitize_public_count_mapping(
         value.get("earnings_screen_status_counts"),
         set(PUBLIC_EARNINGS_SCREEN_STATUS_KEYS),
@@ -4732,10 +4751,31 @@ def _sanitize_public_candidate_discovery(value: Any) -> Dict[str, Any]:
     if isinstance(raw_stage_sources, Mapping):
         for stage in ("public_snapshot", "tencent_verification"):
             if stage in raw_stage_sources:
+                raw_stage = raw_stage_sources.get(stage)
                 stage_sources[stage] = _copy_public_scalar_fields(
-                    raw_stage_sources.get(stage),
-                    ("provider", "status"),
+                    raw_stage,
+                    (
+                        "provider",
+                        "status",
+                        "checked_at",
+                        "freshness",
+                        "degraded",
+                    ),
                 )
+                raw_stage_errors = (
+                    raw_stage.get("provider_errors")
+                    if isinstance(raw_stage, Mapping)
+                    else None
+                )
+                if isinstance(raw_stage_errors, list):
+                    stage_sources[stage]["provider_errors"] = [
+                        _copy_public_scalar_fields(
+                            item,
+                            ("provider", "status", "error_type", "checked_at"),
+                        )
+                        for item in raw_stage_errors
+                        if isinstance(item, Mapping)
+                    ]
     sanitized["stage_sources"] = stage_sources
     return sanitized
 
@@ -5387,10 +5427,45 @@ def _valid_public_candidate_discovery_metadata(
         if isinstance(stage_sources, Mapping)
         else None
     )
+    public_provider = (
+        public_stage.get("provider")
+        if isinstance(public_stage, Mapping)
+        else None
+    )
+    degraded = value.get("degraded") is True
+    provider_errors = value.get("provider_errors")
+    provider_errors_valid = bool(
+        isinstance(provider_errors, list)
+        and all(
+            isinstance(item, Mapping)
+            and isinstance(item.get("provider"), str)
+            and isinstance(item.get("status"), str)
+            and isinstance(item.get("error_type"), str)
+            for item in provider_errors
+        )
+    )
     return bool(
         isinstance(public_stage, Mapping)
-        and public_stage.get("provider") == "akshare.sina.stock_zh_a_spot"
+        and public_provider
+        in {
+            "akshare.sina.stock_zh_a_spot",
+            "mongo.candidate_market_snapshots",
+            "mongo.market_quotes",
+        }
         and public_stage.get("status") == "ok"
+        and (
+            not degraded
+            or (
+                public_provider
+                in {
+                    "mongo.candidate_market_snapshots",
+                    "mongo.market_quotes",
+                }
+                and value.get("freshness") == "cached_fresh"
+                and provider_errors_valid
+                and bool(provider_errors)
+            )
+        )
         and isinstance(tencent_stage, Mapping)
         and tencent_stage.get("provider") == "tencent_batch_quotes"
         and isinstance(tencent_stage.get("status"), str)
