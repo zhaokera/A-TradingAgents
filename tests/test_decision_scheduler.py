@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from app.core.config import Settings
@@ -24,6 +27,20 @@ class FakeDB(dict):
 
 def _index(collection, name):
     return next(kwargs for _keys, kwargs in collection.indexes if kwargs.get("name") == name)
+
+
+def test_app_lifespan_registers_decision_scheduler():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    awaited_calls = {
+        node.value.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+    }
+
+    assert "register_decision_scheduler_jobs" in awaited_calls
 
 
 def test_decision_runtime_flags_are_independent_and_bounded(monkeypatch):

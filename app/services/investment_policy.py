@@ -355,7 +355,9 @@ def build_dynamic_portfolio_policy(
     return {
         **INVESTMENT_OBJECTIVE["portfolio"],
         "policy_source": "dynamic_account_risk",
-        "market_regime": normalized_regime if normalized_regime in exposure_caps else "unknown",
+        "market_regime": (
+            normalized_regime if normalized_regime in exposure_caps else "unknown"
+        ),
         "total_assets": round(assets, 2),
         "current_exposure_pct": round(exposure, 2),
         "new_exposure_cap_pct": new_exposure_cap,
@@ -373,7 +375,7 @@ def calculate_candidate_position_sizing(
     total_assets: Any,
     available_cash: Any,
     current_symbol_value: Any = 0,
-    policy: Optional[Dict[str, Any]] = None,
+    policy: Optional[Mapping[str, Any]] = None,
     lot_size: int = 100,
 ) -> Dict[str, Any]:
     """Size an A-share candidate from account, concentration and loss limits."""
@@ -386,8 +388,9 @@ def calculate_candidate_position_sizing(
         existing_value = max(0.0, float(current_symbol_value or 0))
     except (TypeError, ValueError):
         return {"status": "unavailable", "reason": "invalid_account_or_price_data"}
+    values = (entry, stop, assets, cash, existing_value)
     if (
-        not all(math.isfinite(value) for value in (entry, stop, assets, cash, existing_value))
+        not all(math.isfinite(value) for value in values)
         or entry <= 0
         or stop <= 0
         or stop >= entry
@@ -396,7 +399,9 @@ def calculate_candidate_position_sizing(
     ):
         return {"status": "unavailable", "reason": "invalid_account_or_price_data"}
 
-    effective_policy = policy or build_dynamic_portfolio_policy(total_assets=assets)
+    effective_policy = dict(
+        policy or build_dynamic_portfolio_policy(total_assets=assets)
+    )
     stop_distance_pct = (entry - stop) / entry * 100
     loss_budget_pct = float(
         effective_policy.get("per_position_loss_budget_pct", 1.0)
