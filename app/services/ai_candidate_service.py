@@ -837,6 +837,22 @@ def normalize_ai_candidate_run(
         status: sum(item.get("actionability") == status for item in candidates)
         for status in _ACTIONABILITY_LABELS
     }
+    provider_errors = discovery.get("provider_errors")
+    provider_errors = (
+        [
+            deepcopy(dict(item))
+            for item in provider_errors
+            if isinstance(item, Mapping)
+        ]
+        if isinstance(provider_errors, list)
+        else []
+    )
+    stage_sources = discovery.get("stage_sources")
+    stage_sources = (
+        deepcopy(dict(stage_sources))
+        if isinstance(stage_sources, Mapping)
+        else {}
+    )
     return {
         "status": "completed",
         "source": "public_full_market",
@@ -857,7 +873,21 @@ def normalize_ai_candidate_run(
             "portfolio": deepcopy(INVESTMENT_OBJECTIVE["portfolio"]),
         },
         "discovery": {
+            "status": discovery.get("status"),
+            "source": discovery.get("source"),
+            "trade_date": (
+                discovery.get("provider_trade_date")
+                or discovery.get("benchmark_trade_date")
+            ),
             "benchmark_trade_date": discovery.get("benchmark_trade_date"),
+            "checked_at": discovery.get("checked_at"),
+            "freshness": discovery.get("freshness"),
+            "degraded": discovery.get("degraded") is True,
+            "cache_age_seconds": discovery.get("cache_age_seconds"),
+            "attempt_count": discovery.get("attempt_count"),
+            "provider_health": discovery.get("provider_health"),
+            "provider_errors": provider_errors,
+            "stage_sources": stage_sources,
             "universe_count": discovery.get("universe_count"),
             "eligible_count": discovery.get("eligible_count"),
             "selected_count": discovery.get("selected_count"),
