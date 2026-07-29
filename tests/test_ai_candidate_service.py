@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from bson import ObjectId
@@ -38,7 +39,7 @@ def _offline_research_dependencies():
 
 
 def _live_market_status(*, level: str = "green") -> dict:
-    local_date = datetime.now(timezone.utc).date().isoformat()
+    local_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
     return {
         "ok": True,
         "data": {
@@ -1121,6 +1122,9 @@ def test_favorite_format_defaults_old_records_to_manual_source():
 
     assert formatted["source"] == "manual"
     assert formatted["ai_metadata"] is None
+    assert formatted["quote_provider_updated_at"] is None
+    assert formatted["quote_time_semantics"] is None
+    assert formatted["exchange_trade_time_verified"] is False
 
 
 @pytest.mark.asyncio
@@ -1143,6 +1147,9 @@ async def test_favorite_tracking_update_preserves_user_fields():
             "reference_price": 10.2,
             "actionability": "ready_now",
             "actionability_label": "价格条件已满足",
+            "provider_updated_at": "2026-07-20T10:00:00+08:00",
+            "quote_time_semantics": "provider_snapshot_updated_at",
+            "exchange_trade_time_verified": False,
             "price_plan": {"entry_price": 10.0, "stop_price": 9.2},
         },
     )
@@ -1152,6 +1159,16 @@ async def test_favorite_tracking_update_preserves_user_fields():
     assert "favorites.$.notes" not in update
     assert "favorites.$.tags" not in update
     assert update["favorites.$.ai_metadata"]["actionability"] == "ready_now"
+    assert update["favorites.$.ai_metadata"]["quote_provider_updated_at"] == (
+        "2026-07-20T10:00:00+08:00"
+    )
+    assert update["favorites.$.ai_metadata"]["quote_time_semantics"] == (
+        "provider_snapshot_updated_at"
+    )
+    assert (
+        update["favorites.$.ai_metadata"]["exchange_trade_time_verified"]
+        is False
+    )
 
 
 def test_serialize_run_marks_mongo_naive_datetime_as_utc():

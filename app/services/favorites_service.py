@@ -67,6 +67,9 @@ class FavoritesService:
             "volume": None,
             "quote_source": None,
             "quote_trade_at": None,
+            "quote_provider_updated_at": None,
+            "quote_time_semantics": None,
+            "exchange_trade_time_verified": False,
             "quote_checked_at": None,
         }
 
@@ -153,6 +156,16 @@ class FavoritesService:
                         it["volume"] = q.get("volume")
                         it["quote_source"] = q.get("source") or q.get("data_source") or "fallback"
                         it["quote_trade_at"] = q.get("trade_at")
+                        it["quote_provider_updated_at"] = (
+                            q.get("provider_updated_at") or q.get("trade_at")
+                        )
+                        it["quote_time_semantics"] = (
+                            q.get("quote_time_semantics")
+                            or "legacy_provider_time_unverified"
+                        )
+                        it["exchange_trade_time_verified"] = (
+                            q.get("exchange_trade_time_verified") is True
+                        )
                         it["quote_checked_at"] = checked_at
             except Exception:
                 # 查询失败时保持占位 None，避免影响基础功能
@@ -397,6 +410,17 @@ class FavoritesService:
                 "rank_score": candidate.get("rank_score"),
                 "quote_source": candidate.get("quote_source"),
                 "quote_trade_at": candidate.get("trade_at"),
+                "quote_provider_updated_at": (
+                    candidate.get("provider_updated_at")
+                    or candidate.get("trade_at")
+                ),
+                "quote_time_semantics": (
+                    candidate.get("quote_time_semantics")
+                    or "legacy_provider_time_unverified"
+                ),
+                "exchange_trade_time_verified": (
+                    candidate.get("exchange_trade_time_verified") is True
+                ),
                 "price_alert_only": True,
                 "condition_order_created": False,
                 "execution_actionable": False,
@@ -601,6 +625,16 @@ class FavoritesService:
             "last_checked_at": candidate.get("quote_checked_at"),
             "quote_source": candidate.get("quote_source"),
             "quote_trade_at": candidate.get("trade_at"),
+            "quote_provider_updated_at": (
+                candidate.get("provider_updated_at") or candidate.get("trade_at")
+            ),
+            "quote_time_semantics": (
+                candidate.get("quote_time_semantics")
+                or "legacy_provider_time_unverified"
+            ),
+            "exchange_trade_time_verified": (
+                candidate.get("exchange_trade_time_verified") is True
+            ),
             "is_reference_only": True,
             "lifecycle_state": lifecycle_state,
             "is_current": lifecycle_state == "current",

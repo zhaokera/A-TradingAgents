@@ -26,6 +26,9 @@ def _candidate(
         "reference_price": 10.2,
         "quote_source": "tencent",
         "trade_at": "2026-07-29T14:00:00+08:00",
+        "provider_updated_at": "2026-07-29T14:00:00+08:00",
+        "quote_time_semantics": "provider_snapshot_updated_at",
+        "exchange_trade_time_verified": False,
         "price_plan": {
             "entry_strategy": "pullback",
             "entry_price": 10.0,
@@ -120,6 +123,13 @@ async def test_auto_ai_sync_promotes_only_trackable_candidates_and_preserves_use
     assert promoted["ai_metadata"]["condition_order_created"] is False
     assert promoted["ai_metadata"]["profile_evidence"]["status"] == "missing"
     assert promoted["ai_metadata"]["profile_evidence"]["complete"] is False
+    assert promoted["ai_metadata"]["quote_provider_updated_at"] == (
+        "2026-07-29T14:00:00+08:00"
+    )
+    assert promoted["ai_metadata"]["quote_time_semantics"] == (
+        "provider_snapshot_updated_at"
+    )
+    assert promoted["ai_metadata"]["exchange_trade_time_verified"] is False
     assert "688001" not in by_code
     assert "600002" not in by_code
 
