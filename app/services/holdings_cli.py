@@ -1944,6 +1944,11 @@ def _quote_snapshot(quote: Dict[str, Any], definition: Dict[str, Any]) -> Dict[s
     snapshot = {
         "source": quote.get("source") or quote.get("data_source"),
         "provider_timestamp": quote.get("provider_timestamp"),
+        "provider_updated_at": quote.get("provider_updated_at"),
+        "quote_time_semantics": quote.get("quote_time_semantics"),
+        "exchange_trade_time_verified": (
+            quote.get("exchange_trade_time_verified") is True
+        ),
         "trade_at": quote.get("trade_at"),
         "trade_date": quote.get("trade_date"),
         "received_at": quote.get("received_at") or quote.get("updated_at"),
@@ -2217,7 +2222,7 @@ def _build_opportunity_candidates(
                 _risk_flag(
                     "quote_not_actionable",
                     "warning",
-                    "腾讯提供方成交时间不满足时效门禁，不能生成仓位数量。",
+                    "腾讯提供方快照更新时间不满足时效门禁，不能生成仓位数量。",
                     quote_status=snapshot.get("freshness", {}).get("status"),
                 )
             )

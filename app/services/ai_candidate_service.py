@@ -312,7 +312,7 @@ def _normalize_risk_flags(value: Any) -> List[Dict[str, str]]:
         message = str(raw.get("message") or raw.get("reason") or code).strip()
         if code == "quote_not_actionable":
             message = (
-                "腾讯成交时间未通过当前时效门禁；可保留条件价和组合预算，"
+                "腾讯提供方快照更新时间未通过当前时效门禁；可保留条件价和组合预算，"
                 "但触发时必须刷新行情后再判定是否可执行。"
             )
         flags.append(
@@ -746,6 +746,11 @@ def normalize_ai_candidate(
         "initial_reference_price": reference_price,
         "pct_change": _finite_number(quote.get("pct_change"), tencent.get("pct_change")),
         "trade_at": quote.get("trade_at"),
+        "provider_updated_at": quote.get("provider_updated_at"),
+        "quote_time_semantics": quote.get("quote_time_semantics"),
+        "exchange_trade_time_verified": (
+            quote.get("exchange_trade_time_verified") is True
+        ),
         "quote": {
             "price": reference_price,
             "source": str(
@@ -756,6 +761,11 @@ def normalize_ai_candidate(
                 or "unknown"
             ).strip().lower(),
             "trade_at": quote.get("trade_at"),
+            "provider_updated_at": quote.get("provider_updated_at"),
+            "quote_time_semantics": quote.get("quote_time_semantics"),
+            "exchange_trade_time_verified": (
+                quote.get("exchange_trade_time_verified") is True
+            ),
             "quote_checked_at": quote.get("quote_checked_at"),
             "volume": _finite_number(quote.get("volume")),
             "amount": _finite_number(quote.get("amount")),
@@ -1371,6 +1381,44 @@ class AICandidateService:
                 "source": None,
                 "evidence": [],
             }
+            data_quality = (
+                stock_profile.get("data_quality")
+                if isinstance(stock_profile.get("data_quality"), Mapping)
+                else {}
+            )
+            missing_fields = list(data_quality.get("missing_fields") or [])
+            if not missing_fields:
+                missing_fields = [
+                    field
+                    for field in ("industry", "main_business")
+                    if not stock_profile.get(field)
+                ]
+            profile_status = str(stock_profile.get("status") or "missing")
+            profile_complete = bool(
+                data_quality.get("complete") is True
+                or (
+                    profile_status == "complete"
+                    and not missing_fields
+                )
+            )
+            profile_warning = {
+                "status": profile_status,
+                "confidence": str(
+                    stock_profile.get("confidence") or "missing"
+                ),
+                "complete": profile_complete,
+                "missing_fields": missing_fields,
+                "warning_code": (
+                    None
+                    if profile_complete
+                    else "stock_profile_evidence_incomplete"
+                ),
+                "message": (
+                    "主营与行业证据完整。"
+                    if profile_complete
+                    else "主营或行业证据不完整，当前候选仅作价格提醒，不提升为可执行结论。"
+                ),
+            }
             profile = classify_investment_objective(
                 code,
                 candidate.get("name"),
@@ -1378,6 +1426,26 @@ class AICandidateService:
             )
             candidate.update(profile)
             candidate["stock_profile"] = stock_profile
+            candidate["profile_evidence"] = profile_warning
+            if not profile_complete:
+                risk_flags = (
+                    candidate.get("risk_flags")
+                    if isinstance(candidate.get("risk_flags"), list)
+                    else []
+                )
+                if not any(
+                    isinstance(flag, Mapping)
+                    and flag.get("code") == "stock_profile_evidence_incomplete"
+                    for flag in risk_flags
+                ):
+                    risk_flags.append(
+                        {
+                            "code": "stock_profile_evidence_incomplete",
+                            "severity": "warning",
+                            "message": profile_warning["message"],
+                        }
+                    )
+                candidate["risk_flags"] = risk_flags
             if stock_profile.get("industry"):
                 candidate["industry"] = stock_profile["industry"]
             candidate["rank_score"] = _candidate_rank_score(candidate)
@@ -1715,6 +1783,11 @@ class AICandidateService:
                 "price": current_price,
                 "source": quote_source,
                 "trade_at": quote.get("trade_at"),
+                "provider_updated_at": quote.get("provider_updated_at"),
+                "quote_time_semantics": quote.get("quote_time_semantics"),
+                "exchange_trade_time_verified": (
+                    quote.get("exchange_trade_time_verified") is True
+                ),
                 "quote_checked_at": checked_at,
                 "volume": _finite_number(quote.get("volume")),
                 "amount": _finite_number(quote.get("amount")),
@@ -1742,6 +1815,15 @@ class AICandidateService:
                 candidate["reference_price"] = current_price
                 candidate["pct_change"] = _finite_number(quote.get("pct_chg"))
                 candidate["trade_at"] = quote.get("trade_at")
+                candidate["provider_updated_at"] = quote.get(
+                    "provider_updated_at"
+                )
+                candidate["quote_time_semantics"] = quote.get(
+                    "quote_time_semantics"
+                )
+                candidate["exchange_trade_time_verified"] = (
+                    quote.get("exchange_trade_time_verified") is True
+                )
                 candidate["quote_source"] = quote_source
                 candidate["quote_checked_at"] = checked_at
             refreshed = _enrich_saved_candidate(candidate)

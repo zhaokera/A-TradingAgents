@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional
 
+from apscheduler.triggers.combining import OrTrigger
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.core.database import get_mongo_db
@@ -24,6 +26,25 @@ REQUIRED_TRACKING_INDEXES = {
     "decision_outcomes": {"uq_decision_outcome_sequence"},
     "decision_minute_bars": {"uq_decision_minute_bar"},
 }
+TRACKING_MISFIRE_GRACE_SECONDS = 30
+
+
+def _live_tracking_trigger(timezone_name: str) -> OrTrigger:
+    """Run every 15 seconds only during A-share continuous trading windows."""
+
+    common = {
+        "day_of_week": "mon-fri",
+        "second": "*/15",
+        "timezone": timezone_name,
+    }
+    return OrTrigger(
+        [
+            CronTrigger(hour=9, minute="30-59", **common),
+            CronTrigger(hour=10, minute="*", **common),
+            CronTrigger(hour=11, minute="0-29", **common),
+            CronTrigger(hour="13-14", minute="*", **common),
+        ]
+    )
 
 
 class DecisionSchedulerRuntime:
@@ -181,11 +202,12 @@ async def register_decision_scheduler_jobs(
         if readiness.get("ready") is True:
             scheduler.add_job(
                 runtime.tracking_poller.poll_once,
-                IntervalTrigger(seconds=15, timezone=config.TIMEZONE),
+                _live_tracking_trigger(config.TIMEZONE),
                 id="decision_tracking_poller",
                 name="决策影子交易腾讯行情跟踪",
                 max_instances=1,
                 coalesce=True,
+                misfire_grace_time=TRACKING_MISFIRE_GRACE_SECONDS,
             )
             added.append("decision_tracking_poller")
         else:

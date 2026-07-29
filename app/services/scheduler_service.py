@@ -64,6 +64,16 @@ class SchedulerService:
             self.db = get_mongo_db()
         return self.db
 
+    @staticmethod
+    def _should_skip_execution_audit(job_id: str, return_value: Any) -> bool:
+        """Avoid persisting expected off-session no-op tracking executions."""
+
+        return (
+            job_id == "decision_tracking_poller"
+            and isinstance(return_value, dict)
+            and return_value.get("status") == "disabled_market_phase"
+        )
+
     async def schedule_daily_catchup_if_missed(
         self,
         job_id: str,
@@ -827,6 +837,12 @@ class SchedulerService:
 
     def _on_job_executed(self, event: JobExecutionEvent):
         """任务执行成功回调"""
+        if self._should_skip_execution_audit(event.job_id, event.retval):
+            logger.debug(
+                "Skip expected off-session tracking audit: phase=%s",
+                event.retval.get("phase"),
+            )
+            return
         # 计算执行时间（处理时区问题）
         execution_time = None
         if event.scheduled_run_time:

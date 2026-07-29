@@ -3,6 +3,7 @@
 """
 
 import math
+from copy import deepcopy
 from typing import List, Optional, Dict, Any, Mapping
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
@@ -386,6 +387,11 @@ class FavoritesService:
                 "objective_tier": candidate.get("objective_tier"),
                 "objective_tier_label": candidate.get("objective_tier_label"),
                 "objective_segment": candidate.get("objective_segment"),
+                "profile_evidence": deepcopy(
+                    candidate.get("profile_evidence")
+                    if isinstance(candidate.get("profile_evidence"), Mapping)
+                    else {}
+                ),
                 "actionability": candidate.get("actionability"),
                 "actionability_label": candidate.get("actionability_label"),
                 "rank_score": candidate.get("rank_score"),
@@ -580,6 +586,11 @@ class FavoritesService:
             "objective_tier": candidate.get("objective_tier"),
             "objective_tier_label": candidate.get("objective_tier_label"),
             "objective_segment": candidate.get("objective_segment"),
+            "profile_evidence": deepcopy(
+                candidate.get("profile_evidence")
+                if isinstance(candidate.get("profile_evidence"), Mapping)
+                else {}
+            ),
             "source": candidate.get("source"),
             "tracking_enabled": True,
             "actionability": candidate.get("actionability"),
