@@ -1278,6 +1278,63 @@ def test_fetch_tencent_daily_bars_retries_then_uses_fresh_audited_cache(monkeypa
     ]
 
 
+def test_fetch_tencent_daily_bars_can_prefer_fresh_audited_cache(monkeypatch):
+    now = datetime(2026, 7, 29, 6, 0, tzinfo=timezone.utc)
+    bars = [
+        {
+            "date": (datetime(2026, 5, 30) + timedelta(days=index)).date().isoformat(),
+            "open": 10.0,
+            "close": 10.1,
+            "high": 10.2,
+            "low": 9.9,
+        }
+        for index in range(60)
+    ]
+
+    class Collection:
+        def find_one(self, query):
+            assert query == {"_id": "000977:qfq"}
+            return {
+                "_id": "000977:qfq",
+                "source": "tencent",
+                "checked_at": now - timedelta(minutes=15),
+                "bars": bars,
+            }
+
+    class Database:
+        def __getitem__(self, name):
+            assert name == quote_service.TENCENT_HISTORY_CACHE_COLLECTION
+            return Collection()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        SimpleNamespace(
+            stock_zh_a_hist_tx=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("fresh preferred cache must avoid the network")
+            )
+        ),
+    )
+
+    result = fetch_tencent_daily_bars_sync(
+        "000977",
+        start_date="20260501",
+        end_date="20260729",
+        min_rows=60,
+        now=now,
+        db_factory=Database,
+        prefer_cache=True,
+    )
+
+    assert result["ok"] is True
+    assert result["source"] == "mongo.candidate_technical_history_cache"
+    assert result["freshness"] == "cached_fresh"
+    assert result["degraded"] is True
+    assert result["cache_usage"] == "preferred"
+    assert result["cache_age_seconds"] == 900.0
+    assert result["provider_errors"] == []
+
+
 def test_fetch_tencent_daily_bars_rejects_stale_cache(monkeypatch):
     now = datetime(2026, 7, 28, 2, 0, tzinfo=timezone.utc)
     bars = [

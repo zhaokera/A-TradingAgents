@@ -1,5 +1,6 @@
 import inspect
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
@@ -84,6 +85,16 @@ def test_scheduler_adds_quotes_job(monkeypatch):
     monkeypatch.setattr(main_mod, "AsyncIOScheduler", lambda *args, **kwargs: fake_scheduler, raising=True)
     monkeypatch.setattr(main_mod, "QuotesIngestionService", _FakeQuotesIngestion, raising=True)
     monkeypatch.setattr(main_mod.asyncio, "create_task", _fake_asyncio_create_task, raising=True)
+    monkeypatch.setattr(
+        main_mod,
+        "get_scheduler_service",
+        lambda: SimpleNamespace(
+            schedule_daily_catchup_if_missed=AsyncMock(
+                return_value={"scheduled": False, "reason": "test"}
+            )
+        ),
+        raising=True,
+    )
 
     # Directly drive the lifespan to avoid importing full router stack
     import asyncio as _asyncio

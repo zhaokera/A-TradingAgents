@@ -41,7 +41,10 @@ from app.routers import websocket_notifications as websocket_notifications_route
 from app.routers import scheduler as scheduler_router
 from app.services.basics_sync_service import get_basics_sync_service
 from app.services.multi_source_basics_sync_service import get_multi_source_sync_service
-from app.services.scheduler_service import set_scheduler_instance
+from app.services.scheduler_service import (
+    get_scheduler_service,
+    set_scheduler_instance,
+)
 from app.services.decision_scheduler_service import (
     DecisionSchedulerRuntime,
     register_decision_scheduler_jobs,
@@ -612,10 +615,16 @@ async def lifespan(app: FastAPI):
         else:
             logger.info(f"📰 新闻数据同步已配置（仅自选股）: {settings.NEWS_SYNC_CRON}")
 
-        scheduler.start()
-
-        # 设置调度器实例到服务中，以便API可以管理任务
+        # Register audit listeners before the scheduler can emit any job event.
         set_scheduler_instance(scheduler)
+        scheduler_service = get_scheduler_service()
+        candidate_catchup = await scheduler_service.schedule_daily_catchup_if_missed(
+            "ai_candidate_daily_research",
+            hour=9,
+            minute=40,
+        )
+        logger.info("AI candidate startup catch-up: %s", candidate_catchup)
+        scheduler.start()
         logger.info("✅ 调度器服务已初始化")
     except Exception as e:
         logger.error(f"❌ 调度器启动失败: {e}", exc_info=True)

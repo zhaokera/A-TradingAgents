@@ -2,8 +2,9 @@
 自选股服务
 """
 
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+import math
+from typing import List, Optional, Dict, Any, Mapping
+from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 
 from app.core.database import get_mongo_db
@@ -256,6 +257,200 @@ class FavoritesService:
             str(item.get("stock_code") or "").strip()
             for item in (doc or {}).get("favorites", [])
             if str(item.get("stock_code") or "").strip()
+        }
+
+    async def sync_auto_ai_candidates(
+        self,
+        user_id: str,
+        *,
+        candidates: List[Dict[str, Any]],
+        run_id: str,
+        generated_at: datetime,
+        max_auto_candidates: int = 5,
+    ) -> Dict[str, Any]:
+        """Replace only system-owned AI favorites with eligible current picks."""
+
+        def finite_price(value: Any) -> Optional[float]:
+            if isinstance(value, bool):
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return round(number, 4) if math.isfinite(number) and number > 0 else None
+
+        def eligible(candidate: Mapping[str, Any]) -> bool:
+            code = str(candidate.get("code") or "").strip()
+            if (
+                len(code) != 6
+                or not code.isdigit()
+                or code.startswith(("688", "689"))
+                or candidate.get("can_add_to_favorites") is not True
+                or str(candidate.get("actionability") or "")
+                not in {"ready_now", "watch_trigger"}
+                or candidate.get("account_trackable") is False
+            ):
+                return False
+            gate = candidate.get("portfolio_gate")
+            if isinstance(gate, Mapping) and (
+                gate.get("blocked") is True
+                or gate.get("account_trackable") is False
+            ):
+                return False
+            plan = candidate.get("price_plan")
+            if not isinstance(plan, Mapping):
+                return False
+            entry = finite_price(plan.get("entry_price"))
+            stop = finite_price(plan.get("stop_price"))
+            target = finite_price(plan.get("target_price"))
+            return (
+                entry is not None
+                and stop is not None
+                and target is not None
+                and stop < entry < target
+            )
+
+        limit = max(0, min(int(max_auto_candidates), 20))
+        ranked = [
+            dict(candidate)
+            for candidate in candidates
+            if isinstance(candidate, Mapping) and eligible(candidate)
+        ]
+        ranked.sort(
+            key=lambda candidate: (
+                -float(candidate.get("rank_score") or 0),
+                str(candidate.get("code") or ""),
+            )
+        )
+        selected = ranked[:limit]
+        selected_codes = [str(candidate["code"]) for candidate in selected]
+        selected_by_code = {
+            str(candidate["code"]): candidate for candidate in selected
+        }
+
+        timestamp = generated_at
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        timestamp = timestamp.astimezone(timezone.utc)
+        timestamp_text = timestamp.isoformat()
+        expires_at = timestamp + timedelta(days=3)
+
+        db = await self._get_db()
+        collection = db.user_favorites
+        document = await collection.find_one({"user_id": str(user_id)})
+        existing = list((document or {}).get("favorites") or [])
+        retained: List[Dict[str, Any]] = []
+        auto_by_code: Dict[str, Dict[str, Any]] = {}
+        user_codes: List[str] = []
+        removed_codes: List[str] = []
+        for raw_favorite in existing:
+            favorite = dict(raw_favorite)
+            code = str(favorite.get("stock_code") or "")
+            metadata = favorite.get("ai_metadata")
+            is_auto = (
+                favorite.get("source") == "ai_screening"
+                and isinstance(metadata, Mapping)
+                and metadata.get("auto_promoted") is True
+            )
+            if is_auto:
+                if code in selected_by_code:
+                    auto_by_code[code] = favorite
+                    retained.append(favorite)
+                else:
+                    removed_codes.append(code)
+                continue
+            retained.append(favorite)
+            if code:
+                user_codes.append(code)
+
+        added_codes: List[str] = []
+        updated_codes: List[str] = []
+        for code in selected_codes:
+            candidate = selected_by_code[code]
+            if code in user_codes:
+                continue
+            price_plan = dict(candidate.get("price_plan") or {})
+            metadata = {
+                "run_id": str(run_id),
+                "generated_at": timestamp_text,
+                "expires_at": expires_at.isoformat(),
+                "auto_promoted": True,
+                "tracking_enabled": True,
+                "lifecycle_state": "current",
+                "is_current": True,
+                "reason_summary": candidate.get("reason_summary"),
+                "reference_price": candidate.get("reference_price"),
+                "price_plan": price_plan,
+                "objective_id": candidate.get("objective_id"),
+                "objective_label": candidate.get("objective_label"),
+                "objective_tier": candidate.get("objective_tier"),
+                "objective_tier_label": candidate.get("objective_tier_label"),
+                "objective_segment": candidate.get("objective_segment"),
+                "actionability": candidate.get("actionability"),
+                "actionability_label": candidate.get("actionability_label"),
+                "rank_score": candidate.get("rank_score"),
+                "quote_source": candidate.get("quote_source"),
+                "quote_trade_at": candidate.get("trade_at"),
+                "price_alert_only": True,
+                "condition_order_created": False,
+                "execution_actionable": False,
+                "is_reference_only": True,
+            }
+            if code in auto_by_code:
+                favorite = auto_by_code[code]
+                old_metadata = favorite.get("ai_metadata")
+                favorite["ai_metadata"] = {
+                    **(dict(old_metadata) if isinstance(old_metadata, Mapping) else {}),
+                    **metadata,
+                }
+                updated_codes.append(code)
+                continue
+
+            entry_price = finite_price(price_plan.get("entry_price"))
+            strategy = str(price_plan.get("entry_strategy") or "")
+            favorite = {
+                "stock_code": code,
+                "stock_name": str(candidate.get("name") or code),
+                "market": str(candidate.get("market") or "A股"),
+                "added_at": timestamp.replace(tzinfo=None),
+                "tags": ["AI候选"],
+                "notes": "",
+                "alert_price_high": (
+                    entry_price if strategy == "breakout" else None
+                ),
+                "alert_price_low": (
+                    entry_price if strategy != "breakout" else None
+                ),
+                "source": "ai_screening",
+                "ai_metadata": metadata,
+            }
+            retained.append(favorite)
+            added_codes.append(code)
+
+        await collection.update_one(
+            {"user_id": str(user_id)},
+            {
+                "$set": {
+                    "favorites": retained,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$setOnInsert": {
+                    "user_id": str(user_id),
+                    "created_at": datetime.utcnow(),
+                },
+            },
+            upsert=True,
+        )
+        return {
+            "run_id": str(run_id),
+            "selected_codes": selected_codes,
+            "added_codes": added_codes,
+            "updated_codes": updated_codes,
+            "removed_codes": removed_codes,
+            "preserved_user_codes": user_codes,
+            "max_auto_candidates": limit,
+            "price_alert_only": True,
+            "condition_orders_created": 0,
         }
 
     async def remove_favorite(self, user_id: str, stock_code: str) -> bool:

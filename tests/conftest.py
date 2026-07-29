@@ -54,6 +54,7 @@ MAINTAINED_ROOT_TESTS = {
     "test_decision_scheduler.py",
     "test_decision_tracking_service.py",
     "test_decision_validation_service.py",
+    "test_favorites_ai_sync.py",
     "test_cli_holdings.py",
     "test_database_service_paths.py",
     "test_holding_ai_advice.py",
@@ -73,6 +74,7 @@ MAINTAINED_ROOT_TESTS = {
     "test_public_candidate_pipeline.py",
     "test_public_candidate_pipeline_contract.py",
     "test_public_candidate_pipeline_integration.py",
+    "test_scheduler_service.py",
     "test_tencent_quote_service.py",
 }
 

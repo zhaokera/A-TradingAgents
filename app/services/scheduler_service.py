@@ -63,6 +63,68 @@ class SchedulerService:
         if self.db is None:
             self.db = get_mongo_db()
         return self.db
+
+    async def schedule_daily_catchup_if_missed(
+        self,
+        job_id: str,
+        *,
+        hour: int,
+        minute: int,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Run a newly registered daily job once when startup missed today's slot."""
+
+        effective_now = now or datetime.now(timezone.utc)
+        if effective_now.tzinfo is None:
+            effective_now = effective_now.replace(tzinfo=timezone.utc)
+        local_now = effective_now.astimezone(UTC_8)
+        scheduled_local = local_now.replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0,
+        )
+        if local_now.weekday() >= 5:
+            return {"scheduled": False, "reason": "not_a_weekday"}
+        if local_now < scheduled_local:
+            return {"scheduled": False, "reason": "daily_schedule_not_due"}
+        if self.scheduler.get_job(job_id) is None:
+            return {"scheduled": False, "reason": "job_not_registered"}
+
+        day_start = local_now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+            tzinfo=None,
+        )
+        day_end = day_start + timedelta(days=1)
+        existing = await self._get_db().scheduler_executions.find_one(
+            {
+                "job_id": job_id,
+                "status": {"$in": ["running", "success", "failed", "missed"]},
+                "timestamp": {"$gte": day_start, "$lt": day_end},
+            },
+            sort=[("timestamp", -1)],
+        )
+        if existing:
+            return {
+                "scheduled": False,
+                "reason": "daily_execution_already_recorded",
+                "status": str(existing.get("status") or "unknown"),
+            }
+
+        self.scheduler.modify_job(job_id, next_run_time=effective_now)
+        await self._record_job_action(
+            job_id,
+            "startup_catchup",
+            "success",
+        )
+        return {
+            "scheduled": True,
+            "reason": "missed_daily_run_catchup",
+            "scheduled_for": effective_now.isoformat(),
+        }
     
     async def list_jobs(self) -> List[Dict[str, Any]]:
         """
@@ -1038,7 +1100,9 @@ def set_scheduler_instance(scheduler: AsyncIOScheduler):
     Args:
         scheduler: APScheduler调度器实例
     """
-    global _scheduler_instance
+    global _scheduler_instance, _scheduler_service
+    if _scheduler_instance is not scheduler:
+        _scheduler_service = None
     _scheduler_instance = scheduler
     logger.info("✅ 调度器实例已设置")
 
@@ -1157,4 +1221,3 @@ async def update_job_progress(
 
     except Exception as e:
         logger.error(f"❌ 更新任务进度失败: {e}")
-
