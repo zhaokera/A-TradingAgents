@@ -42,8 +42,11 @@ AI_CANDIDATE_SOURCE = "ai_screening"
 AI_CANDIDATE_TAG = "AI候选"
 AI_CANDIDATE_RUN_TTL_DAYS = 90
 AI_CANDIDATE_JOB_TTL_DAYS = 7
+AI_CANDIDATE_RESEARCH_MAX_ATTEMPTS = 2
+AI_CANDIDATE_RETRY_BACKOFF_SECONDS = 1.0
 _A_SHARE_CODE = re.compile(r"^[0-9]{6}$")
 logger = logging.getLogger(__name__)
+_RETRYABLE_RESEARCH_CODES = {"technical_deep_check_timeout"}
 
 _BLOCKING_RISK_SEVERITIES = {"error", "critical", "blocker", "blocked"}
 _BLOCKING_RISK_CODES = {
@@ -1910,6 +1913,37 @@ class AICandidateService:
         self._update_run_counts(document)
         db = await self._get_db()
         await db["ai_candidate_runs"].insert_one(deepcopy(document))
+        sync_auto_candidates = getattr(
+            self._favorites,
+            "sync_auto_ai_candidates",
+            None,
+        )
+        if callable(sync_auto_candidates):
+            try:
+                auto_favorites = await sync_auto_candidates(
+                    str(user_id),
+                    candidates=document.get("candidates", []),
+                    run_id=str(document["_id"]),
+                    generated_at=now,
+                    max_auto_candidates=5,
+                )
+                document["auto_favorites"] = auto_favorites
+                await db["ai_candidate_runs"].update_one(
+                    {"_id": document["_id"], "user_id": str(user_id)},
+                    {"$set": {"auto_favorites": deepcopy(auto_favorites)}},
+                )
+                favorite_codes = await self._favorites.get_favorite_codes(user_id)
+            except Exception as exc:
+                failure = {
+                    "status": "failed",
+                    "code": "auto_favorites_sync_failed",
+                    "message": str(exc)[:300],
+                }
+                await db["ai_candidate_runs"].update_one(
+                    {"_id": document["_id"], "user_id": str(user_id)},
+                    {"$set": {"auto_favorites": failure}},
+                )
+                raise
         reconcile = getattr(self._favorites, "reconcile_ai_candidate_lifecycle", None)
         if callable(reconcile):
             await reconcile(
@@ -1956,44 +1990,90 @@ class AICandidateService:
                     "status": "running",
                     "started_at": datetime.now(timezone.utc),
                     "progress": {"stage": "full_market_research", "percent": 10},
+                    "attempt_count": 0,
+                    "attempts": [],
                 }
             },
         )
-        try:
-            result = await self.run(user_id, max_candidates=max_candidates)
-            await jobs.update_one(
-                {"_id": job_id, "user_id": str(user_id)},
-                {
-                    "$set": {
-                        "status": "completed",
-                        "completed_at": datetime.now(timezone.utc),
-                        "run_id": result.get("run_id"),
-                        "result": result,
-                        "progress": {"stage": "completed", "percent": 100},
+        attempts: List[Dict[str, Any]] = []
+        for attempt in range(1, AI_CANDIDATE_RESEARCH_MAX_ATTEMPTS + 1):
+            try:
+                result = await self.run(user_id, max_candidates=max_candidates)
+                await jobs.update_one(
+                    {"_id": job_id, "user_id": str(user_id)},
+                    {
+                        "$set": {
+                            "status": "completed",
+                            "completed_at": datetime.now(timezone.utc),
+                            "run_id": result.get("run_id"),
+                            "result": result,
+                            "attempt_count": attempt,
+                            "attempts": attempts,
+                            "progress": {"stage": "completed", "percent": 100},
+                        }
+                    },
+                )
+                return
+            except Exception as exc:
+                logger.exception(
+                    "AI candidate background research attempt failed: attempt=%s",
+                    attempt,
+                )
+                details = getattr(exc, "details", None)
+                stage = getattr(exc, "stage", None)
+                if not stage and isinstance(details, Mapping):
+                    stage = details.get("stage")
+                error_code = str(
+                    getattr(exc, "code", "candidate_research_failed")
+                )
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "code": error_code,
+                        "stage": str(stage) if stage else None,
                     }
-                },
-            )
-        except Exception as exc:
-            logger.exception("AI candidate background research failed")
-            details = getattr(exc, "details", None)
-            stage = getattr(exc, "stage", None)
-            if not stage and isinstance(details, Mapping):
-                stage = details.get("stage")
-            await jobs.update_one(
-                {"_id": job_id, "user_id": str(user_id)},
-                {
-                    "$set": {
-                        "status": "failed",
-                        "completed_at": datetime.now(timezone.utc),
-                        "error": {
-                            "code": getattr(exc, "code", "candidate_research_failed"),
-                            "message": str(getattr(exc, "message", exc))[:500],
-                            "stage": str(stage) if stage else None,
+                )
+                if (
+                    error_code in _RETRYABLE_RESEARCH_CODES
+                    and attempt < AI_CANDIDATE_RESEARCH_MAX_ATTEMPTS
+                ):
+                    await jobs.update_one(
+                        {"_id": job_id, "user_id": str(user_id)},
+                        {
+                            "$set": {
+                                "attempt_count": attempt,
+                                "attempts": deepcopy(attempts),
+                                "progress": {
+                                    "stage": "technical_deep_check_retry",
+                                    "percent": 20,
+                                },
+                            }
                         },
-                        "progress": {"stage": "failed", "percent": 100},
-                    }
-                },
-            )
+                    )
+                    await asyncio.sleep(AI_CANDIDATE_RETRY_BACKOFF_SECONDS)
+                    continue
+
+                error = {
+                    "code": error_code,
+                    "message": str(getattr(exc, "message", exc))[:500],
+                    "stage": str(stage) if stage else None,
+                    "attempt_count": attempt,
+                    "attempts": deepcopy(attempts),
+                }
+                await jobs.update_one(
+                    {"_id": job_id, "user_id": str(user_id)},
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "completed_at": datetime.now(timezone.utc),
+                            "attempt_count": attempt,
+                            "attempts": deepcopy(attempts),
+                            "error": error,
+                            "progress": {"stage": "failed", "percent": 100},
+                        }
+                    },
+                )
+                return
 
     async def start_run(
         self,

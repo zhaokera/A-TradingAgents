@@ -430,11 +430,21 @@ def test_price_below_stop_marks_original_entry_plan_invalidated():
 
 @pytest.mark.asyncio
 async def test_run_persists_user_owned_candidate_batch():
-    collection = SimpleNamespace(insert_one=AsyncMock())
+    collection = SimpleNamespace(
+        insert_one=AsyncMock(),
+        update_one=AsyncMock(),
+    )
     db = MagicMock()
     db.__getitem__.return_value = collection
     favorites = SimpleNamespace(
-        get_favorite_codes=AsyncMock(return_value={"600001"})
+        get_favorite_codes=AsyncMock(return_value={"600001"}),
+        sync_auto_ai_candidates=AsyncMock(
+            return_value={
+                "selected_codes": ["600001"],
+                "added_codes": [],
+                "condition_orders_created": 0,
+            }
+        ),
     )
     service = AICandidateService(
         research_runner=_research_payload,
@@ -451,6 +461,8 @@ async def test_run_persists_user_owned_candidate_batch():
     stored = collection.insert_one.await_args.args[0]
     assert stored["user_id"] == "admin-id"
     assert stored["expires_at"] > stored["generated_at"]
+    favorites.sync_auto_ai_candidates.assert_awaited_once()
+    assert result["auto_favorites"]["selected_codes"] == ["600001"]
 
 
 @pytest.mark.asyncio
@@ -901,7 +913,65 @@ async def test_background_job_keeps_discovery_stage_from_error_details():
         "code": "candidate_discovery_unavailable",
         "message": "公开全市场候选发现不可用",
         "stage": "candidate_discovery",
+        "attempt_count": 1,
+        "attempts": [
+            {
+                "attempt": 1,
+                "code": "candidate_discovery_unavailable",
+                "stage": "candidate_discovery",
+            }
+        ],
     }
+
+
+@pytest.mark.asyncio
+async def test_background_job_retries_technical_timeout_once(monkeypatch):
+    job_id = ObjectId()
+    jobs = SimpleNamespace(update_one=AsyncMock())
+    db = MagicMock()
+    db.__getitem__.return_value = jobs
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+    service.run = AsyncMock(
+        side_effect=[
+            CLIError(
+                "公开候选技术初筛超时",
+                code="technical_deep_check_timeout",
+                exit_code=4,
+                stage="technical_deep_check",
+            ),
+            {"run_id": "run-after-cache"},
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.ai_candidate_service.asyncio.sleep",
+        sleep,
+    )
+
+    await service._execute_job(
+        job_id=job_id,
+        user_id="admin-id",
+        max_candidates=5,
+    )
+
+    assert service.run.await_count == 2
+    sleep.assert_awaited_once()
+    completed = jobs.update_one.await_args_list[-1].args[1]["$set"]
+    assert completed["status"] == "completed"
+    assert completed["run_id"] == "run-after-cache"
+    assert completed["attempt_count"] == 2
+    assert completed["attempts"] == [
+        {
+            "attempt": 1,
+            "code": "technical_deep_check_timeout",
+            "stage": "technical_deep_check",
+        }
+    ]
 
 
 @pytest.mark.asyncio

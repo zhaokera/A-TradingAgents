@@ -43,7 +43,7 @@ MAX_PUBLIC_TECHNICAL_CLOSEST_REJECTIONS = 5
 PUBLIC_MIN_NET_REWARD_RISK = 1.5
 TECHNICAL_DEEP_CHECK_TIMEOUT_SECONDS = 35.0
 TECHNICAL_FUNNEL_TIMEOUT_SECONDS = 50.0
-TECHNICAL_SCREEN_WORKERS = 6
+TECHNICAL_SCREEN_WORKERS = 12
 MIN_TECHNICAL_HISTORY_COVERAGE_RATIO = 0.9
 WORKER_STDERR_LOG_LIMIT = 512
 A_SHARE_STOCK_CODE_PATTERN = re.compile(
@@ -176,7 +176,7 @@ def _screen_candidate_technical_plan(
     current_price = _finite_number(
         quote.get("close") or quote.get("price") or quote.get("current_price")
     )
-    history = fetch_tencent_daily_bars_sync(code)
+    history = fetch_tencent_daily_bars_sync(code, prefer_cache=True)
     history_evidence = {
         "source": history.get("source"),
         "checked_at": history.get("checked_at"),

@@ -687,7 +687,7 @@ def test_real_technical_screen_falls_back_to_fee_aware_pullback_plan(monkeypatch
     monkeypatch.setattr(
         quote_service,
         "fetch_tencent_daily_bars_sync",
-        lambda _code: {"ok": True, "status": "ok", "bars": bars},
+        lambda _code, **_kwargs: {"ok": True, "status": "ok", "bars": bars},
     )
     monkeypatch.setattr(
         quote_service,

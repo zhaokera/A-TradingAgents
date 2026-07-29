@@ -469,6 +469,7 @@ def fetch_tencent_daily_bars_sync(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     min_rows: int = 60,
+    prefer_cache: bool = False,
     now: Optional[datetime] = None,
     db_factory: Optional[Callable[[], Any]] = None,
     sleeper: Callable[[float], None] = time.sleep,
@@ -499,7 +500,11 @@ def fetch_tencent_daily_bars_sync(
             "checked_at": checked_at.isoformat(),
         }
 
-    def load_cache(provider_error: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def load_cache(
+        provider_error: Optional[Dict[str, Any]],
+        *,
+        cache_usage: str,
+    ) -> Optional[Dict[str, Any]]:
         try:
             row = get_db()[TENCENT_HISTORY_CACHE_COLLECTION].find_one(
                 {"_id": f"{normalized_code}:qfq"}
@@ -553,9 +558,15 @@ def fetch_tencent_daily_bars_sync(
             "checked_at": cached_at.astimezone(timezone.utc).isoformat(),
             "freshness": "cached_fresh",
             "degraded": True,
+            "cache_usage": cache_usage,
             "cache_age_seconds": round(age_seconds, 3),
-            "provider_errors": [provider_error],
+            "provider_errors": [provider_error] if provider_error else [],
         }
+
+    if prefer_cache:
+        cached = load_cache(None, cache_usage="preferred")
+        if cached is not None:
+            return cached
 
     bars: List[Dict[str, Any]] = []
     fetch_error: Optional[Exception] = None
@@ -591,7 +602,7 @@ def fetch_tencent_daily_bars_sync(
 
     if fetch_error is not None:
         provider_error = cache_error("fetch_error", type(fetch_error).__name__)
-        cached = load_cache(provider_error)
+        cached = load_cache(provider_error, cache_usage="fallback")
         if cached is not None:
             return cached
         return {
@@ -629,7 +640,7 @@ def fetch_tencent_daily_bars_sync(
     if not payload["ok"]:
         payload["reason"] = f"腾讯前复权日线不足 {min_rows} 条。"
         provider_error = cache_error("insufficient_history", "InsufficientHistory")
-        cached = load_cache(provider_error)
+        cached = load_cache(provider_error, cache_usage="fallback")
         if cached is not None:
             return cached
         payload["provider_errors"] = [provider_error]
