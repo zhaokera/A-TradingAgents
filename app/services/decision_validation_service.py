@@ -164,6 +164,15 @@ def _condition_order_capability(packet: Mapping[str, Any]) -> bool:
     )
 
 
+def _has_actionable_selections(proposal: Any) -> bool:
+    payload, _ = _proposal_payload(proposal)
+    return any(
+        str(item.get("action") or "") in ACTIONABLE_ACTIONS
+        for item in payload.get("selections") or []
+        if isinstance(item, Mapping)
+    )
+
+
 class DecisionValidationService:
     """Reject hard-limit violations without modifying a Codex proposal."""
 
@@ -862,8 +871,10 @@ class DecisionValidationService:
         db = await self._get_db()
         document = deepcopy(dict(validation))
         document["persisted_at"] = datetime.now(timezone.utc).isoformat()
-        await db["decision_validations"].insert_one(document)
-        return deepcopy(document)
+        await db["decision_validations"].insert_one(deepcopy(document))
+        result = deepcopy(document)
+        result.pop("_id", None)
+        return result
 
     async def validate(
         self,
@@ -894,7 +905,10 @@ class DecisionValidationService:
                 refresh=True,
                 now=now,
             )
-            if refreshed.get("material_hash") != packet.get("material_hash"):
+            if (
+                refreshed.get("material_hash") != packet.get("material_hash")
+                and _has_actionable_selections(proposal)
+            ):
                 result = await self.validate_document(
                     owner,
                     proposal,
@@ -917,7 +931,8 @@ class DecisionValidationService:
                     ]
                 )
                 return await self.persist(result)
-            packet = refreshed
+            if refreshed.get("material_hash") == packet.get("material_hash"):
+                packet = refreshed
         result = await self.validate_document(
             owner,
             proposal,

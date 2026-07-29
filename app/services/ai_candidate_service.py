@@ -55,7 +55,7 @@ _BLOCKING_RISK_CODES = {
     "notice_risk_blocked",
     "suspended",
     "delisted",
-}
+    }
 
 _ACTIONABILITY_LABELS = {
     "ready_now": "研究价格条件已满足",
@@ -917,7 +917,13 @@ def normalize_ai_candidate_run(
         "disclaimer": str(
             data.get("disclaimer") or "仅供研究参考，不构成投资建议或交易指令。"
         ),
-    }
+}
+
+
+async def _load_current_market_status() -> Dict[str, Any]:
+    from app.services.holdings_cli import build_market_status_payload
+
+    return await run_in_threadpool(build_market_status_payload)
 
 
 class AICandidateService:
@@ -930,6 +936,7 @@ class AICandidateService:
         stock_master: Any = None,
         macro_risk: Any = None,
         trading_calendar: Any = None,
+        market_status_loader: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._research_runner = research_runner
         self._favorites = favorites
@@ -937,6 +944,9 @@ class AICandidateService:
         self._stock_master = stock_master or StockMasterDataService()
         self._macro_risk = macro_risk or GlobalMacroRiskService()
         self._trading_calendar = trading_calendar or AShareCalendarService()
+        self._market_status_loader = (
+            market_status_loader or _load_current_market_status
+        )
         self.db = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
 
@@ -1406,6 +1416,97 @@ class AICandidateService:
             else "domestic_market_regime"
         )
 
+    async def _apply_live_market_gate(
+        self,
+        document: Dict[str, Any],
+        *,
+        checked_at: datetime,
+    ) -> None:
+        market = document.setdefault("market", {})
+        try:
+            payload = self._market_status_loader()
+            if inspect.isawaitable(payload):
+                payload = await payload
+        except Exception as exc:
+            logger.exception("Failed to refresh current A-share market gate")
+            payload = {
+                "ok": False,
+                "data": {},
+                "meta": {
+                    "source": "live_market_gate",
+                    "provider_errors": [
+                        {
+                            "stage": "live_market_gate",
+                            "error_type": type(exc).__name__,
+                        }
+                    ],
+                },
+            }
+        payload = payload if isinstance(payload, Mapping) else {}
+        data = payload.get("data")
+        data = data if isinstance(data, Mapping) else {}
+        gate = data.get("market_gate")
+        gate = gate if isinstance(gate, Mapping) else {}
+        session = data.get("market_session")
+        session = session if isinstance(session, Mapping) else {}
+        meta = payload.get("meta")
+        meta = meta if isinstance(meta, Mapping) else {}
+        level = str(gate.get("level") or "unknown").strip().lower()
+        trade_date = str(
+            gate.get("trade_date") or gate.get("benchmark_trade_date") or ""
+        ).strip()
+        local_date = checked_at.astimezone(
+            timezone(timedelta(hours=8))
+        ).date().isoformat()
+        is_trading_hours = session.get("is_trading_hours") is True
+        current_trade_date = bool(
+            trade_date and (not is_trading_hours or trade_date == local_date)
+        )
+        usable = bool(
+            payload.get("ok") is True
+            and gate.get("status") == "ok"
+            and level in {"green", "yellow", "red"}
+            and current_trade_date
+        )
+        provider_errors = meta.get("provider_errors")
+        provider_errors = (
+            deepcopy(list(provider_errors))
+            if isinstance(provider_errors, list)
+            else []
+        )
+        if not usable and not provider_errors:
+            provider_errors.append(
+                {
+                    "stage": "live_market_gate",
+                    "status": str(gate.get("status") or "unavailable"),
+                    "reason": (
+                        "live_trade_date_mismatch"
+                        if is_trading_hours and trade_date != local_date
+                        else "market_gate_unavailable"
+                    ),
+                    "trade_date": trade_date or None,
+                    "expected_trade_date": local_date if is_trading_hours else None,
+                }
+            )
+        market["live_gate"] = {
+            "usable": usable,
+            "status": str(gate.get("status") or "unavailable"),
+            "source": str(meta.get("source") or "live_market_gate"),
+            "checked_at": str(meta.get("generated_at") or checked_at.isoformat()),
+            "trade_date": trade_date or None,
+            "is_trading_hours": is_trading_hours,
+            "provider_errors": provider_errors,
+            "fail_closed": not usable,
+            "market_session": deepcopy(dict(session)),
+            "market_gate": deepcopy(dict(gate)),
+        }
+        market["domestic_regime"] = level if usable else "red"
+        market["domestic_regime_source"] = (
+            "live_market_gate"
+            if usable
+            else "live_market_gate_unavailable_fail_closed"
+        )
+
     async def _apply_account_policy(
         self,
         document: Dict[str, Any],
@@ -1687,7 +1788,6 @@ class AICandidateService:
                     previous_actionability=previous_actionability,
                 )
         await self._apply_objective_profiles(document)
-        await self._apply_macro_policy(document)
         market = document.setdefault("market", {})
         discovery_snapshot = market.get("discovery_snapshot")
         if not isinstance(discovery_snapshot, Mapping):
@@ -1699,8 +1799,13 @@ class AICandidateService:
                     "local_time",
                     "decision",
                     "reason_code",
+                    "domestic_regime",
+                    "regime",
+                    "regime_reason",
                 )
             }
+        await self._apply_live_market_gate(document, checked_at=refresh_now)
+        await self._apply_macro_policy(document)
         market.update(
             {
                 "session": "quote_refresh_only",

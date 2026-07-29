@@ -64,6 +64,20 @@ def _confirmation_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _proposal_has_actionable_selections(
+    proposal: Optional[Mapping[str, Any]],
+) -> bool:
+    if not isinstance(proposal, Mapping):
+        return False
+    payload = proposal.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    return any(
+        str(item.get("action") or "") in {"buy_now", "condition_order"}
+        for item in payload.get("selections") or []
+        if isinstance(item, Mapping)
+    )
+
+
 class DecisionConfirmationService:
     """Record a human decision without placing an order."""
 
@@ -245,6 +259,10 @@ class DecisionConfirmationService:
             or research_baseline.get("baseline_id")
             or ""
         )
+        research_baseline_material_hash = str(
+            research.get("source_baseline_material_hash") or ""
+        )
+        baseline_material_hash = str(baseline.get("material_hash") or "")
         if (
             proposal is None
             and baseline_id
@@ -285,7 +303,15 @@ class DecisionConfirmationService:
                 != str(research.get("research_packet_id") or "")
             ):
                 revalidation_reasons.append("proposal_research_packet_mismatch")
-            if baseline_id and research_baseline_id != baseline_id:
+            baseline_changed = (
+                baseline_material_hash != research_baseline_material_hash
+                if baseline_material_hash and research_baseline_material_hash
+                else bool(baseline_id and research_baseline_id != baseline_id)
+            )
+            if (
+                _proposal_has_actionable_selections(proposal)
+                and baseline_changed
+            ):
                 revalidation_reasons.append("software_baseline_changed")
             if validation is None:
                 revalidation_reasons.append("validation_missing")

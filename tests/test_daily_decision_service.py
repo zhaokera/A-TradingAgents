@@ -835,6 +835,8 @@ def test_canonical_hash_excludes_only_explicit_volatile_paths():
             "price": 10.0,
             "trade_at": "2026-07-22T10:00:00+08:00",
             "quote_checked_at": "one",
+            "age_seconds": 1.1,
+            "event_age_seconds": 0.2,
         },
         "profile": {
             "industry_evidence": {
@@ -858,6 +860,8 @@ def test_canonical_hash_excludes_only_explicit_volatile_paths():
     volatile = deepcopy(packet)
     volatile.update(decision_id="two", as_of="two", created_at="two", persisted_at="two", persistence={"owner": "two"})
     volatile["quote"]["quote_checked_at"] = "two"
+    volatile["quote"]["age_seconds"] = 89.9
+    volatile["quote"]["event_age_seconds"] = 3.2
     volatile["profile"]["industry_evidence"]["retrieved_at"] = "two"
     assert material_hash(volatile) == baseline
 
@@ -916,6 +920,48 @@ async def test_request_and_briefing_build_times_do_not_create_new_revision():
     assert "classified_at" not in first["market_session"]
     assert first["briefing_as_of"] == "2026-07-22T10:00:00+08:00"
     assert first["candidate_generated_at"] == "2026-07-22T09:55:00+08:00"
+
+
+@pytest.mark.asyncio
+async def test_current_candidate_live_gate_overrides_stale_briefing_regime():
+    run = _run()
+    run["market"] = {
+        "domestic_regime": "green",
+        "regime": "green",
+        "live_gate": {
+            "usable": True,
+            "status": "ok",
+            "source": "tencent_major_indices+akshare_sina_public_breadth",
+            "trade_date": "2026-07-22",
+            "checked_at": "2026-07-22T10:00:00+08:00",
+            "market_gate": {
+                "status": "ok",
+                "level": "green",
+                "trade_date": "2026-07-22",
+            },
+        },
+        "discovery_snapshot": {
+            "domestic_regime": "red",
+            "trade_date": "2026-07-21",
+        },
+    }
+    briefing = _briefing()
+    briefing["market"] = {
+        "domestic_regime": "red",
+        "combined_regime": "red",
+    }
+
+    packet = await _service(run=run, briefing=briefing).today("user-1", now=NOW)
+
+    assert packet["market"]["domestic_regime"] == "green"
+    assert packet["market"]["combined_regime"] == "green"
+    assert packet["market"]["live_gate"]["usable"] is True
+    assert packet["market"]["discovery_snapshot"]["domestic_regime"] == "red"
+    assert all(
+        "market_red" not in item["reason_codes"]
+        for bucket in ("buy_now", "condition_order", "wait", "avoid")
+        for item in packet[bucket]
+    )
 
 
 @pytest.mark.asyncio

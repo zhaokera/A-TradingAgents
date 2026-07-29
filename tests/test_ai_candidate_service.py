@@ -37,6 +37,40 @@ def _offline_research_dependencies():
     return stock_master, macro_risk
 
 
+def _live_market_status(*, level: str = "green") -> dict:
+    local_date = datetime.now(timezone.utc).date().isoformat()
+    return {
+        "ok": True,
+        "data": {
+            "market_session": {
+                "session": "trading",
+                "is_trading_hours": True,
+                "local_time": f"{local_date}T10:00:00+08:00",
+            },
+            "market_gate": {
+                "status": "ok",
+                "level": level,
+                "trade_date": local_date,
+                "benchmark_trade_date": local_date,
+                "new_position_allowed": level != "red",
+                "max_new_exposure_multiplier": (
+                    1.0 if level == "green" else 0.5 if level == "yellow" else 0.0
+                ),
+                "breadth_regime": {
+                    "status": "ok",
+                    "level": level,
+                    "source": "akshare.sina.stock_zh_a_spot",
+                    "total_coverage_ratio": 0.997,
+                },
+            },
+        },
+        "meta": {
+            "source": "tencent_major_indices+akshare_sina_public_breadth",
+            "generated_at": f"{local_date}T02:00:00Z",
+        },
+    }
+
+
 def _research_payload():
     return {
         "ok": True,
@@ -448,6 +482,7 @@ async def test_latest_reconciles_favorite_status_with_current_favorites():
         quotes=quotes,
         stock_master=stock_master,
         macro_risk=macro_risk,
+        market_status_loader=AsyncMock(return_value=_live_market_status()),
     )
     service.db = db
 
@@ -473,6 +508,8 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
                     "session": "closed",
                     "is_trading_hours": False,
                     "local_time": "2026-07-20T14:00:00+08:00",
+                    "domestic_regime": "red",
+                    "regime": "red",
                 },
                 "candidates": [
                     {
@@ -531,6 +568,7 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
         quotes=quotes,
         stock_master=stock_master,
         macro_risk=macro_risk,
+        market_status_loader=AsyncMock(return_value=_live_market_status()),
     )
     service.db = db
 
@@ -563,8 +601,45 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
     assert result["market"]["discovery_snapshot"]["local_time"] == (
         "2026-07-20T14:00:00+08:00"
     )
+    assert result["market"]["discovery_snapshot"]["domestic_regime"] == "red"
+    assert result["market"]["domestic_regime"] == "green"
+    assert result["market"]["regime"] == "green"
+    assert result["market"]["live_gate"]["usable"] is True
+    assert result["market"]["live_gate"]["source"] == (
+        "tencent_major_indices+akshare_sina_public_breadth"
+    )
+    assert result["market"]["live_gate"]["market_gate"]["breadth_regime"][
+        "total_coverage_ratio"
+    ] == 0.997
     assert candidate["performance"]["observation_count"] == 1
     collection.update_one.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_live_market_gate_fails_closed_on_intraday_trade_date_mismatch():
+    stale_payload = _live_market_status()
+    stale_payload["data"]["market_gate"]["trade_date"] = "2026-07-28"
+    stale_payload["data"]["market_gate"]["benchmark_trade_date"] = "2026-07-28"
+    service = AICandidateService(
+        research_runner=_research_payload,
+        market_status_loader=AsyncMock(return_value=stale_payload),
+    )
+    document = {"market": {"domestic_regime": "green"}}
+
+    await service._apply_live_market_gate(
+        document,
+        checked_at=datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert document["market"]["domestic_regime"] == "red"
+    assert document["market"]["domestic_regime_source"] == (
+        "live_market_gate_unavailable_fail_closed"
+    )
+    assert document["market"]["live_gate"]["usable"] is False
+    assert document["market"]["live_gate"]["fail_closed"] is True
+    assert document["market"]["live_gate"]["provider_errors"][0]["reason"] == (
+        "live_trade_date_mismatch"
+    )
 
 
 @pytest.mark.asyncio
@@ -1278,6 +1353,7 @@ async def test_scheduled_quote_refresh_never_polls_governance_excluded_codes():
             get_favorite_codes=AsyncMock(return_value=set())
         ),
         quotes=SimpleNamespace(get_quotes=get_quotes),
+        market_status_loader=AsyncMock(return_value=_live_market_status()),
     )
     service._candidate_governance = AsyncMock(
         return_value={

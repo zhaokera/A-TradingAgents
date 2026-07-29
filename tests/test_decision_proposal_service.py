@@ -193,6 +193,23 @@ def _proposal(*, quantity=100):
     )
 
 
+def _empty_proposal():
+    return CodexDecisionProposalInput.model_validate(
+        {
+            "research_packet_id": "research-1",
+            "proposal_schema_version": "codex-proposal-v1",
+            "decision_scope": {
+                "max_new_positions": 2,
+                "primary_position_count": 1,
+            },
+            "selections": [],
+            "portfolio_rationale": "当前不新增任何仓位",
+            "no_action_reason": "等待市场门禁与候选条件改善",
+            "prompt_version": "codex-decision-v1",
+        }
+    )
+
+
 class FakeCollection:
     def __init__(self):
         self.rows = []
@@ -511,6 +528,48 @@ async def test_workspace_preserves_validated_proposal_when_baseline_rotates():
     }
     assert workspace["authority"] == "software_baseline"
     assert workspace["primary_decision"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_closes_valid_empty_proposal_on_bound_research_packet():
+    db = FakeDatabase()
+    research = FakeResearchService(_packet())
+    validator = DecisionValidationService(
+        db=db,
+        research_service=research,
+        validation_ttl_seconds=60,
+    )
+    proposals = DecisionProposalService(
+        db=db,
+        research_service=research,
+        validator=validator,
+    )
+    submitted = await proposals.submit("owner-1", _empty_proposal(), now=NOW)
+    confirmations = DecisionConfirmationService(
+        db=db,
+        proposal_service=proposals,
+        validation_service=validator,
+        research_service=research,
+        baseline_service=ChangedBaselineService(),
+        authority_mode="codex_validated",
+    )
+
+    workspace = await confirmations.workspace(
+        "owner-1",
+        refresh=False,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert workspace["workflow_status"] == "proposal_validated"
+    assert workspace["revalidation_required"] is False
+    assert workspace["revalidation_reasons"] == []
+    assert workspace["research_packet"]["research_packet_id"] == "research-1"
+    assert workspace["validation"]["validation_id"] == (
+        submitted["validation"]["validation_id"]
+    )
+    assert workspace["primary_decision"]["proposal_id"] == (
+        submitted["proposal"]["proposal_id"]
+    )
 
 
 @pytest.mark.asyncio

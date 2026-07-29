@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping
 
@@ -67,10 +68,12 @@ class DailyBriefingService:
             lifecycle_counts[state] = lifecycle_counts.get(state, 0) + 1
         unread_count = await get_notifications_service().unread_count(str(user_id))
         if candidate_run:
-            macro = (candidate_run.get("market") or {}).get("macro_risk") or {}
+            candidate_market = candidate_run.get("market") or {}
+            macro = candidate_market.get("macro_risk") or {}
             account = candidate_run.get("account") or {}
             portfolio_plan = candidate_run.get("portfolio_plan") or {}
         else:
+            candidate_market = {}
             if getattr(global_macro_risk_service, "db", None) is None:
                 global_macro_risk_service.db = db
             macro = await global_macro_risk_service.get_current()
@@ -126,13 +129,20 @@ class DailyBriefingService:
                 "items": holding_items,
             },
             "market": {
-                "domestic_regime": (candidate_run or {}).get("market", {}).get("domestic_regime")
+                "domestic_regime": candidate_market.get("domestic_regime")
                 if candidate_run
                 else None,
-                "combined_regime": (candidate_run or {}).get("market", {}).get("regime")
+                "combined_regime": candidate_market.get("regime")
                 if candidate_run
                 else macro.get("regime"),
                 "macro_risk": macro,
+                "live_gate": deepcopy(candidate_market.get("live_gate") or {}),
+                "discovery_snapshot": deepcopy(
+                    candidate_market.get("discovery_snapshot") or {}
+                ),
+                "candidate_discovery": deepcopy(
+                    (candidate_run or {}).get("candidate_discovery") or {}
+                ),
             },
             "candidate_run": {
                 "run_id": (candidate_run or {}).get("run_id"),
