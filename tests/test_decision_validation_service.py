@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
+from bson import ObjectId
 
 from app.models.decision import CodexDecisionProposalInput
 from app.services.decision_validation_service import DecisionValidationService
@@ -188,6 +190,105 @@ def _proposal(*, selections=None, **updates):
 
 def _failure_codes(result):
     return {item["code"] for item in result["hard_failures"]}
+
+
+class _MutatingInsertCollection:
+    def __init__(self, row=None):
+        self.row = deepcopy(row)
+
+    async def find_one(self, query):
+        if self.row and all(self.row.get(key) == value for key, value in query.items()):
+            return deepcopy(self.row)
+        return None
+
+    async def insert_one(self, document):
+        document["_id"] = ObjectId()
+        return SimpleNamespace(inserted_id=document["_id"])
+
+
+class _ValidationDatabase:
+    def __init__(self, proposal=None):
+        self.collections = {
+            "codex_decision_proposals": _MutatingInsertCollection(proposal),
+            "decision_validations": _MutatingInsertCollection(),
+        }
+
+    def __getitem__(self, name):
+        return self.collections[name]
+
+
+def _empty_proposal_document():
+    payload = {
+        "research_packet_id": "research-1",
+        "proposal_schema_version": "codex-proposal-v1",
+        "decision_scope": {
+            "max_new_positions": 2,
+            "primary_position_count": 1,
+        },
+        "selections": [],
+        "portfolio_rationale": "当前不新增任何仓位",
+        "no_action_reason": "等待市场门禁与候选条件改善",
+        "prompt_version": "codex-decision-v1",
+    }
+    return {
+        "proposal_id": "proposal-empty",
+        "user_id": "owner-1",
+        "research_packet_id": "research-1",
+        "payload": payload,
+    }
+
+
+@pytest.mark.asyncio
+async def test_persist_does_not_return_mongo_object_id():
+    service = DecisionValidationService(db=_ValidationDatabase())
+    validation = await service.validate_document(
+        "owner-1",
+        _empty_proposal_document(),
+        _packet(),
+        now=NOW,
+        proposal_id="proposal-empty",
+    )
+
+    persisted = await service.persist(validation)
+
+    assert persisted["status"] == "valid"
+    assert "_id" not in persisted
+    assert not any(isinstance(value, ObjectId) for value in persisted.values())
+
+
+@pytest.mark.asyncio
+async def test_empty_no_action_proposal_refresh_stays_bound_to_immutable_packet():
+    original = _packet()
+    refreshed = deepcopy(original)
+    refreshed["research_packet_id"] = "research-new"
+    refreshed["material_hash"] = "research-material-new"
+
+    class Research:
+        async def get(self, user_id, research_packet_id):
+            assert user_id == "owner-1"
+            assert research_packet_id == "research-1"
+            return deepcopy(original)
+
+        async def today(self, user_id, *, refresh=True, now=None):
+            assert refresh is True
+            return deepcopy(refreshed)
+
+    service = DecisionValidationService(
+        db=_ValidationDatabase(_empty_proposal_document()),
+        research_service=Research(),
+    )
+
+    result = await service.validate(
+        "owner-1",
+        "proposal-empty",
+        refresh_quote=True,
+        now=NOW,
+    )
+
+    assert result["status"] == "valid"
+    assert result["research_packet_id"] == "research-1"
+    assert result["hard_failures"] == []
+    assert "_id" not in result
 
 
 @pytest.mark.asyncio

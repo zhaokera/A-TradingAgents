@@ -268,6 +268,8 @@ def _canonical_sanitise(value: Any, path: tuple[str, ...] = ()) -> Any:
                 segment in {"quote", "transport"} for segment in path
             ):
                 continue
+            if key in {"age_seconds", "event_age_seconds"} and "quote" in path:
+                continue
             result[key] = _canonical_sanitise(item, (*path, key))
         return result
     if isinstance(value, (list, tuple)):
@@ -890,8 +892,25 @@ class DailyDecisionService:
             "provider_versions": deepcopy(PROVIDER_VERSIONS),
         }
 
-        market = briefing.get("market")
-        market = dict(market) if isinstance(market, Mapping) else {}
+        briefing_market = briefing.get("market")
+        market = (
+            deepcopy(dict(briefing_market))
+            if isinstance(briefing_market, Mapping)
+            else {}
+        )
+        candidate_market = candidate_run.get("market")
+        candidate_market = (
+            candidate_market if isinstance(candidate_market, Mapping) else {}
+        )
+        live_gate = candidate_market.get("live_gate")
+        if isinstance(live_gate, Mapping) and live_gate.get("usable") is True:
+            market = deepcopy(dict(candidate_market))
+            market["combined_regime"] = str(
+                candidate_market.get("regime")
+                or candidate_market.get("combined_regime")
+                or candidate_market.get("domestic_regime")
+                or "red"
+            )
         bucket_items: Dict[str, list[Dict[str, Any]]] = {name: [] for name in BUCKETS}
         profile_errors: list[Any] = []
         profile_conflicts: list[Any] = []
