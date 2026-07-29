@@ -38,6 +38,14 @@ def _candidate(
         "objective_tier": "core",
         "objective_tier_label": "核心方向",
         "objective_segment": "数字科技",
+        "profile_evidence": {
+            "status": "missing",
+            "confidence": "missing",
+            "complete": False,
+            "missing_fields": ["industry", "main_business"],
+            "warning_code": "stock_profile_evidence_incomplete",
+            "message": "主营与行业证据缺失，当前仅作价格提醒。",
+        },
     }
 
 
@@ -110,6 +118,8 @@ async def test_auto_ai_sync_promotes_only_trackable_candidates_and_preserves_use
     assert promoted["ai_metadata"]["auto_promoted"] is True
     assert promoted["ai_metadata"]["price_alert_only"] is True
     assert promoted["ai_metadata"]["condition_order_created"] is False
+    assert promoted["ai_metadata"]["profile_evidence"]["status"] == "missing"
+    assert promoted["ai_metadata"]["profile_evidence"]["complete"] is False
     assert "688001" not in by_code
     assert "600002" not in by_code
 

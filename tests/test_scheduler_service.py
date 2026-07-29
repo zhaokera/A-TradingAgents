@@ -14,6 +14,21 @@ def _scheduler():
     return scheduler
 
 
+def test_expected_off_session_tracking_result_is_not_audited():
+    assert SchedulerService._should_skip_execution_audit(
+        "decision_tracking_poller",
+        {"status": "disabled_market_phase", "phase": "post_close"},
+    )
+    assert not SchedulerService._should_skip_execution_audit(
+        "decision_tracking_poller",
+        {"status": "disabled_session_unavailable"},
+    )
+    assert not SchedulerService._should_skip_execution_audit(
+        "quotes_ingestion_service",
+        {"status": "disabled_market_phase"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_startup_catchup_schedules_missed_daily_job_with_audit():
     scheduler = _scheduler()

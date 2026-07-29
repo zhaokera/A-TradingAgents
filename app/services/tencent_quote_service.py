@@ -215,16 +215,31 @@ def assess_cn_quote_freshness(
     local_now = _as_market_datetime(now or datetime.now(CN_MARKET_TIMEZONE))
     assert local_now is not None
     source = str(quote.get("source") or quote.get("data_source") or "unknown").lower()
-    trade_dt = _as_market_datetime(quote.get("trade_at"))
+    provider_updated_dt = _as_market_datetime(
+        quote.get("provider_updated_at") or quote.get("trade_at")
+    )
+    trade_dt = provider_updated_dt
     session = _cn_session(local_now)
     age_seconds_raw = (local_now - trade_dt).total_seconds() if trade_dt else None
 
     base = {
         "actionable": False,
         "status": "missing_trade_at",
-        "reason": "行情缺少提供方成交时间，仅用于研究展示。",
+        "reason": "行情缺少提供方快照更新时间，仅用于研究展示。",
         "source": source,
         "trade_at": trade_dt.isoformat(timespec="seconds") if trade_dt else None,
+        "provider_updated_at": (
+            provider_updated_dt.isoformat(timespec="seconds")
+            if provider_updated_dt
+            else None
+        ),
+        "quote_time_semantics": str(
+            quote.get("quote_time_semantics")
+            or "legacy_provider_time_unverified"
+        ),
+        "exchange_trade_time_verified": (
+            quote.get("exchange_trade_time_verified") is True
+        ),
         "trade_date": trade_dt.date().isoformat() if trade_dt else None,
         "age_seconds": int(age_seconds_raw) if age_seconds_raw is not None else None,
         "session": session,
@@ -254,7 +269,7 @@ def assess_cn_quote_freshness(
         return {
             **base,
             "status": "future_trade_at",
-            "reason": "腾讯成交时间超出允许的时钟偏差，禁止用于仓位计算。",
+            "reason": "腾讯提供方快照更新时间超出允许的时钟偏差，禁止用于仓位计算。",
         }
     if age_seconds_raw is not None and age_seconds_raw > max_age_seconds:
         return {
@@ -266,7 +281,7 @@ def assess_cn_quote_freshness(
         **base,
         "actionable": True,
         "status": "fresh",
-        "reason": "腾讯提供方成交时间在允许时效内。",
+        "reason": "腾讯提供方快照更新时间在允许时效内。",
     }
 
 
@@ -280,7 +295,10 @@ def assess_tencent_research_quote_freshness(
 ) -> Dict[str, Any]:
     """Evaluate Tencent quote completeness for public research coverage."""
     local_now = _as_market_datetime(now)
-    trade_dt = _as_market_datetime(quote.get("trade_at"))
+    provider_updated_dt = _as_market_datetime(
+        quote.get("provider_updated_at") or quote.get("trade_at")
+    )
+    trade_dt = provider_updated_dt
     benchmark_dt = _as_market_datetime(benchmark_trade_date)
     source = str(quote.get("source") or "unknown").strip().lower()
     age_seconds_raw = (
@@ -291,9 +309,21 @@ def assess_tencent_research_quote_freshness(
     base = {
         "data_complete": False,
         "status": "missing_trade_at",
-        "reason": "腾讯行情缺少可解析的提供方成交时间。",
+        "reason": "腾讯行情缺少可解析的提供方快照更新时间。",
         "source": source,
         "trade_at": trade_dt.isoformat(timespec="seconds") if trade_dt else None,
+        "provider_updated_at": (
+            provider_updated_dt.isoformat(timespec="seconds")
+            if provider_updated_dt
+            else None
+        ),
+        "quote_time_semantics": str(
+            quote.get("quote_time_semantics")
+            or "legacy_provider_time_unverified"
+        ),
+        "exchange_trade_time_verified": (
+            quote.get("exchange_trade_time_verified") is True
+        ),
         "trade_date": trade_dt.date().isoformat() if trade_dt else None,
         "benchmark_trade_date": benchmark_dt.date().isoformat() if benchmark_dt else None,
         "age_seconds": int(age_seconds_raw) if age_seconds_raw is not None else None,
@@ -355,7 +385,7 @@ def assess_tencent_research_quote_freshness(
             return {
                 **base,
                 "status": "future_trade_at",
-                "reason": "腾讯成交时间超出允许的时钟偏差。",
+                "reason": "腾讯提供方快照更新时间超出允许的时钟偏差。",
             }
         return {
             **base,
@@ -374,7 +404,7 @@ def assess_tencent_research_quote_freshness(
         return {
             **base,
             "status": "future_trade_at",
-            "reason": "腾讯成交时间超出允许的时钟偏差。",
+            "reason": "腾讯提供方快照更新时间超出允许的时钟偏差。",
         }
     if age_seconds_raw is not None and age_seconds_raw > max_age_seconds:
         return {
@@ -748,6 +778,7 @@ def parse_tencent_quote_payload(code: str, payload: str) -> Optional[Dict[str, A
         return None
 
     provider_timestamp = fields[30] if len(fields) > 30 and fields[30] else None
+    provider_updated_at = _parse_provider_trade_at(provider_timestamp)
     received_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     quote = {
         "code": normalized_code,
@@ -776,7 +807,11 @@ def parse_tencent_quote_payload(code: str, payload: str) -> Optional[Dict[str, A
         "circ_mv": _yi_to_yuan(fields[44]) if len(fields) > 44 and fields[44] else None,
         "total_mv": _yi_to_yuan(fields[45]) if len(fields) > 45 and fields[45] else None,
         "provider_timestamp": provider_timestamp,
-        "trade_at": _parse_provider_trade_at(provider_timestamp),
+        "provider_updated_at": provider_updated_at,
+        "quote_time_semantics": "provider_snapshot_updated_at",
+        "exchange_trade_time_verified": False,
+        "trade_at_compatibility_alias": True,
+        "trade_at": provider_updated_at,
         "trade_date": _extract_trade_date(provider_timestamp),
         "received_at": received_at,
         "updated_at": received_at,

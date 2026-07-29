@@ -122,7 +122,10 @@ class MarketSessionPolicyService:
         )
         phase = str(classification.get("phase") or "calendar_unknown")
         source = str(quote.get("source") or "unknown").strip().lower()
-        trade_at = _as_shanghai_datetime(quote.get("trade_at"))
+        provider_updated_at = _as_shanghai_datetime(
+            quote.get("provider_updated_at") or quote.get("trade_at")
+        )
+        trade_at = provider_updated_at
         age_seconds = (local_now - trade_at).total_seconds() if trade_at else None
         event_confirmation_required = (
             quote.get("event_confirmation_required") is True
@@ -154,6 +157,18 @@ class MarketSessionPolicyService:
             "source": source,
             "phase": phase,
             "trade_at": trade_at.isoformat(timespec="seconds") if trade_at else None,
+            "provider_updated_at": (
+                provider_updated_at.isoformat(timespec="seconds")
+                if provider_updated_at
+                else None
+            ),
+            "quote_time_semantics": str(
+                quote.get("quote_time_semantics")
+                or "legacy_provider_time_unverified"
+            ),
+            "exchange_trade_time_verified": (
+                quote.get("exchange_trade_time_verified") is True
+            ),
             "trade_date": trade_at.date().isoformat() if trade_at else None,
             "age_seconds": serialized_age,
             "max_age_seconds": self.quote_max_age_seconds,

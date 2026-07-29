@@ -466,6 +466,54 @@ async def test_run_persists_user_owned_candidate_batch():
 
 
 @pytest.mark.asyncio
+async def test_missing_stock_profile_remains_a_nonblocking_visible_warning():
+    stock_master = SimpleNamespace(
+        db=None,
+        resolve_many=AsyncMock(return_value={}),
+    )
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+        stock_master=stock_master,
+    )
+    service.db = {}
+    candidate = {
+        "code": "000969",
+        "name": "安泰科技",
+        "priority": 1,
+        "can_add_to_favorites": True,
+        "actionability": "watch_trigger",
+        "risk_flags": [],
+        "price_plan": {
+            "entry_price": 15.9,
+            "stop_price": 15.13,
+            "target_price": 21.52,
+        },
+        "position_sizing": {"status": "sized"},
+    }
+    document = {"candidates": [candidate], "objective": {}}
+
+    await service._apply_objective_profiles(document)
+
+    assert candidate["can_add_to_favorites"] is True
+    assert candidate["actionability"] == "watch_trigger"
+    assert candidate["profile_evidence"] == {
+        "status": "missing",
+        "confidence": "missing",
+        "complete": False,
+        "missing_fields": ["industry", "main_business"],
+        "warning_code": "stock_profile_evidence_incomplete",
+        "message": "主营或行业证据不完整，当前候选仅作价格提醒，不提升为可执行结论。",
+    }
+    assert candidate["risk_flags"][-1] == {
+        "code": "stock_profile_evidence_incomplete",
+        "severity": "warning",
+        "message": "主营或行业证据不完整，当前候选仅作价格提醒，不提升为可执行结论。",
+    }
+
+
+@pytest.mark.asyncio
 async def test_latest_reconciles_favorite_status_with_current_favorites():
     collection = SimpleNamespace(
         find_one=AsyncMock(
@@ -596,6 +644,9 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
         "price": 9.9,
         "source": "tencent",
         "trade_at": "2026-07-21T10:00:00+08:00",
+        "provider_updated_at": None,
+        "quote_time_semantics": None,
+        "exchange_trade_time_verified": False,
         "quote_checked_at": candidate["quote_checked_at"],
         "volume": 1200.0,
         "amount": 11880.0,

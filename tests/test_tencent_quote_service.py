@@ -100,6 +100,10 @@ def test_parse_tencent_quote_payload_returns_market_quote_shape():
     assert quote["circ_mv"] == 93000000
     assert quote["total_mv"] == 120000000
     assert quote["trade_at"] == "2026-07-10T14:59:30+08:00"
+    assert quote["provider_updated_at"] == "2026-07-10T14:59:30+08:00"
+    assert quote["quote_time_semantics"] == "provider_snapshot_updated_at"
+    assert quote["exchange_trade_time_verified"] is False
+    assert quote["trade_at_compatibility_alias"] is True
     assert quote["trade_date"] == "2026-07-10"
     assert quote["received_at"].endswith("Z")
 
@@ -118,6 +122,29 @@ def test_parse_tencent_quote_payload_keeps_malformed_provider_time_non_actionabl
     )
     assert freshness["actionable"] is False
     assert freshness["status"] == "missing_trade_at"
+
+
+def test_post_close_provider_update_time_is_a_non_actionable_compatibility_alias():
+    quote = parse_tencent_quote_payload(
+        "000969",
+        _make_tencent_payload(
+            code="000969",
+            provider_symbol="sz000969",
+            provider_timestamp="20260729161418",
+        ),
+    )
+
+    freshness = assess_cn_quote_freshness(
+        quote,
+        now=datetime(2026, 7, 29, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert freshness["actionable"] is False
+    assert freshness["status"] == "off_session"
+    assert freshness["provider_updated_at"] == "2026-07-29T16:14:18+08:00"
+    assert freshness["quote_time_semantics"] == "provider_snapshot_updated_at"
+    assert freshness["exchange_trade_time_verified"] is False
+    assert "成交时间" not in freshness["reason"]
 
 
 def test_parse_tencent_quote_payload_uses_precise_amount_and_share_volume():
@@ -908,6 +935,9 @@ def test_quote_freshness_marks_off_session_and_fallback_as_display_only():
         "reason": "当前不在A股连续交易时段，行情仅用于研究展示。",
         "source": "tencent",
         "trade_at": "2026-07-10T11:30:00+08:00",
+        "provider_updated_at": "2026-07-10T11:30:00+08:00",
+        "quote_time_semantics": "legacy_provider_time_unverified",
+        "exchange_trade_time_verified": False,
         "trade_date": "2026-07-10",
         "age_seconds": 1800,
         "session": "lunch_break",

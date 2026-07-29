@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import ast
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
+from apscheduler.triggers.combining import OrTrigger
 
 from app.core.config import Settings
 from app.core.database import create_database_indexes
@@ -144,7 +147,22 @@ async def test_scheduler_registers_refresh_first_and_bounded_tracking_job():
     tracking = scheduler.jobs[1]
     assert tracking["max_instances"] == 1
     assert tracking["coalesce"] is True
-    assert tracking["trigger"].interval.total_seconds() == 15
+    assert tracking["misfire_grace_time"] == 30
+    assert isinstance(tracking["trigger"], OrTrigger)
+    shanghai = ZoneInfo("Asia/Shanghai")
+    trigger = tracking["trigger"]
+    assert trigger.get_next_fire_time(
+        None,
+        datetime(2026, 7, 29, 9, 29, 59, tzinfo=shanghai),
+    ) == datetime(2026, 7, 29, 9, 30, tzinfo=shanghai)
+    assert trigger.get_next_fire_time(
+        None,
+        datetime(2026, 7, 29, 11, 29, 46, tzinfo=shanghai),
+    ) == datetime(2026, 7, 29, 13, 0, tzinfo=shanghai)
+    assert trigger.get_next_fire_time(
+        None,
+        datetime(2026, 7, 29, 15, 0, tzinfo=shanghai),
+    ) == datetime(2026, 7, 30, 9, 30, tzinfo=shanghai)
     assert result["tracking_readiness"]["ready"] is True
 
 
