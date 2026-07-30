@@ -9,6 +9,8 @@ from collections import Counter
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from app.services.a_share_permissions import classify_a_share_board
+
 from app.services.a_share_market_regime import MIN_BREADTH_UNIVERSE_SIZE
 from app.services.investment_policy import (
     classify_investment_objective,
@@ -1388,6 +1390,7 @@ def discover_public_candidate_universe(
     fetch_quotes: Callable[[Iterable[str]], Dict[str, Any]],
     now: datetime,
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run public preselection and one deadline-bounded Tencent review callback."""
@@ -1413,20 +1416,27 @@ def discover_public_candidate_universe(
         for code, reason in (excluded_code_reasons or {}).items()
         if re.fullmatch(r"[0-9]{6}", str(code or "").strip())
     }
+    board_exclusions = {
+        str(board or "").strip().upper(): str(reason or "").strip()
+        for board, reason in (board_exclusion_reasons or {}).items()
+        if str(board or "").strip() and str(reason or "").strip()
+    }
+    if star_market_exclusion_reason and "STAR" not in board_exclusions:
+        board_exclusions["STAR"] = star_market_exclusion_reason
     permission_prefilter_excluded: List[Dict[str, str]] = []
     filtered_rows: List[Dict[str, Any]] = []
     for row in context["rows"]:
         code = _normalized_code(row.get("code")) if isinstance(row, Mapping) else ""
         reason = explicit_exclusions.get(code)
-        if reason is None and star_market_exclusion_reason and code.startswith(
-            ("688", "689")
-        ):
-            reason = star_market_exclusion_reason
+        board = classify_a_share_board(code)["board"]
+        if reason is None:
+            reason = board_exclusions.get(str(board))
         if reason:
             permission_prefilter_excluded.append(
                 {
                     "code": code,
                     "name": str(row.get("name") or code),
+                    "board": str(board),
                     "reason_code": reason,
                 }
             )

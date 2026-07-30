@@ -10,6 +10,10 @@ from bson import ObjectId
 
 from app.core.database import get_mongo_db
 from app.models.user import FavoriteStock
+from app.services.a_share_permissions import (
+    normalize_market_permissions,
+    permission_for_code,
+)
 from app.services.quotes_service import get_quotes_service
 
 
@@ -89,8 +93,51 @@ class FavoritesService:
             doc = await db.user_favorites.find_one({"user_id": user_id})
             favorites = (doc or {}).get("favorites", [])
 
+        try:
+            settings = await db["user_holding_settings"].find_one(
+                {"user_id": str(user_id)},
+                {"execution_capabilities.market_permissions": 1, "_id": 0},
+            )
+        except Exception:
+            settings = None
+        capabilities = (
+            settings.get("execution_capabilities")
+            if isinstance(settings, Mapping)
+            else {}
+        )
+        capabilities = (
+            capabilities if isinstance(capabilities, Mapping) else {}
+        )
+        market_permissions = normalize_market_permissions(
+            capabilities.get("market_permissions")
+        )
+
         # 先格式化基础字段
         items = [self._format_favorite(fav) for fav in favorites]
+        for item in items:
+            permission = permission_for_code(
+                item.get("stock_code"),
+                market_permissions,
+            )
+            item["market_permission"] = permission
+            item["execution_permission_eligible"] = permission["eligible"]
+            item["permission_reason_code"] = permission[
+                "exclusion_reason_code"
+            ]
+            if permission["eligible"] is not True:
+                item["execution_actionable"] = False
+                item["is_reference_only"] = True
+                metadata = item.get("ai_metadata")
+                if isinstance(metadata, Mapping):
+                    item["ai_metadata"] = {
+                        **dict(metadata),
+                        "execution_actionable": False,
+                        "execution_status": "permission_blocked",
+                        "permission_reason_code": permission[
+                            "exclusion_reason_code"
+                        ],
+                        "is_reference_only": True,
+                    }
 
         # 批量获取股票基础信息（板块等）
         codes = [it.get("stock_code") for it in items if it.get("stock_code")]
@@ -281,8 +328,13 @@ class FavoritesService:
         run_id: str,
         generated_at: datetime,
         max_auto_candidates: int = 5,
+        market_permissions: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Replace only system-owned AI favorites with eligible current picks."""
+
+        normalized_market_permissions = normalize_market_permissions(
+            market_permissions
+        )
 
         def finite_price(value: Any) -> Optional[float]:
             if isinstance(value, bool):
@@ -298,7 +350,11 @@ class FavoritesService:
             if (
                 len(code) != 6
                 or not code.isdigit()
-                or code.startswith(("688", "689"))
+                or permission_for_code(
+                    code,
+                    normalized_market_permissions,
+                )["eligible"]
+                is not True
                 or candidate.get("can_add_to_favorites") is not True
                 or str(candidate.get("actionability") or "")
                 not in {"ready_now", "watch_trigger"}

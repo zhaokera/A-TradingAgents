@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from app.core.config import settings
 from app.core.database import get_mongo_db
 from app.models.decision import CodexDecisionProposalInput, DecisionAction
+from app.services.a_share_permissions import permission_for_code
 from app.services.decision_research_service import decision_research_service
 from app.services.decision_workflow_errors import DecisionWorkflowError
 
@@ -390,6 +391,27 @@ class DecisionValidationService:
 
             if action not in ACTIONABLE_ACTIONS:
                 continue
+
+            capabilities = packet.get("execution_capabilities")
+            capabilities = (
+                capabilities if isinstance(capabilities, Mapping) else {}
+            )
+            permission = permission_for_code(
+                symbol,
+                capabilities.get("market_permissions"),
+            )
+            if permission["eligible"] is not True:
+                failures.append(
+                    _failure(
+                        str(permission["exclusion_reason_code"]),
+                        symbol=symbol,
+                        details={
+                            "board": permission["board"],
+                            "permission_key": permission["permission_key"],
+                            "permission_reason_code": permission["reason_code"],
+                        },
+                    )
+                )
 
             quantity = int(selection.get("requested_quantity") or 0)
             trigger = _decimal(selection.get("trigger_price")) or Decimal(0)

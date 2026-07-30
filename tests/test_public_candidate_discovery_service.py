@@ -135,14 +135,67 @@ def test_discovery_prefilters_star_and_user_exclusions_before_tencent_review():
         {
             "code": "600406",
             "name": "国电南瑞",
+            "board": "A_SHARE",
             "reason_code": "user_excluded",
         },
         {
             "code": "688208",
             "name": "道通科技",
+            "board": "STAR",
             "reason_code": "star_market_permission_denied",
         },
     ]
+
+
+def test_discovery_prefilters_beijing_exchange_before_tencent_review():
+    snapshot = _snapshot(
+        [
+            _row("920493", name="并行科技", amount=900_000_000.0),
+            _row("000977", name="浪潮信息", amount=700_000_000.0),
+        ]
+    )
+    requested = []
+
+    def fetch_quotes(codes):
+        requested.extend(codes)
+        definitions = rank_public_candidate_universe(
+            [_row(code, amount=700_000_000.0) for code in codes],
+            benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        )["definitions"]
+        return {
+            "status": "ok",
+            "requested_codes": list(codes),
+            "rows": [_quote(definition) for definition in definitions],
+        }
+
+    result = discover_public_candidate_universe(
+        snapshot,
+        fetch_quotes=fetch_quotes,
+        now=NOW,
+        board_exclusion_reasons={
+            "BSE": "beijing_stock_exchange_permission_unverified"
+        },
+    )
+
+    assert "920493" not in requested
+    assert "000977" in requested
+    audit = result["candidate_discovery"]
+    exclusion_by_code = {
+        item["code"]: item
+        for item in audit["permission_prefilter_excluded"]
+    }
+    assert exclusion_by_code["920493"] == {
+        "code": "920493",
+        "name": "并行科技",
+        "board": "BSE",
+        "reason_code": "beijing_stock_exchange_permission_unverified",
+    }
+    assert all(
+        item["board"] == "BSE"
+        and item["reason_code"]
+        == "beijing_stock_exchange_permission_unverified"
+        for item in audit["permission_prefilter_excluded"]
+    )
 
 
 def _tencent_quote_payload(

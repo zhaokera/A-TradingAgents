@@ -1341,6 +1341,47 @@ async def test_research_entry_receives_user_and_star_market_prefilters():
     }
 
 
+@pytest.mark.asyncio
+async def test_research_entry_receives_all_restricted_board_prefilters():
+    captured = {}
+
+    def runner(*, excluded_code_reasons, board_exclusion_reasons):
+        captured["excluded_code_reasons"] = excluded_code_reasons
+        captured["board_exclusion_reasons"] = board_exclusion_reasons
+        return _research_payload()
+
+    service = AICandidateService(
+        research_runner=runner,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+    )
+
+    payload = await service._run_research(
+        {
+            "excluded_codes": ["600406"],
+            "market_permissions": {
+                "star_market": {
+                    "verified": True,
+                    "tradable": False,
+                },
+                "beijing_stock_exchange": {
+                    "verified": False,
+                    "tradable": False,
+                },
+            },
+        }
+    )
+
+    assert payload["ok"] is True
+    assert captured == {
+        "excluded_code_reasons": {"600406": "user_excluded"},
+        "board_exclusion_reasons": {
+            "STAR": "star_market_permission_denied",
+            "BSE": "beijing_stock_exchange_permission_unverified",
+        },
+    }
+
+
 def test_governance_stops_old_star_and_user_excluded_shadow_plans():
     document = {
         "candidates": [
@@ -1381,6 +1422,54 @@ def test_governance_stops_old_star_and_user_excluded_shadow_plans():
     assert all(
         item["performance"]["shadow_trade"]["previous_status"] == "active"
         for item in excluded.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("permission", "expected_reason"),
+    [
+        (
+            {"verified": False, "tradable": False, "eligible": False},
+            "beijing_stock_exchange_permission_unverified",
+        ),
+        (
+            {"verified": True, "tradable": False, "eligible": False},
+            "beijing_stock_exchange_permission_denied",
+        ),
+    ],
+)
+def test_governance_stops_beijing_exchange_shadow_plans(
+    permission,
+    expected_reason,
+):
+    document = {
+        "candidates": [
+            {
+                "code": "920493",
+                "performance": {"shadow_trade": {"status": "active"}},
+            },
+            {
+                "code": "000977",
+                "performance": {"shadow_trade": {"status": "active"}},
+            },
+        ]
+    }
+
+    AICandidateService._apply_candidate_governance(
+        document,
+        {
+            "excluded_codes": [],
+            "beijing_stock_exchange": permission,
+        },
+    )
+
+    assert [item["code"] for item in document["candidates"]] == ["000977"]
+    excluded = document["governance_excluded_candidates"]
+    assert excluded[0]["code"] == "920493"
+    assert excluded[0]["governance_reason"] == expected_reason
+    assert excluded[0]["execution_actionable"] is False
+    assert excluded[0]["performance"]["shadow_trade"]["status"] == (
+        "stopped_governance"
     )
 
 
