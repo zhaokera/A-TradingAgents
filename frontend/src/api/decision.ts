@@ -100,6 +100,20 @@ export interface DecisionResearchPacket {
       separate_order_limit_price_supported?: boolean
       eligible?: boolean
     }
+    market_permissions?: {
+      star_market?: {
+        verified?: boolean
+        tradable?: boolean
+        eligible?: boolean
+        reason_code?: 'permission_unverified' | 'permission_denied' | null
+      }
+      beijing_stock_exchange?: {
+        verified?: boolean
+        tradable?: boolean
+        eligible?: boolean
+        reason_code?: 'permission_unverified' | 'permission_denied' | null
+      }
+    }
   }
   market: {
     combined_regime?: string

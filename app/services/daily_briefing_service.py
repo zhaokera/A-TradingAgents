@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Mapping
 
 from app.core.database import get_mongo_db
+from app.services.a_share_permissions import normalize_market_permissions
 from app.services.ai_candidate_service import ai_candidate_service
 from app.services.favorites_service import favorites_service
 from app.services.global_macro_risk_service import global_macro_risk_service
@@ -81,12 +82,26 @@ class DailyBriefingService:
                 {"user_id": str(user_id)}
             )
             total_assets = float((settings or {}).get("total_assets") or holding_market_value)
+            execution_capabilities = deepcopy(
+                (settings or {}).get("execution_capabilities") or {}
+            )
+            execution_capabilities["market_permissions"] = (
+                normalize_market_permissions(
+                    execution_capabilities.get("market_permissions")
+                )
+            )
             account = {
                 "total_assets": round(total_assets, 2),
                 "available_cash": round(max(0.0, total_assets - holding_market_value), 2),
                 "current_exposure_pct": round(
                     holding_market_value / total_assets * 100, 2
                 ) if total_assets else 0.0,
+                "execution_capabilities": execution_capabilities,
+                "excluded_codes": sorted(
+                    str(code or "").strip()
+                    for code in (settings or {}).get("excluded_codes", [])
+                    if str(code or "").strip()
+                ),
             }
             portfolio_plan = {}
         candidates = (

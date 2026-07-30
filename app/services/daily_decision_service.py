@@ -19,6 +19,12 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.core.database import get_mongo_db
+from app.services.a_share_permissions import (
+    classify_a_share_board,
+    normalize_a_share_code,
+    normalize_market_permissions,
+    permission_for_code,
+)
 from app.services.ai_candidate_service import ai_candidate_service
 from app.services.daily_briefing_service import daily_briefing_service
 from app.services.decision_tracking_service import DecisionTrackingService
@@ -95,17 +101,7 @@ class DecisionPersistenceError(RuntimeError):
 
 
 def _normalise_code(value: Any) -> str:
-    text = str(value or "").strip().upper()
-    for pattern in (
-        r"(?:SH|SZ)\.(\d{1,6})",
-        r"(\d{1,6})\.(?:SH|SZ)",
-        r"(?:SH|SZ)(\d{1,6})",
-        r"(\d{1,6})",
-    ):
-        match = re.fullmatch(pattern, text)
-        if match:
-            return match.group(1).zfill(6)
-    return text
+    return normalize_a_share_code(value)
 
 
 def _execution_capabilities(account: Mapping[str, Any]) -> Dict[str, Any]:
@@ -125,10 +121,9 @@ def _execution_capabilities(account: Mapping[str, Any]) -> Dict[str, Any]:
     market_permissions = (
         market_permissions if isinstance(market_permissions, Mapping) else {}
     )
-    star = market_permissions.get("star_market")
-    star = star if isinstance(star, Mapping) else {}
-    star_verified = star.get("verified") is True
-    star_tradable = star.get("tradable") is True
+    normalized_market_permissions = normalize_market_permissions(
+        market_permissions
+    )
     excluded_codes = account.get("excluded_codes")
     excluded_codes = (
         excluded_codes
@@ -144,13 +139,7 @@ def _execution_capabilities(account: Mapping[str, Any]) -> Dict[str, Any]:
             "separate_order_limit_price_supported": separate_limit,
             "eligible": eligible,
         },
-        "market_permissions": {
-            "star_market": {
-                "verified": star_verified,
-                "tradable": star_tradable,
-                "eligible": star_verified and star_tradable,
-            }
-        },
+        "market_permissions": normalized_market_permissions,
         "excluded_codes": sorted(
             {
                 _normalise_code(code)
@@ -167,19 +156,9 @@ def _permission_prefilter_reason(
 ) -> Optional[str]:
     if code in set(execution_capabilities.get("excluded_codes") or []):
         return "user_excluded"
-    if not code.startswith(("688", "689")):
-        return None
     market_permissions = execution_capabilities.get("market_permissions")
-    market_permissions = (
-        market_permissions if isinstance(market_permissions, Mapping) else {}
-    )
-    star = market_permissions.get("star_market")
-    star = star if isinstance(star, Mapping) else {}
-    if star.get("eligible") is True:
-        return None
-    if star.get("verified") is True:
-        return "star_market_permission_denied"
-    return "star_market_permission_unverified"
+    permission = permission_for_code(code, market_permissions)
+    return permission.get("exclusion_reason_code")
 
 
 def _as_shanghai(value: Any) -> datetime:
@@ -784,11 +763,7 @@ class DailyDecisionService:
                         {
                             "code": code,
                             "name": str(candidate.get("name") or code),
-                            "board": (
-                                "STAR"
-                                if code.startswith(("688", "689"))
-                                else "A_SHARE"
-                            ),
+                            "board": classify_a_share_board(code)["board"],
                             "reason_code": permission_reason,
                         }
                     )

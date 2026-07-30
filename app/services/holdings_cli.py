@@ -7698,6 +7698,7 @@ def _orchestrate_public_full_market_research_payload(
     database_status: Optional[Dict[str, Any]] = None,
     discovery_state: Optional[Dict[str, Any]] = None,
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one deadline-bounded public discovery workflow for opportunities."""
@@ -7746,6 +7747,8 @@ def _orchestrate_public_full_market_research_payload(
     }
     if excluded_code_reasons:
         discovery_kwargs["excluded_code_reasons"] = excluded_code_reasons
+    if board_exclusion_reasons:
+        discovery_kwargs["board_exclusion_reasons"] = board_exclusion_reasons
     if star_market_exclusion_reason:
         discovery_kwargs[
             "star_market_exclusion_reason"
@@ -7875,6 +7878,7 @@ def _build_public_full_market_research_payload(
     external_risk_level: Optional[str] = None,
     database_status: Optional[Dict[str, Any]] = None,
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     discovery_state: Dict[str, Any] = {}
@@ -7885,6 +7889,7 @@ def _build_public_full_market_research_payload(
             database_status=database_status,
             discovery_state=discovery_state,
             excluded_code_reasons=excluded_code_reasons,
+            board_exclusion_reasons=board_exclusion_reasons,
             star_market_exclusion_reason=star_market_exclusion_reason,
         )
     except CLIError as exc:
@@ -7920,6 +7925,7 @@ def run_public_full_market_research(
     *,
     external_risk_level: Optional[str] = None,
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
+    board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the account-independent full-market research workflow.
@@ -7933,6 +7939,7 @@ def run_public_full_market_research(
         context=context,
         external_risk_level=external_risk_level,
         excluded_code_reasons=excluded_code_reasons,
+        board_exclusion_reasons=board_exclusion_reasons,
         star_market_exclusion_reason=star_market_exclusion_reason,
         database_status={
             "status": "not_required",

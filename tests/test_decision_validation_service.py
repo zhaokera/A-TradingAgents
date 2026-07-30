@@ -485,6 +485,49 @@ async def test_breakout_condition_order_requires_verified_separate_trigger_capab
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("permission", "expected_reason"),
+    [
+        (None, "beijing_stock_exchange_permission_unverified"),
+        (
+            {"verified": True, "tradable": False},
+            "beijing_stock_exchange_permission_denied",
+        ),
+    ],
+)
+async def test_actionable_beijing_selection_requires_verified_permission(
+    permission,
+    expected_reason,
+):
+    capabilities = _packet()["execution_capabilities"]
+    if permission is not None:
+        capabilities["market_permissions"] = {
+            "beijing_stock_exchange": permission
+        }
+    packet = _packet(
+        candidates=[_candidate("920493")],
+        execution_capabilities=capabilities,
+    )
+
+    result = await DecisionValidationService().validate_document(
+        "owner-1",
+        _proposal(
+            selections=[
+                _selection(
+                    "920493",
+                    action="buy_now",
+                    entry_strategy="pullback",
+                )
+            ]
+        ),
+        packet,
+        now=NOW,
+    )
+
+    assert expected_reason in _failure_codes(result)
+
+
+@pytest.mark.asyncio
 async def test_action_scoped_hard_constraint_blocks_matching_action():
     candidate = _candidate(
         hard_constraints=[

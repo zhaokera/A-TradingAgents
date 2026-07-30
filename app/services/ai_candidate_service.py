@@ -18,6 +18,14 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.database import get_mongo_db
 from app.models.notification import NotificationCreate
+from app.services.a_share_permissions import (
+    BSE_PERMISSION_KEY,
+    STAR_PERMISSION_KEY,
+    board_exclusion_reasons,
+    classify_a_share_board,
+    normalize_market_permissions,
+    permission_for_code,
+)
 from app.services.candidate_research_pipeline import run_candidate_research
 from app.services.favorites_service import FavoritesService, favorites_service
 from app.services.investment_policy import (
@@ -149,6 +157,18 @@ def _normalized_code_set(value: Any) -> set[str]:
     }
 
 
+def _governance_market_permissions(
+    governance: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    raw = governance.get("market_permissions")
+    if not isinstance(raw, Mapping):
+        raw = {
+            STAR_PERMISSION_KEY: governance.get(STAR_PERMISSION_KEY),
+            BSE_PERMISSION_KEY: governance.get(BSE_PERMISSION_KEY),
+        }
+    return normalize_market_permissions(raw)
+
+
 def _candidate_governance_reason(
     code: Any,
     governance: Mapping[str, Any],
@@ -156,16 +176,11 @@ def _candidate_governance_reason(
     normalized = str(code or "").strip()
     if normalized in _normalized_code_set(governance.get("excluded_codes")):
         return "user_excluded"
-    if normalized.startswith(("688", "689")):
-        star = governance.get("star_market")
-        star = star if isinstance(star, Mapping) else {}
-        if star.get("eligible") is not True:
-            return (
-                "star_market_permission_denied"
-                if star.get("verified") is True
-                else "star_market_permission_unverified"
-            )
-    return None
+    permission = permission_for_code(
+        normalized,
+        _governance_market_permissions(governance),
+    )
+    return permission.get("exclusion_reason_code")
 
 
 def _candidate_governance_from_settings(
@@ -178,19 +193,20 @@ def _candidate_governance_from_settings(
     market_permissions = (
         market_permissions if isinstance(market_permissions, Mapping) else {}
     )
-    star = market_permissions.get("star_market")
-    star = star if isinstance(star, Mapping) else {}
-    star_verified = star.get("verified") is True
-    star_tradable = star.get("tradable") is True
+    normalized_market_permissions = normalize_market_permissions(
+        market_permissions
+    )
     return {
         "excluded_codes": sorted(
             _normalized_code_set(settings.get("excluded_codes"))
         ),
-        "star_market": {
-            "verified": star_verified,
-            "tradable": star_tradable,
-            "eligible": star_verified and star_tradable,
-        },
+        "market_permissions": normalized_market_permissions,
+        STAR_PERMISSION_KEY: deepcopy(
+            normalized_market_permissions[STAR_PERMISSION_KEY]
+        ),
+        BSE_PERMISSION_KEY: deepcopy(
+            normalized_market_permissions[BSE_PERMISSION_KEY]
+        ),
     }
 
 
@@ -987,9 +1003,8 @@ class AICandidateService:
         governance_excluded_codes = _normalized_code_set(
             governance.get("excluded_codes")
         )
-        star_governance = governance.get("star_market")
-        star_governance = (
-            star_governance if isinstance(star_governance, Mapping) else {}
+        governance_market_permissions = _governance_market_permissions(
+            governance
         )
         candidate_discovery = result.get("candidate_discovery")
         candidate_discovery = (
@@ -1015,15 +1030,14 @@ class AICandidateService:
                 continue
             if code in governance_excluded_codes:
                 reason = "user_excluded"
-            elif code.startswith(("688", "689")):
-                reason = (
-                    "star_market_permission_denied"
-                    if star_governance.get("verified") is True
-                    else "star_market_permission_unverified"
-                )
             else:
+                permission_reason = permission_for_code(
+                    code,
+                    governance_market_permissions,
+                ).get("exclusion_reason_code")
                 reason = str(
-                    item.get("reason_code")
+                    permission_reason
+                    or item.get("reason_code")
                     or item.get("governance_reason")
                     or "governance_excluded"
                 )
@@ -1035,9 +1049,7 @@ class AICandidateService:
                 {
                     "code": code,
                     "name": str(item.get("name") or code),
-                    "board": (
-                        "STAR" if code.startswith(("688", "689")) else "A_SHARE"
-                    ),
+                    "board": classify_a_share_board(code)["board"],
                     "reason_code": reason,
                 }
             )
@@ -1234,14 +1246,16 @@ class AICandidateService:
                 code: "user_excluded"
                 for code in governance.get("excluded_codes") or []
             }
-        if accepts_kwargs or "star_market_exclusion_reason" in parameters:
-            star = governance.get("star_market")
-            star = star if isinstance(star, Mapping) else {}
-            if star.get("eligible") is not True:
+        exclusion_reasons = board_exclusion_reasons(
+            _governance_market_permissions(governance)
+        )
+        if accepts_kwargs or "board_exclusion_reasons" in parameters:
+            kwargs["board_exclusion_reasons"] = exclusion_reasons
+        elif "star_market_exclusion_reason" in parameters:
+            star_reason = exclusion_reasons.get("STAR")
+            if star_reason:
                 kwargs["star_market_exclusion_reason"] = (
-                    "star_market_permission_denied"
-                    if star.get("verified") is True
-                    else "star_market_permission_unverified"
+                    star_reason
                 )
         result = await run_in_threadpool(self._research_runner, **kwargs)
         return dict(result) if isinstance(result, Mapping) else {}
@@ -1304,7 +1318,15 @@ class AICandidateService:
         document["candidates"] = permitted
         document["governance"] = {
             "excluded_codes": list(governance.get("excluded_codes") or []),
-            "star_market": deepcopy(dict(governance.get("star_market") or {})),
+            "market_permissions": deepcopy(
+                _governance_market_permissions(governance)
+            ),
+            STAR_PERMISSION_KEY: deepcopy(
+                _governance_market_permissions(governance)[STAR_PERMISSION_KEY]
+            ),
+            BSE_PERMISSION_KEY: deepcopy(
+                _governance_market_permissions(governance)[BSE_PERMISSION_KEY]
+            ),
             "excluded_count": len(existing_excluded),
             "execution_scope": "candidate_research_only",
         }
@@ -1347,14 +1369,21 @@ class AICandidateService:
         exposure_pct = (
             total_holding_cost / total_assets * 100 if total_assets > 0 else 0.0
         )
+        raw_execution_capabilities = deepcopy(
+            (settings_doc or {}).get("execution_capabilities") or {}
+        )
+        raw_market_permissions = raw_execution_capabilities.get(
+            "market_permissions"
+        )
+        raw_execution_capabilities["market_permissions"] = (
+            normalize_market_permissions(raw_market_permissions)
+        )
         return {
             "total_assets": round(total_assets, 2),
             "available_cash": round(available_cash, 2),
             "current_exposure_pct": round(exposure_pct, 2),
             "holding_values": holding_values,
-            "execution_capabilities": deepcopy(
-                (settings_doc or {}).get("execution_capabilities") or {}
-            ),
+            "execution_capabilities": raw_execution_capabilities,
             "excluded_codes": sorted(
                 _normalized_code_set((settings_doc or {}).get("excluded_codes"))
             ),
@@ -2011,6 +2040,9 @@ class AICandidateService:
                     run_id=str(document["_id"]),
                     generated_at=now,
                     max_auto_candidates=5,
+                    market_permissions=_governance_market_permissions(
+                        governance
+                    ),
                 )
                 document["auto_favorites"] = auto_favorites
                 await db["ai_candidate_runs"].update_one(
