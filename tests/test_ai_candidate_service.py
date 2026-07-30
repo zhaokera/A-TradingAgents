@@ -977,7 +977,14 @@ async def test_background_job_keeps_discovery_stage_from_error_details():
 
 
 @pytest.mark.asyncio
-async def test_background_job_retries_technical_timeout_once(monkeypatch):
+@pytest.mark.parametrize(
+    "retryable_code",
+    ["technical_deep_check_timeout", "TechnicalHistoryFetchError"],
+)
+async def test_background_job_retries_transient_technical_failure_once(
+    monkeypatch,
+    retryable_code,
+):
     job_id = ObjectId()
     jobs = SimpleNamespace(update_one=AsyncMock())
     db = MagicMock()
@@ -992,7 +999,7 @@ async def test_background_job_retries_technical_timeout_once(monkeypatch):
         side_effect=[
             CLIError(
                 "公开候选技术初筛超时",
-                code="technical_deep_check_timeout",
+                code=retryable_code,
                 exit_code=4,
                 stage="technical_deep_check",
             ),
@@ -1020,7 +1027,7 @@ async def test_background_job_retries_technical_timeout_once(monkeypatch):
     assert completed["attempts"] == [
         {
             "attempt": 1,
-            "code": "technical_deep_check_timeout",
+            "code": retryable_code,
             "stage": "technical_deep_check",
         }
     ]
