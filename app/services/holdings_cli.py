@@ -7888,6 +7888,17 @@ def _build_public_full_market_research_payload(
             star_market_exclusion_reason=star_market_exclusion_reason,
         )
     except CLIError as exc:
+        if exc.code == "TechnicalHistoryFetchError":
+            raise CLIError(
+                exc.message,
+                code=exc.code,
+                exit_code=exc.exit_code,
+                stage=exc.stage,
+                details=_public_discovery_failure_details(
+                    exc,
+                    discovery_state.get("result"),
+                ),
+            ) from exc
         if exc.code in {
             "stage_timeout",
             "technical_deep_check_timeout",

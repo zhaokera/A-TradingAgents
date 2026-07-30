@@ -6876,6 +6876,43 @@ def test_opportunities_command_normalizes_public_deep_check_failure_details(monk
     assert discovery["candidate_discovery"] == expected_candidate_discovery
 
 
+def test_public_builder_preserves_retryable_technical_history_failure(monkeypatch):
+    context = make_opportunity_market_context(
+        public_snapshot_fetcher=lambda **_kwargs: {
+            "status": "ok",
+            "source": "akshare.sina.stock_zh_a_spot",
+            "rows": [],
+        }
+    )
+    discovery = _make_public_research_discovery(candidate_count=1)
+    monkeypatch.setattr(
+        holdings_cli_module,
+        "discover_public_candidate_universe",
+        lambda *_args, **_kwargs: deepcopy(discovery),
+    )
+    monkeypatch.setattr(
+        holdings_cli_module,
+        "run_public_candidate_technical_funnel",
+        lambda *_args, **_kwargs: {
+            "status": "technical_deep_check_failed",
+            "candidates": [],
+            "error_type": "TechnicalHistoryFetchError",
+        },
+    )
+
+    with pytest.raises(CLIError) as caught:
+        holdings_cli_module._build_public_full_market_research_payload(
+            context=context,
+            database_status={"status": "unavailable"},
+        )
+
+    assert caught.value.code == "TechnicalHistoryFetchError"
+    assert caught.value.stage == "technical_deep_check"
+    assert caught.value.details["candidate_discovery"] == (
+        discovery["candidate_discovery"]
+    )
+
+
 def test_complete_public_scan_with_no_candidates_is_stdout_success(monkeypatch):
     snapshot = _make_complete_public_snapshot(amount=1.0)
     snapshot_calls = []

@@ -46,7 +46,10 @@ AI_CANDIDATE_RESEARCH_MAX_ATTEMPTS = 2
 AI_CANDIDATE_RETRY_BACKOFF_SECONDS = 1.0
 _A_SHARE_CODE = re.compile(r"^[0-9]{6}$")
 logger = logging.getLogger(__name__)
-_RETRYABLE_RESEARCH_CODES = {"technical_deep_check_timeout"}
+_RETRYABLE_RESEARCH_CODES = {
+    "technical_deep_check_timeout",
+    "TechnicalHistoryFetchError",
+}
 
 _BLOCKING_RISK_SEVERITIES = {"error", "critical", "blocker", "blocked"}
 _BLOCKING_RISK_CODES = {
