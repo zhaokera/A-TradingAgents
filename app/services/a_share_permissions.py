@@ -8,15 +8,18 @@ from typing import Any, Dict, Mapping, Optional
 
 STAR_BOARD = "STAR"
 BSE_BOARD = "BSE"
+CHINEXT_BOARD = "CHINEXT"
 A_SHARE_BOARD = "A_SHARE"
 
 STAR_PERMISSION_KEY = "star_market"
 BSE_PERMISSION_KEY = "beijing_stock_exchange"
+CHINEXT_PERMISSION_KEY = "chi_next_market"
 
 _BSE_PREFIXES = ("43", "83", "87", "88", "92")
 _RESTRICTED_PERMISSION_BY_BOARD = {
     STAR_BOARD: STAR_PERMISSION_KEY,
     BSE_BOARD: BSE_PERMISSION_KEY,
+    CHINEXT_BOARD: CHINEXT_PERMISSION_KEY,
 }
 _CODE_PATTERNS = (
     re.compile(r"(?:SH|SZ|BJ)\.?([0-9]{1,6})", re.IGNORECASE),
@@ -40,6 +43,8 @@ def classify_a_share_board(value: Any) -> Dict[str, Optional[str]]:
         board = STAR_BOARD
     elif code.startswith(_BSE_PREFIXES):
         board = BSE_BOARD
+    elif code.isdigit() and 300000 <= int(code) <= 309999:
+        board = CHINEXT_BOARD
     else:
         board = A_SHARE_BOARD
     return {
@@ -54,7 +59,7 @@ def _normalize_permission_entry(value: Any) -> Dict[str, Any]:
     verified = entry.get("verified") is True
     tradable = entry.get("tradable") is True
     eligible = verified and tradable
-    return {
+    result = {
         "verified": verified,
         "tradable": tradable,
         "eligible": eligible,
@@ -66,6 +71,10 @@ def _normalize_permission_entry(value: Any) -> Dict[str, Any]:
             else "permission_unverified"
         ),
     }
+    for field in ("source", "updated_by", "updated_at"):
+        if entry.get(field) not in (None, ""):
+            result[field] = entry[field]
+    return result
 
 
 def normalize_market_permissions(value: Any) -> Dict[str, Dict[str, Any]]:
@@ -76,6 +85,9 @@ def normalize_market_permissions(value: Any) -> Dict[str, Dict[str, Any]]:
         ),
         BSE_PERMISSION_KEY: _normalize_permission_entry(
             permissions.get(BSE_PERMISSION_KEY)
+        ),
+        CHINEXT_PERMISSION_KEY: _normalize_permission_entry(
+            permissions.get(CHINEXT_PERMISSION_KEY)
         ),
     }
 

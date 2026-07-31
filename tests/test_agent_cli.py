@@ -128,6 +128,69 @@ def test_briefing_today_calls_unified_backend_contract(fake_client: FakeClient) 
     assert fake_client.calls[0]["params"] == {"refresh": "false"}
 
 
+def test_account_permissions_calls_authenticated_backend(fake_client: FakeClient) -> None:
+    result = runner.invoke(agent_cli.app, ["account", "permissions"])
+
+    assert result.exit_code == 0
+    assert fake_client.calls[0] == {
+        "method": "GET",
+        "path": "/api/holdings/market-permissions",
+        "params": None,
+        "payload": None,
+        "timeout_seconds": None,
+    }
+
+
+def test_account_set_permission_requires_confirmation(
+    fake_client: FakeClient,
+) -> None:
+    result = runner.invoke(
+        agent_cli.app,
+        [
+            "account",
+            "set-permission",
+            "--market",
+            "chi_next_market",
+            "--state",
+            "denied",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert fake_client.calls == []
+    assert json.loads(result.stderr)["error"]["code"] == (
+        "confirmation_required"
+    )
+
+
+def test_account_set_permission_updates_one_supported_market(
+    fake_client: FakeClient,
+) -> None:
+    result = runner.invoke(
+        agent_cli.app,
+        [
+            "account",
+            "set-permission",
+            "--market",
+            "chi_next_market",
+            "--state",
+            "denied",
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert fake_client.calls[0] == {
+        "method": "PATCH",
+        "path": (
+            "/api/holdings/market-permissions/chi_next_market"
+        ),
+        "params": None,
+        "payload": {"state": "denied"},
+        "timeout_seconds": None,
+    }
+
+
 def test_decision_today_calls_authenticated_backend_contract(fake_client: FakeClient) -> None:
     result = runner.invoke(agent_cli.app, ["decision", "today", "--no-refresh"])
 

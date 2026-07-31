@@ -198,6 +198,51 @@ def test_discovery_prefilters_beijing_exchange_before_tencent_review():
     )
 
 
+def test_discovery_prefilters_chinext_before_tencent_review():
+    snapshot = _snapshot(
+        [
+            _row("300450", name="先导智能", amount=900_000_000.0),
+            _row("002171", name="楚江新材", amount=700_000_000.0),
+        ]
+    )
+    requested = []
+
+    def fetch_quotes(codes):
+        requested.extend(codes)
+        definitions = rank_public_candidate_universe(
+            [_row(code, amount=700_000_000.0) for code in codes],
+            benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        )["definitions"]
+        return {
+            "status": "ok",
+            "requested_codes": list(codes),
+            "rows": [_quote(definition) for definition in definitions],
+        }
+
+    result = discover_public_candidate_universe(
+        snapshot,
+        fetch_quotes=fetch_quotes,
+        now=NOW,
+        board_exclusion_reasons={
+            "CHINEXT": "chi_next_market_permission_denied"
+        },
+    )
+
+    assert "300450" not in requested
+    assert "002171" in requested
+    audit = result["candidate_discovery"]
+    exclusion_by_code = {
+        item["code"]: item
+        for item in audit["permission_prefilter_excluded"]
+    }
+    assert exclusion_by_code["300450"] == {
+        "code": "300450",
+        "name": "先导智能",
+        "board": "CHINEXT",
+        "reason_code": "chi_next_market_permission_denied",
+    }
+
+
 def _tencent_quote_payload(
     definition,
     *,
