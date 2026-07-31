@@ -1,6 +1,6 @@
 import asyncio
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from bson import ObjectId
@@ -10,14 +10,18 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.database import get_mongo_db, get_mongo_db_sync
 from app.core.response import ok
+from app.models.operation_log import ActionType
 from app.routers.auth_db import get_current_user
 from app.routers.paper import _detect_market_and_code, _get_last_price
+from app.services.ai_candidate_service import ai_candidate_service
 from app.services.holding_ai_advice import (
     apply_holding_price_guardrails,
     build_holding_ai_advice,
     build_holding_report_advice,
 )
 from app.services.holding_price_guardrails import build_technical_price_plan
+from app.services.market_permission_service import market_permission_service
+from app.services.operation_log_service import log_operation
 from app.services.portfolio_target_analysis import build_target_analysis
 from app.services.tencent_quote_service import (
     assess_cn_quote_freshness,
@@ -66,6 +70,10 @@ class HoldingUpdateRequest(BaseModel):
 
 class HoldingSettingsUpdateRequest(BaseModel):
     total_assets: Optional[float] = Field(default=None, ge=0, description="账户总资产")
+
+
+class MarketPermissionUpdateRequest(BaseModel):
+    state: Literal["allowed", "denied", "unverified"]
 
 
 class HoldingSaleRequest(BaseModel):
@@ -493,6 +501,64 @@ async def update_holding_settings(
     )
     settings = await db["user_holding_settings"].find_one({"user_id": current_user["id"]})
     return ok({"settings": _build_settings_payload(settings)}, "设置已保存")
+
+
+@router.get("/market-permissions", response_model=dict)
+async def get_market_permissions(
+    current_user: dict = Depends(get_current_user),
+):
+    data = await market_permission_service.get(str(current_user["id"]))
+    return ok(data, "账户交易权限已读取")
+
+
+@router.patch("/market-permissions/{permission_key}", response_model=dict)
+async def update_market_permission(
+    permission_key: Literal[
+        "star_market",
+        "chi_next_market",
+        "beijing_stock_exchange",
+    ],
+    payload: MarketPermissionUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        data = await market_permission_service.update(
+            str(current_user["id"]),
+            username=str(current_user.get("username") or ""),
+            permission_key=permission_key,
+            state=payload.state,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        data["governance_reconciliation"] = (
+            await ai_candidate_service.reconcile_user_governance(
+                str(current_user["id"])
+            )
+        )
+    except Exception as exc:
+        data["governance_reconciliation"] = {
+            "status": "failed",
+            "fail_closed": True,
+            "error_type": type(exc).__name__,
+        }
+    try:
+        await log_operation(
+            user_id=str(current_user["id"]),
+            username=str(current_user.get("username") or ""),
+            action_type=ActionType.SYSTEM_SETTINGS,
+            action="update_market_permission",
+            details={
+                "audit_id": data.get("audit", {}).get("audit_id"),
+                "permission_key": permission_key,
+                "state": payload.state,
+                "source": "user_confirmed",
+            },
+        )
+    except Exception:
+        # The atomic audit is embedded in user_holding_settings.
+        pass
+    return ok(data, "账户交易权限已更新")
 
 
 @router.post("/", response_model=dict)

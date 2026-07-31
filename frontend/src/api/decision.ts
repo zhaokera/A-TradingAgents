@@ -113,6 +113,13 @@ export interface DecisionResearchPacket {
         eligible?: boolean
         reason_code?: 'permission_unverified' | 'permission_denied' | null
       }
+      chi_next_market?: {
+        verified?: boolean
+        tradable?: boolean
+        eligible?: boolean
+        reason_code?: 'permission_unverified' | 'permission_denied' | null
+        source?: string
+      }
     }
   }
   market: {

@@ -65,6 +65,8 @@ MAINTAINED_ROOT_TESTS = {
     "test_investment_policy.py",
     "test_logging_manager.py",
     "test_market_session_policy_service.py",
+    "test_market_permission_service.py",
+    "test_market_permissions_router.py",
     "test_portfolio_diversification_service.py",
     "test_portfolio_target_analysis.py",
     "test_premarket_intelligence_service.py",

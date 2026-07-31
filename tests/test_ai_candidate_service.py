@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1368,6 +1369,10 @@ async def test_research_entry_receives_all_restricted_board_prefilters():
                     "verified": False,
                     "tradable": False,
                 },
+                "chi_next_market": {
+                    "verified": True,
+                    "tradable": False,
+                },
             },
         }
     )
@@ -1378,6 +1383,7 @@ async def test_research_entry_receives_all_restricted_board_prefilters():
         "board_exclusion_reasons": {
             "STAR": "star_market_permission_denied",
             "BSE": "beijing_stock_exchange_permission_unverified",
+            "CHINEXT": "chi_next_market_permission_denied",
         },
     }
 
@@ -1471,6 +1477,129 @@ def test_governance_stops_beijing_exchange_shadow_plans(
     assert excluded[0]["performance"]["shadow_trade"]["status"] == (
         "stopped_governance"
     )
+
+
+def test_governance_stops_chinext_shadow_plan_and_preserves_audit():
+    document = {
+        "candidates": [
+            {
+                "code": "300450",
+                "name": "先导智能",
+                "performance": {"shadow_trade": {"status": "active"}},
+            },
+            {
+                "code": "002171",
+                "performance": {"shadow_trade": {"status": "active"}},
+            },
+        ]
+    }
+
+    AICandidateService._apply_candidate_governance(
+        document,
+        {
+            "excluded_codes": [],
+            "chi_next_market": {
+                "verified": True,
+                "tradable": False,
+                "eligible": False,
+            },
+        },
+    )
+
+    assert [item["code"] for item in document["candidates"]] == ["002171"]
+    excluded = document["governance_excluded_candidates"]
+    assert excluded[0]["code"] == "300450"
+    assert excluded[0]["governance_reason"] == (
+        "chi_next_market_permission_denied"
+    )
+    assert excluded[0]["execution_actionable"] is False
+    assert excluded[0]["performance"]["shadow_trade"]["status"] == (
+        "stopped_governance"
+    )
+
+
+@pytest.mark.asyncio
+async def test_permission_change_reconciles_active_runs_and_auto_favorites():
+    generated_at = datetime(2026, 7, 31, 1, 0, tzinfo=timezone.utc)
+    run = {
+        "_id": ObjectId(),
+        "user_id": "owner-1",
+        "generated_at": generated_at,
+        "expires_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
+        "candidates": [
+            {
+                "code": "300450",
+                "name": "先导智能",
+                "performance": {"shadow_trade": {"status": "active"}},
+            },
+            {
+                "code": "002171",
+                "name": "楚江新材",
+                "actionability": "watch_trigger",
+                "can_add_to_favorites": True,
+            },
+        ],
+    }
+    cursor = SimpleNamespace(
+        sort=lambda *_args, **_kwargs: cursor,
+        to_list=AsyncMock(return_value=[deepcopy(run)]),
+    )
+    runs = SimpleNamespace(
+        find=MagicMock(return_value=cursor),
+        update_one=AsyncMock(),
+    )
+    settings = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "user_id": "owner-1",
+                "execution_capabilities": {
+                    "source": "user_confirmed",
+                    "market_permissions": {
+                        "chi_next_market": {
+                            "verified": True,
+                            "tradable": False,
+                            "source": "user_confirmed",
+                        }
+                    },
+                },
+            }
+        )
+    )
+    db = MagicMock()
+    db.__getitem__.side_effect = lambda name: {
+        "ai_candidate_runs": runs,
+        "user_holding_settings": settings,
+    }[name]
+    favorites = SimpleNamespace(
+        sync_auto_ai_candidates=AsyncMock(
+            return_value={
+                "removed_codes": ["300450"],
+                "selected_codes": ["002171"],
+            }
+        )
+    )
+    service = AICandidateService(
+        favorites=favorites,
+        quotes=SimpleNamespace(),
+    )
+    service.db = db
+
+    result = await service.reconcile_user_governance("owner-1")
+
+    assert result["active_run_count"] == 1
+    assert result["excluded_count"] == 1
+    update = runs.update_one.await_args.args[1]["$set"]
+    assert [item["code"] for item in update["candidates"]] == ["002171"]
+    excluded = update["governance_excluded_candidates"]
+    assert excluded[0]["code"] == "300450"
+    assert excluded[0]["governance_reason"] == (
+        "chi_next_market_permission_denied"
+    )
+    sync_kwargs = favorites.sync_auto_ai_candidates.await_args.kwargs
+    assert [item["code"] for item in sync_kwargs["candidates"]] == ["002171"]
+    assert sync_kwargs["market_permissions"]["chi_next_market"][
+        "eligible"
+    ] is False
 
 
 @pytest.mark.asyncio

@@ -695,6 +695,77 @@ async def test_verified_beijing_permission_keeps_candidate_in_decision_scope():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("permission", "reason_code"),
+    [
+        (None, "chi_next_market_permission_unverified"),
+        (
+            {"verified": True, "tradable": False},
+            "chi_next_market_permission_denied",
+        ),
+    ],
+)
+async def test_chinext_permission_prefilters_candidate_before_decision(
+    permission,
+    reason_code,
+):
+    briefing = _briefing()
+    if permission is not None:
+        briefing["account"]["execution_capabilities"] = {
+            "market_permissions": {
+                "chi_next_market": permission,
+            }
+        }
+
+    packet = await _service(
+        run=_run([_candidate(code="300450", name="先导智能")]),
+        briefing=briefing,
+    ).today("user-1", now=NOW)
+
+    assert not packet["avoid"]
+    assert not packet["wait"]
+    assert not packet["buy_now"]
+    assert not packet["condition_order"]
+    assert packet["permission_prefilter_excluded"] == [
+        {
+            "code": "300450",
+            "name": "先导智能",
+            "board": "CHINEXT",
+            "reason_code": reason_code,
+        }
+    ]
+    permission_result = packet["execution_capabilities"][
+        "market_permissions"
+    ]["chi_next_market"]
+    assert permission_result["eligible"] is False
+    assert permission_result["reason_code"] in {
+        "permission_unverified",
+        "permission_denied",
+    }
+
+
+@pytest.mark.asyncio
+async def test_verified_chinext_permission_keeps_candidate_in_decision_scope():
+    briefing = _briefing()
+    briefing["account"]["execution_capabilities"] = {
+        "market_permissions": {
+            "chi_next_market": {
+                "verified": True,
+                "tradable": True,
+            }
+        }
+    }
+
+    packet = await _service(
+        run=_run([_candidate(code="300450", name="先导智能")]),
+        briefing=briefing,
+    ).today("user-1", now=NOW)
+
+    assert packet["permission_prefilter_excluded"] == []
+    assert sum(len(packet[bucket]) for bucket in ("avoid", "wait", "buy_now")) == 1
+
+
+@pytest.mark.asyncio
 async def test_decision_propagates_candidate_run_permission_audit():
     run = _run([_candidate()])
     run["permission_prefilter_excluded"] = [

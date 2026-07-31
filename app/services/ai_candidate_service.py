@@ -20,6 +20,7 @@ from app.core.database import get_mongo_db
 from app.models.notification import NotificationCreate
 from app.services.a_share_permissions import (
     BSE_PERMISSION_KEY,
+    CHINEXT_PERMISSION_KEY,
     STAR_PERMISSION_KEY,
     board_exclusion_reasons,
     classify_a_share_board,
@@ -165,6 +166,9 @@ def _governance_market_permissions(
         raw = {
             STAR_PERMISSION_KEY: governance.get(STAR_PERMISSION_KEY),
             BSE_PERMISSION_KEY: governance.get(BSE_PERMISSION_KEY),
+            CHINEXT_PERMISSION_KEY: governance.get(
+                CHINEXT_PERMISSION_KEY
+            ),
         }
     return normalize_market_permissions(raw)
 
@@ -200,12 +204,16 @@ def _candidate_governance_from_settings(
         "excluded_codes": sorted(
             _normalized_code_set(settings.get("excluded_codes"))
         ),
+        "source": str(capabilities.get("source") or "unverified"),
         "market_permissions": normalized_market_permissions,
         STAR_PERMISSION_KEY: deepcopy(
             normalized_market_permissions[STAR_PERMISSION_KEY]
         ),
         BSE_PERMISSION_KEY: deepcopy(
             normalized_market_permissions[BSE_PERMISSION_KEY]
+        ),
+        CHINEXT_PERMISSION_KEY: deepcopy(
+            normalized_market_permissions[CHINEXT_PERMISSION_KEY]
         ),
     }
 
@@ -1318,6 +1326,7 @@ class AICandidateService:
         document["candidates"] = permitted
         document["governance"] = {
             "excluded_codes": list(governance.get("excluded_codes") or []),
+            "source": str(governance.get("source") or "unverified"),
             "market_permissions": deepcopy(
                 _governance_market_permissions(governance)
             ),
@@ -1326,6 +1335,11 @@ class AICandidateService:
             ),
             BSE_PERMISSION_KEY: deepcopy(
                 _governance_market_permissions(governance)[BSE_PERMISSION_KEY]
+            ),
+            CHINEXT_PERMISSION_KEY: deepcopy(
+                _governance_market_permissions(governance)[
+                    CHINEXT_PERMISSION_KEY
+                ]
             ),
             "excluded_count": len(existing_excluded),
             "execution_scope": "candidate_research_only",
@@ -2566,6 +2580,103 @@ class AICandidateService:
             await self._apply_account_policy(document, user_id=str(user_id))
             self._update_run_counts(document)
         return self._serialize_run(document)
+
+    async def reconcile_user_governance(
+        self,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """Apply current account permissions to active runs and AI favorites."""
+
+        owner_id = str(user_id)
+        db = await self._get_db()
+        runs = db["ai_candidate_runs"]
+        cursor = runs.find(
+            {
+                "user_id": owner_id,
+                "expires_at": {"$gt": datetime.now(timezone.utc)},
+            }
+        ).sort("generated_at", -1)
+        documents = await cursor.to_list(length=100)
+        governance = await self._candidate_governance(owner_id)
+        market_permissions = _governance_market_permissions(governance)
+        reconciled = 0
+        excluded_count = 0
+        for document in documents:
+            self._apply_candidate_governance(document, governance)
+            self._update_run_counts(document)
+            account = (
+                deepcopy(document.get("account"))
+                if isinstance(document.get("account"), Mapping)
+                else {}
+            )
+            capabilities = (
+                deepcopy(account.get("execution_capabilities"))
+                if isinstance(account.get("execution_capabilities"), Mapping)
+                else {}
+            )
+            capabilities["source"] = str(
+                governance.get("source") or "unverified"
+            )
+            capabilities["market_permissions"] = deepcopy(
+                market_permissions
+            )
+            account["execution_capabilities"] = capabilities
+            document["account"] = account
+            document["updated_at"] = datetime.now(timezone.utc)
+            excluded = document.get("governance_excluded_candidates")
+            excluded = excluded if isinstance(excluded, list) else []
+            excluded_count += len(excluded)
+            await runs.update_one(
+                {"_id": document["_id"], "user_id": owner_id},
+                {
+                    "$set": {
+                        "candidates": deepcopy(document.get("candidates") or []),
+                        "candidate_count": document["candidate_count"],
+                        "actionability_counts": deepcopy(
+                            document["actionability_counts"]
+                        ),
+                        "account": account,
+                        "governance": deepcopy(document.get("governance") or {}),
+                        "governance_excluded_candidates": deepcopy(excluded),
+                        "updated_at": document["updated_at"],
+                    }
+                },
+            )
+            reconciled += 1
+
+        latest = documents[0] if documents else None
+        sync = getattr(self._favorites, "sync_auto_ai_candidates", None)
+        favorites_result: Dict[str, Any] = {"status": "not_supported"}
+        if callable(sync):
+            generated_at = (
+                latest.get("generated_at")
+                if isinstance(latest, Mapping)
+                and isinstance(latest.get("generated_at"), datetime)
+                else datetime.now(timezone.utc)
+            )
+            favorites_result = await sync(
+                owner_id,
+                candidates=(
+                    deepcopy(latest.get("candidates") or [])
+                    if isinstance(latest, Mapping)
+                    else []
+                ),
+                run_id=(
+                    str(latest.get("_id") or "")
+                    if isinstance(latest, Mapping)
+                    else ""
+                ),
+                generated_at=generated_at,
+                max_auto_candidates=5,
+                market_permissions=market_permissions,
+            )
+        return {
+            "status": "reconciled",
+            "active_run_count": reconciled,
+            "excluded_count": excluded_count,
+            "market_permissions": deepcopy(market_permissions),
+            "auto_favorites": favorites_result,
+        }
 
     async def add_to_favorites(
         self,

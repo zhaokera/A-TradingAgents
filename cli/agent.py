@@ -52,6 +52,7 @@ app = typer.Typer(
 )
 candidates_app = typer.Typer(help="AI 研究候选", no_args_is_help=True)
 auth_app = typer.Typer(help="账号密码登录与 CLI 会话管理", no_args_is_help=True)
+account_app = typer.Typer(help="当前账户交易权限", no_args_is_help=True)
 holdings_app = typer.Typer(
     help="持仓数据 JSON CLI，所有命令均使用账号密码会话",
     no_args_is_help=True,
@@ -68,6 +69,7 @@ decision_app = typer.Typer(help="可审计的每日决策包", no_args_is_help=T
 admin_app = typer.Typer(help="受保护的系统管理 API", no_args_is_help=True)
 
 app.add_typer(auth_app, name="auth")
+app.add_typer(account_app, name="account")
 app.add_typer(holdings_app, name="holdings")
 app.add_typer(candidates_app, name="candidates")
 app.add_typer(favorites_app, name="favorites")
@@ -426,6 +428,63 @@ def auth_logout(ctx: typer.Context) -> None:
         raise typer.Exit(exc.exit_code) from exc
 
 
+@account_app.command("permissions")
+def account_permissions(ctx: typer.Context) -> None:
+    _call_api(ctx, "GET", "/api/holdings/market-permissions")
+
+
+@account_app.command("set-permission")
+def account_set_permission(
+    ctx: typer.Context,
+    market: str = typer.Option(
+        ...,
+        "--market",
+        help=(
+            "star_market、chi_next_market 或 "
+            "beijing_stock_exchange"
+        ),
+    ),
+    state: str = typer.Option(
+        ...,
+        "--state",
+        help="allowed、denied 或 unverified",
+    ),
+    confirm: bool = typer.Option(False, "--confirm"),
+) -> None:
+    market_aliases = {
+        "star": "star_market",
+        "star_market": "star_market",
+        "chinext": "chi_next_market",
+        "gem": "chi_next_market",
+        "chi_next_market": "chi_next_market",
+        "bse": "beijing_stock_exchange",
+        "beijing_stock_exchange": "beijing_stock_exchange",
+    }
+    permission_key = market_aliases.get(market.strip().lower())
+    if permission_key is None:
+        raise typer.BadParameter("不支持的市场权限")
+    normalized_state = state.strip().lower()
+    if normalized_state not in {"allowed", "denied", "unverified"}:
+        raise typer.BadParameter(
+            "权限状态必须是 allowed、denied 或 unverified"
+        )
+    try:
+        _require_confirm(confirm, "更新账户交易权限")
+    except AgentCLIError as exc:
+        _write_json(
+            exc.payload(),
+            pretty=_root_options(ctx).pretty,
+            stderr=True,
+        )
+        raise typer.Exit(exc.exit_code) from exc
+    _call_api(
+        ctx,
+        "PATCH",
+        f"/api/holdings/market-permissions/{permission_key}",
+        payload={"state": normalized_state},
+    )
+
+
 @app.command("health")
 def health(ctx: typer.Context) -> None:
     """检查正在运行的后端。"""
@@ -449,6 +508,7 @@ def capabilities(ctx: typer.Context) -> None:
                 ],
                 "groups": {
                     "auth": ["login", "status", "logout"],
+                    "account": ["permissions", "set-permission"],
                     "holdings": [
                         "list",
                         "summary",
@@ -508,6 +568,7 @@ def capabilities(ctx: typer.Context) -> None:
                 "safety": {
                     "local_api_only_by_default": True,
                     "admin_mutations_require_confirm": True,
+                    "permission_updates_require_confirm": True,
                     "deletions_require_confirm": True,
                     "initial_password_login_required": True,
                     "minimum_session_days": DEFAULT_SESSION_DAYS,

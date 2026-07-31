@@ -528,6 +528,49 @@ async def test_actionable_beijing_selection_requires_verified_permission(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("permission", "expected_reason"),
+    [
+        (None, "chi_next_market_permission_unverified"),
+        (
+            {"verified": True, "tradable": False},
+            "chi_next_market_permission_denied",
+        ),
+    ],
+)
+async def test_actionable_chinext_selection_requires_verified_permission(
+    permission,
+    expected_reason,
+):
+    capabilities = _packet()["execution_capabilities"]
+    if permission is not None:
+        capabilities["market_permissions"] = {
+            "chi_next_market": permission
+        }
+    packet = _packet(
+        candidates=[_candidate("300450")],
+        execution_capabilities=capabilities,
+    )
+
+    result = await DecisionValidationService().validate_document(
+        "owner-1",
+        _proposal(
+            selections=[
+                _selection(
+                    "300450",
+                    action="buy_now",
+                    entry_strategy="pullback",
+                )
+            ]
+        ),
+        packet,
+        now=NOW,
+    )
+
+    assert expected_reason in _failure_codes(result)
+
+
+@pytest.mark.asyncio
 async def test_action_scoped_hard_constraint_blocks_matching_action():
     candidate = _candidate(
         hard_constraints=[

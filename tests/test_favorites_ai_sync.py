@@ -99,6 +99,7 @@ async def test_auto_ai_sync_promotes_only_trackable_candidates_and_preserves_use
     candidates = [
         _candidate("688001", rank_score=100),
         _candidate("920493", rank_score=99),
+        _candidate("300450", rank_score=98),
         _candidate("600001", rank_score=95),
         _candidate("600002", rank_score=90, actionability="blocked", can_add=False),
         _candidate("600003", rank_score=85),
@@ -115,6 +116,10 @@ async def test_auto_ai_sync_promotes_only_trackable_candidates_and_preserves_use
             "star_market": {"verified": False, "tradable": False},
             "beijing_stock_exchange": {
                 "verified": False,
+                "tradable": False,
+            },
+            "chi_next_market": {
+                "verified": True,
                 "tradable": False,
             },
         },
@@ -153,6 +158,7 @@ async def test_auto_ai_sync_promotes_only_trackable_candidates_and_preserves_use
     assert promoted["ai_metadata"]["exchange_trade_time_verified"] is False
     assert "688001" not in by_code
     assert "920493" not in by_code
+    assert "300450" not in by_code
     assert "600002" not in by_code
 
 
@@ -268,3 +274,74 @@ async def test_manual_beijing_favorite_is_permission_blocked_research(
     assert item["market_permission"]["reason_code"] == (
         "permission_unverified"
     )
+
+
+@pytest.mark.asyncio
+async def test_manual_chinext_favorite_is_preserved_as_permission_blocked_research(
+    monkeypatch,
+):
+    user_favorites = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "user_id": "admin-id",
+                "favorites": [
+                    {
+                        "stock_code": "300450",
+                        "stock_name": "先导智能",
+                        "source": "manual",
+                        "tags": ["研究"],
+                        "notes": "用户手工保留",
+                    }
+                ],
+            }
+        )
+    )
+    settings = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "execution_capabilities": {
+                    "market_permissions": {
+                        "chi_next_market": {
+                            "verified": True,
+                            "tradable": False,
+                            "source": "user_confirmed",
+                        }
+                    }
+                }
+            }
+        )
+    )
+    basic_cursor = SimpleNamespace(to_list=AsyncMock(return_value=[]))
+    basic_info = SimpleNamespace(find=MagicMock(return_value=basic_cursor))
+    db = MagicMock()
+    db.user_favorites = user_favorites
+    db.__getitem__.side_effect = lambda name: {
+        "user_holding_settings": settings,
+        "stock_basic_info": basic_info,
+    }[name]
+    quote_service = SimpleNamespace(get_quotes=AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        "app.services.favorites_service.get_quotes_service",
+        lambda: quote_service,
+    )
+    monkeypatch.setattr(
+        "app.core.unified_config.UnifiedConfigManager."
+        "get_data_source_configs_async",
+        AsyncMock(return_value=[]),
+    )
+    service = FavoritesService()
+    service.db = db
+
+    items = await service.get_user_favorites("admin-id")
+
+    assert len(items) == 1
+    item = items[0]
+    assert item["stock_code"] == "300450"
+    assert item["notes"] == "用户手工保留"
+    assert item["source"] == "manual"
+    assert item["execution_actionable"] is False
+    assert item["is_reference_only"] is True
+    assert item["permission_reason_code"] == (
+        "chi_next_market_permission_denied"
+    )
+    assert item["market_permission"]["reason_code"] == "permission_denied"
