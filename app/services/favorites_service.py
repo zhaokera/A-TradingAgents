@@ -15,13 +15,22 @@ from app.services.a_share_permissions import (
     permission_for_code,
 )
 from app.services.quotes_service import get_quotes_service
+from app.services.market_session_policy_service import (
+    MarketSessionPolicyService,
+    market_session_policy_service,
+)
 
 
 class FavoritesService:
     """自选股服务类"""
     
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        market_session: Optional[MarketSessionPolicyService] = None,
+    ):
         self.db = None
+        self.market_session = market_session or market_session_policy_service
     
     async def _get_db(self):
         """获取数据库连接"""
@@ -75,6 +84,9 @@ class FavoritesService:
             "quote_time_semantics": None,
             "exchange_trade_time_verified": False,
             "quote_checked_at": None,
+            "quote_status": "unavailable",
+            "quote_display_usable": False,
+            "quote_tracking_usable": False,
         }
 
     async def get_user_favorites(self, user_id: str) -> List[Dict[str, Any]]:
@@ -190,17 +202,11 @@ class FavoritesService:
             try:
                 quotes_map = await get_quotes_service().get_quotes(codes)
                 checked_at = datetime.utcnow().isoformat() + "Z"
+                session = await self.market_session.classify()
                 for it in items:
                     code = it.get("stock_code")
                     q = quotes_map.get(code)
                     if q:
-                        it["current_price"] = (
-                            q.get("price")
-                            or q.get("close")
-                            or q.get("current_price")
-                        )
-                        it["change_percent"] = q.get("pct_chg")
-                        it["volume"] = q.get("volume")
                         it["quote_source"] = q.get("source") or q.get("data_source") or "fallback"
                         it["quote_trade_at"] = q.get("trade_at")
                         it["quote_provider_updated_at"] = (
@@ -214,6 +220,25 @@ class FavoritesService:
                             q.get("exchange_trade_time_verified") is True
                         )
                         it["quote_checked_at"] = checked_at
+                        quote_policy = await self.market_session.quote_status(
+                            q,
+                            session=session,
+                        )
+                        it["quote_status"] = quote_policy.get("status")
+                        it["quote_display_usable"] = (
+                            quote_policy.get("display_usable") is True
+                        )
+                        it["quote_tracking_usable"] = (
+                            quote_policy.get("tracking_usable") is True
+                        )
+                        if it["quote_display_usable"]:
+                            it["current_price"] = (
+                                q.get("price")
+                                or q.get("close")
+                                or q.get("current_price")
+                            )
+                            it["change_percent"] = q.get("pct_chg")
+                            it["volume"] = q.get("volume")
             except Exception:
                 # 查询失败时保持占位 None，避免影响基础功能
                 pass

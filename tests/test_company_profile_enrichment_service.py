@@ -339,6 +339,64 @@ async def test_akshare_adapter_accepts_industry_alias():
 
 
 @pytest.mark.asyncio
+async def test_akshare_adapter_uses_cninfo_company_profile_as_authoritative_fallback():
+    raw = SimpleNamespace(
+        stock_individual_info_em=lambda **kwargs: pd.DataFrame(
+            [{"item": "所属行业", "value": "半导体"}]
+        ),
+        stock_profile_cninfo=lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "A股代码": "603005",
+                    "A股简称": "晶方科技",
+                    "所属行业": "计算机、通信和其他电子设备制造业",
+                    "主营业务": "集成电路的封装测试业务",
+                    "经营范围": "研发、生产、封装和测试集成电路产品",
+                }
+            ]
+        ),
+    )
+    provider = FakeConnectedProvider(raw=raw)
+
+    documents = await fetch_akshare_profile(
+        "603005", provider_factory=lambda: provider
+    )
+
+    cninfo = next(
+        item for item in documents if item["source_endpoint"] == "stock_profile_cninfo"
+    )
+    assert cninfo["source"] == "cninfo"
+    assert cninfo["main_business"] == "集成电路的封装测试业务"
+    assert cninfo["business_scope"] == "研发、生产、封装和测试集成电路产品"
+    profile = select_evidence_profile("603005", [cninfo], now=datetime.now(timezone.utc))
+    assert profile["provider_sector"] == "信息技术"
+    assert profile["data_quality"]["decision_critical_complete"] is True
+
+
+def test_profile_marks_main_business_as_noncritical_when_sector_and_industry_are_proven():
+    profile = select_evidence_profile(
+        "603005",
+        [
+            evidence_doc(
+                "akshare",
+                "stock_individual_info_em",
+                code="603005",
+                industry="半导体",
+                provider_sector="半导体",
+            )
+        ],
+        now=NOW,
+    )
+
+    assert profile["data_quality"]["complete"] is False
+    assert profile["data_quality"]["decision_critical_complete"] is True
+    assert profile["data_quality"]["decision_critical_missing_fields"] == []
+    assert profile["data_quality"]["noncritical_missing_fields"] == [
+        "main_business"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_akshare_endpoint_errors_are_specific_and_safe():
     raw = SimpleNamespace(
         stock_individual_info_em=lambda **kwargs: (_ for _ in ()).throw(

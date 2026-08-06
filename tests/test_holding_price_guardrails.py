@@ -40,6 +40,8 @@ def test_build_technical_price_plan_uses_exact_indicator_and_rounding_contract()
         "recent_5_low": 94.0,
         "recent_20_low": 94.0,
         "recent_20_high": 121.0,
+        "five_day_return_pct": -16.6667,
+        "rebound_from_5d_low_pct": 6.383,
     }
     assert plan["levels"]["resistance_1"] == 108.6
     assert plan["levels"]["resistance_2"] == 114.3
@@ -66,6 +68,50 @@ def test_build_technical_price_plan_uses_exact_indicator_and_rounding_contract()
         "breakout_mode": "ROUND_CEILING",
         "default_mode": "ROUND_HALF_UP",
     }
+
+
+def test_deep_drawdown_five_day_rebound_requires_fresh_recovery_confirmation():
+    closes = [100.0] * 40 + [
+        110.0,
+        92.0,
+        88.0,
+        84.0,
+        80.0,
+        76.0,
+        72.0,
+        68.0,
+        64.0,
+        60.0,
+        61.0,
+        64.0,
+        67.0,
+        70.0,
+        74.0,
+        76.0,
+        78.0,
+        80.0,
+        82.0,
+        84.0,
+    ]
+    bars = [
+        {
+            "date": f"2026-05-{index + 1:02d}" if index < 31 else f"2026-06-{index - 30:02d}",
+            "open": close,
+            "close": close,
+            "high": close + 1,
+            "low": close - 1,
+        }
+        for index, close in enumerate(closes)
+    ]
+
+    plan = build_pullback_price_plan(bars, current_price=84.0)
+
+    context = plan["trend_context"]
+    assert context["drawdown_from_20d_high_pct"] <= -20.0
+    assert context["five_day_return_pct"] >= 5.0
+    assert context["deep_drawdown_rebound"] is True
+    assert context["recovery_required"] is True
+    assert context["state"] == "deep_drawdown_rebound_unconfirmed"
 
 
 def test_build_pullback_price_plan_uses_support_entry_and_distinct_upside_levels():

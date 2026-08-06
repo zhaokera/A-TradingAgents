@@ -6,6 +6,7 @@ import math
 import re
 from copy import deepcopy
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
@@ -427,7 +428,19 @@ def calculate_candidate_position_sizing(
         }
     existing_symbol_pct = existing_value / assets * 100
     symbol_room_pct = max(0.0, hard_cap_pct - existing_symbol_pct)
-    risk_cap_pct = loss_budget_pct / stop_distance_pct * 100
+    raw_loss_budget = Decimal(str(assets)) * Decimal(str(loss_budget_pct)) / Decimal("100")
+    effective_loss_budget = raw_loss_budget.quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP
+    )
+    risk_budget_precision = {
+        "basis": "stop_price_loss_excluding_fees",
+        "raw_loss_budget_amount": float(raw_loss_budget),
+        "effective_loss_budget_amount": float(effective_loss_budget),
+        "rounding_delta": float(effective_loss_budget - raw_loss_budget),
+        "rounding_unit": "CNY_1",
+        "rounding_mode": "ROUND_HALF_UP",
+    }
+    risk_cap_pct = float(effective_loss_budget) / assets / stop_distance_pct * 10000
     suggested_pct = max(
         0.0,
         min(
@@ -438,20 +451,40 @@ def calculate_candidate_position_sizing(
             cash / assets * 100,
         ),
     )
-    amount_cap = min(cash, assets * suggested_pct / 100)
+    amount_cap = round(min(cash, assets * suggested_pct / 100), 2)
     quantity = math.floor(amount_cap / entry / lot_size) * lot_size
     if quantity <= 0:
+        one_lot_planned_loss = round((entry - stop) * lot_size, 2)
+        one_lot_buy_fee = max(5.0, entry * lot_size * 0.0003)
+        one_lot_stop_proceeds = stop * lot_size
+        one_lot_sell_fee = max(5.0, one_lot_stop_proceeds * 0.0003)
+        one_lot_stamp_duty = one_lot_stop_proceeds * 0.0005
+        one_lot_estimated_fees = round(
+            one_lot_buy_fee + one_lot_sell_fee + one_lot_stamp_duty,
+            2,
+        )
         return {
             "status": "one_lot_unaffordable",
             "reason": "account_or_risk_budget_below_one_lot",
             "lot_size": lot_size,
             "one_lot_amount": round(entry * lot_size, 2),
+            "one_lot_planned_loss": one_lot_planned_loss,
+            "one_lot_estimated_fees": one_lot_estimated_fees,
+            "one_lot_estimated_net_drawdown": round(
+                one_lot_planned_loss + one_lot_estimated_fees, 2
+            ),
             "suggested_position_pct": round(suggested_pct, 2),
             "stop_distance_pct": round(stop_distance_pct, 2),
+            "risk_budget_precision": risk_budget_precision,
         }
 
     amount = round(quantity * entry, 2)
     planned_loss = round(quantity * (entry - stop), 2)
+    buy_fee = max(5.0, entry * quantity * 0.0003)
+    stop_proceeds = stop * quantity
+    sell_fee = max(5.0, stop_proceeds * 0.0003)
+    stamp_duty = stop_proceeds * 0.0005
+    estimated_fees = round(buy_fee + sell_fee + stamp_duty, 2)
     return {
         "status": "sized",
         "lot_size": lot_size,
@@ -459,10 +492,15 @@ def calculate_candidate_position_sizing(
         "suggested_amount": amount,
         "suggested_position_pct": round(amount / assets * 100, 2),
         "planned_loss_amount": planned_loss,
+        "estimated_round_trip_fees_at_stop": estimated_fees,
+        "estimated_net_drawdown_at_stop": round(
+            planned_loss + estimated_fees, 2
+        ),
         "planned_loss_pct_of_assets": round(planned_loss / assets * 100, 2),
         "stop_distance_pct": round(stop_distance_pct, 2),
         "risk_cap_pct": round(risk_cap_pct, 2),
         "symbol_room_pct": round(symbol_room_pct, 2),
+        "risk_budget_precision": risk_budget_precision,
     }
 
 

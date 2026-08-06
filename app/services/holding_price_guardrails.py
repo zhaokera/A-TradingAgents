@@ -23,6 +23,18 @@ PULLBACK_MIN_SELL_UPSIDE_PCT = 2.0
 PULLBACK_MIN_TARGET_UPSIDE_PCT = 5.0
 PULLBACK_PROJECTED_TARGET_UPSIDE_PCT = 6.0
 PULLBACK_MAX_PROJECTED_TARGET_UPSIDE_PCT = 15.0
+PRICE_LEVEL_METRICS = (
+    "ma5",
+    "ma10",
+    "ma20",
+    "ma60",
+    "boll_mid",
+    "boll_upper",
+    "boll_lower",
+    "recent_5_low",
+    "recent_20_low",
+    "recent_20_high",
+)
 
 
 def _number(value: Any) -> Optional[float]:
@@ -96,18 +108,37 @@ def _build_trend_context(
     bearish_short_term_alignment = bool(
         metrics["ma5"] < metrics["ma10"] < metrics["ma20"]
     )
-    recovery_required = bool(
+    five_day_return_pct = float(metrics.get("five_day_return_pct") or 0.0)
+    rebound_from_5d_low_pct = float(
+        metrics.get("rebound_from_5d_low_pct") or 0.0
+    )
+    deep_drawdown_rebound = bool(
+        drawdown_pct <= DEEP_DRAWDOWN_RECOVERY_THRESHOLD_PCT
+        and five_day_return_pct >= 5.0
+        and entry_price < current_price
+    )
+    bearish_recovery_required = bool(
         current_price < metrics["ma5"]
         and bearish_short_term_alignment
         and drawdown_pct <= DEEP_DRAWDOWN_RECOVERY_THRESHOLD_PCT
     )
+    recovery_required = bearish_recovery_required or deep_drawdown_rebound
+    if deep_drawdown_rebound:
+        state = "deep_drawdown_rebound_unconfirmed"
+    elif bearish_recovery_required:
+        state = "recovery_required"
+    else:
+        state = "normal"
     return {
-        "state": "recovery_required" if recovery_required else "normal",
+        "state": state,
         "recovery_required": recovery_required,
+        "deep_drawdown_rebound": deep_drawdown_rebound,
         "bearish_short_term_alignment": bearish_short_term_alignment,
         "below_key_averages": below_key_averages,
         "drawdown_from_20d_high_pct": drawdown_pct,
         "distance_to_entry_pct": distance_to_entry_pct,
+        "five_day_return_pct": five_day_return_pct,
+        "rebound_from_5d_low_pct": rebound_from_5d_low_pct,
         "deep_drawdown_threshold_pct": DEEP_DRAWDOWN_RECOVERY_THRESHOLD_PCT,
     }
 
@@ -158,6 +189,12 @@ def build_technical_price_plan(
         "recent_5_low": _round_metric(min(lows[-5:])),
         "recent_20_low": _round_metric(min(lows[-20:])),
         "recent_20_high": _round_metric(max(highs[-20:])),
+        "five_day_return_pct": _round_metric(
+            (current - closes[-6]) / closes[-6] * 100
+        ),
+        "rebound_from_5d_low_pct": _round_metric(
+            (current - min(lows[-5:])) / min(lows[-5:]) * 100
+        ),
     }
     support_candidates = _ordered_distinct(
         value
@@ -331,9 +368,9 @@ def build_pullback_price_plan(
     )
 
     observed_levels = _ordered_distinct(
-        float(value)
-        for value in metrics.values()
-        if _number(value) is not None and float(value) > entry
+        float(metrics[key])
+        for key in PRICE_LEVEL_METRICS
+        if _number(metrics.get(key)) is not None and float(metrics[key]) > entry
     )
     sell_candidates = [
         value

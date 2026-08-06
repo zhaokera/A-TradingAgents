@@ -546,6 +546,29 @@ async def test_incomplete_real_profile_derives_wait_reason():
 
 
 @pytest.mark.asyncio
+async def test_missing_noncritical_main_business_does_not_block_proven_sector_profile():
+    profile = _profile("000977")
+    profile["main_business"] = None
+    profile["main_business_evidence"] = None
+    profile["data_quality"] = {
+        "complete": False,
+        "missing_fields": ["main_business"],
+        "decision_critical_complete": True,
+        "decision_critical_missing_fields": [],
+        "noncritical_missing_fields": ["main_business"],
+        "provider_errors": [],
+        "profile_conflicts": [],
+    }
+
+    packet = await _service(profiles={"000977": profile}).today(
+        "user-1", now=NOW
+    )
+
+    assert not packet["wait"]
+    assert packet["buy_now"][0]["identity"]["code"] == "000977"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("allocation_reason", "expected_reason"),
     [
@@ -1287,6 +1310,29 @@ async def test_history_is_user_scoped_sorted_and_limited():
     assert len(history) == 1
     assert history[0]["user_id"] == "user-1"
     assert history[0]["revision"] == 2
+
+
+@pytest.mark.asyncio
+async def test_history_compacts_transport_only_baseline_polling_noise():
+    db = FakeDatabase()
+    service = _service(db=db)
+    first = await service.today("user-1", now=NOW)
+    duplicate = deepcopy(db.decisions.rows[0])
+    duplicate["decision_id"] = "decision_transport_only"
+    duplicate["revision"] = 2
+    duplicate["material_hash"] = "material_transport_only"
+    duplicate["created_at"] = "9999-07-22T10:05:00+00:00"
+    duplicate["buy_now"][0]["quote"]["trade_at"] = (
+        "2026-07-22T10:05:00+08:00"
+    )
+    db.decisions.rows.append(duplicate)
+
+    history = await service.history("user-1", limit=20)
+
+    assert len(history) == 1
+    assert history[0]["revision"] == 2
+    assert history[0]["decision_state_hash"] == first["decision_state_hash"]
+    assert history[0]["history_compacted"] is True
 
 
 @pytest.mark.asyncio

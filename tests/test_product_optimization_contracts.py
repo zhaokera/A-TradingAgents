@@ -222,7 +222,7 @@ def test_shadow_trade_waits_for_entry_then_uses_allocated_quantity():
 
     AICandidateService._update_performance(
         candidate,
-        current_price=10.1,
+        current_price=9.98,
         session_low=9.98,
         session_high=10.2,
         benchmark_price=4010,
@@ -233,6 +233,8 @@ def test_shadow_trade_waits_for_entry_then_uses_allocated_quantity():
     assert shadow["status"] == "active"
     assert shadow["entry_price"] == 10.0
     assert shadow["quantity"] == 100
+    assert shadow["tracking_version"] == "shadow_trade_v2"
+    assert shadow["entry_observation_key"] == "2"
 
 
 @pytest.mark.asyncio

@@ -212,3 +212,35 @@ def test_candidate_sizing_is_blocked_when_market_has_no_new_risk_budget():
 
     assert sizing["status"] == "market_blocked"
     assert sizing["suggested_quantity"] == 0
+
+
+def test_one_lot_risk_uses_audited_whole_yuan_budget_precision():
+    policy = build_dynamic_portfolio_policy(
+        total_assets=10_685.41,
+        current_exposure_pct=0,
+        market_regime="green",
+    )
+
+    boundary = calculate_candidate_position_sizing(
+        entry_price=30.39,
+        stop_price=29.32,
+        total_assets=10_685.41,
+        available_cash=10_685.41,
+        policy=policy,
+    )
+    clearly_over = calculate_candidate_position_sizing(
+        entry_price=100.35,
+        stop_price=95.41,
+        total_assets=10_685.41,
+        available_cash=10_685.41,
+        policy=policy,
+    )
+
+    assert boundary["status"] == "sized"
+    assert boundary["suggested_quantity"] == 100
+    assert boundary["planned_loss_amount"] == 107.0
+    assert boundary["risk_budget_precision"]["raw_loss_budget_amount"] == 106.8541
+    assert boundary["risk_budget_precision"]["effective_loss_budget_amount"] == 107.0
+    assert boundary["risk_budget_precision"]["rounding_unit"] == "CNY_1"
+    assert clearly_over["status"] == "one_lot_unaffordable"
+    assert clearly_over["one_lot_planned_loss"] == 494.0

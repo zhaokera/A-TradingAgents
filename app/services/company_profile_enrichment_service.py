@@ -14,15 +14,17 @@ from app.core.database import get_mongo_db
 
 logger = logging.getLogger(__name__)
 
-SOURCE_PRIORITY = {"tushare": 0, "baostock": 1, "akshare": 2}
+SOURCE_PRIORITY = {"tushare": 0, "baostock": 1, "cninfo": 2, "akshare": 3}
 NORMALIZATION_VERSION = "cn-sector-v1"
 PROFILE_MAX_AGE = timedelta(days=30)
 REVENUE_MAX_AGE = timedelta(days=550)
 REFRESH_RETRY_BACKOFF = timedelta(hours=24)
+PROFILE_PROVIDER_CONTRACT_VERSION = "company-profile-v2-cninfo"
 ALLOWED_ENDPOINTS = {
     "tushare": {"stock_basic", "stock_company", "fina_mainbz"},
     "baostock": {"query_stock_basic"},
     "akshare": {"stock_individual_info_em"},
+    "cninfo": {"stock_profile_cninfo"},
 }
 SAFE_PROVIDER_ERROR_MESSAGES = {
     "provider_timeout": "Provider request timed out.",
@@ -57,6 +59,8 @@ SECTOR_GROUPS = {
 }
 SECTOR_ALIASES = {
     "信息技术": "信息技术",
+    "计算机、通信和其他电子设备制造业": "信息技术",
+    "软件和信息技术服务业": "信息技术",
     "金融": "金融",
     "医疗": "医疗保健",
     "医药": "医疗保健",
@@ -494,10 +498,24 @@ def select_evidence_profile(
     selected_evidence = [
         item for item in (sector, industry, business, business_scope, selected_revenue) if item
     ]
-    complete = all(selected[field] is not None for field in ("provider_sector", "industry", "main_business"))
+    critical_fields = ("provider_sector", "industry")
+    noncritical_fields = ("main_business",)
+    complete = all(
+        selected[field] is not None
+        for field in (*critical_fields, *noncritical_fields)
+    )
+    decision_critical_complete = all(
+        selected[field] is not None for field in critical_fields
+    )
     status = "verified" if complete else "incomplete" if selected_evidence else "missing"
     confidence = "high" if complete else "medium" if selected_evidence else "low"
     missing_fields = [field for field in ("provider_sector", "industry", "main_business") if selected[field] is None]
+    decision_critical_missing_fields = [
+        field for field in critical_fields if selected[field] is None
+    ]
+    noncritical_missing_fields = [
+        field for field in noncritical_fields if selected[field] is None
+    ]
     profile = {
         "code": normalized_code,
         "industry": industry.get("value") if industry else None,
@@ -519,7 +537,10 @@ def select_evidence_profile(
         "revenue_composition": selected_revenue,
         "data_quality": {
             "complete": complete,
+            "decision_critical_complete": decision_critical_complete,
             "missing_fields": missing_fields,
+            "decision_critical_missing_fields": decision_critical_missing_fields,
+            "noncritical_missing_fields": noncritical_missing_fields,
             "display_only": display_only,
             "profile_conflicts": conflicts,
             "provider_errors": [],
@@ -643,6 +664,7 @@ class CompanyProfileEnrichmentService:
                 "provider_errors": [],
                 "display_only": [],
                 "last_refresh_at": None,
+                "provider_contract_version": None,
             }
             for code in codes
         }
@@ -659,6 +681,9 @@ class CompanyProfileEnrichmentService:
                 quality.get("provider_errors") or row.get("provider_errors") or []
             )
             grouped[code]["display_only"].extend(quality.get("display_only") or [])
+            grouped[code]["provider_contract_version"] = row.get(
+                "provider_contract_version"
+            )
             refresh_at = row.get("refresh_started_at") or row.get("last_refresh_at")
             parsed_refresh_at = _parse_datetime(refresh_at)
             current_refresh_at = _parse_datetime(grouped[code].get("last_refresh_at"))
@@ -749,9 +774,24 @@ class CompanyProfileEnrichmentService:
             ) or cached_profile.get("revenue_composition") is None
             validation_now = now
             last_refresh_at = _parse_datetime(cached[code].get("last_refresh_at"))
+            contract_upgrade_needed = bool(
+                cached_profile.get("data_quality", {}).get(
+                    "decision_critical_complete"
+                )
+                is True
+                and not any(
+                    str(document.get("source_endpoint") or "")
+                    == "stock_profile_cninfo"
+                    for document in documents
+                    if isinstance(document, Mapping)
+                )
+                and cached[code].get("provider_contract_version")
+                != PROFILE_PROVIDER_CONTRACT_VERSION
+            )
             retry_blocked = bool(
                 last_refresh_at is not None
                 and datetime.now(timezone.utc) - last_refresh_at < REFRESH_RETRY_BACKOFF
+                and not contract_upgrade_needed
             )
             if refresh and needs_refresh and not retry_blocked:
                 refresh_started_at = datetime.now(timezone.utc)
@@ -769,6 +809,7 @@ class CompanyProfileEnrichmentService:
                         "updated_at": now,
                         "refresh_started_at": refresh_started_at,
                         "last_refresh_at": refresh_started_at,
+                        "provider_contract_version": PROFILE_PROVIDER_CONTRACT_VERSION,
                     }
                 }
                 lost_write = False

@@ -504,14 +504,16 @@ async def test_missing_stock_profile_remains_a_nonblocking_visible_warning():
         "status": "missing",
         "confidence": "missing",
         "complete": False,
+        "decision_critical_complete": False,
         "missing_fields": ["industry", "main_business"],
         "warning_code": "stock_profile_evidence_incomplete",
-        "message": "主营或行业证据不完整，当前候选仅作价格提醒，不提升为可执行结论。",
+        "message": "行业或板块证据不完整，当前候选仅作价格提醒，不提升为可执行结论。",
+        "noncritical_missing_fields": [],
     }
     assert candidate["risk_flags"][-1] == {
         "code": "stock_profile_evidence_incomplete",
         "severity": "warning",
-        "message": "主营或行业证据不完整，当前候选仅作价格提醒，不提升为可执行结论。",
+        "message": "行业或板块证据不完整，当前候选仅作价格提醒，不提升为可执行结论。",
     }
 
 
@@ -642,7 +644,11 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
     assert candidate["price_plan"]["entry_status"] == "price_ready"
     assert candidate["actionability"] == "ready_now"
     assert candidate["quote_source"] == "tencent"
-    assert candidate["quote"] == {
+    assert {
+        key: value
+        for key, value in candidate["quote"].items()
+        if key != "freshness"
+    } == {
         "price": 9.9,
         "source": "tencent",
         "trade_at": "2026-07-21T10:00:00+08:00",
@@ -656,6 +662,8 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
         "event_change_detected": True,
         "event_observed_at": candidate["quote_checked_at"],
     }
+    assert candidate["quote"]["freshness"]["display_usable"] is True
+    assert candidate["quote"]["freshness"]["tracking_usable"] is False
     assert candidate["condition_order_ready"] is False
     assert candidate["execution_actionable"] is False
     assert result["market"]["execution_usable"] is False
@@ -676,7 +684,7 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
     assert result["market"]["live_gate"]["market_gate"]["breadth_regime"][
         "total_coverage_ratio"
     ] == 0.997
-    assert candidate["performance"]["observation_count"] == 1
+    assert "performance" not in candidate
     collection.update_one.assert_awaited_once()
 
 
@@ -1076,7 +1084,10 @@ async def test_performance_summary_aggregates_tracked_candidate_results():
                             "performance": {
                                 "observation_count": 4,
                                 "shadow_trade": {
+                                    "tracking_version": "shadow_trade_v2",
                                     "status": "closed_target",
+                                    "entry_observation_key": "2026-07-21T09:30:00+08:00",
+                                    "closed_observation_key": "2026-07-22T10:00:00+08:00",
                                     "entry_price": 10.0,
                                     "quantity": 100,
                                     "net_return_pct": 8.5,
@@ -1307,6 +1318,47 @@ def test_performance_counts_each_tencent_trade_timestamp_once():
     )
 
     assert candidate["performance"]["observation_count"] == 1
+
+
+def test_shadow_trade_never_enters_and_exits_on_the_same_observation():
+    candidate = {
+        "initial_reference_price": 18.0,
+        "price_plan": {
+            "entry_strategy": "pullback",
+            "entry_price": 17.06,
+            "stop_price": 16.52,
+            "target_price": 23.75,
+        },
+        "portfolio_allocation": {"quantity": 100},
+    }
+
+    AICandidateService._update_performance(
+        candidate,
+        current_price=17.0,
+        checked_at="2026-08-06T01:20:05+00:00",
+        observation_key="2026-08-06T09:20:05+08:00",
+        session_high=18.5,
+        session_low=16.0,
+    )
+
+    shadow = candidate["performance"]["shadow_trade"]
+    assert shadow["status"] == "active"
+    assert shadow["tracking_version"] == "shadow_trade_v2"
+    assert shadow["entry_observation_key"] == "2026-08-06T09:20:05+08:00"
+    assert "closed_at" not in shadow
+
+    AICandidateService._update_performance(
+        candidate,
+        current_price=16.5,
+        checked_at="2026-08-06T01:21:05+00:00",
+        observation_key="2026-08-06T09:21:05+08:00",
+        session_high=18.5,
+        session_low=16.0,
+    )
+
+    shadow = candidate["performance"]["shadow_trade"]
+    assert shadow["status"] == "closed_stop"
+    assert shadow["closed_observation_key"] == "2026-08-06T09:21:05+08:00"
 
 
 @pytest.mark.asyncio
@@ -1614,11 +1666,18 @@ async def test_candidate_performance_is_diagnostic_deduplicated_and_governed():
         "price_plan": plan,
         "performance": {
             "shadow_trade": {
+                "tracking_version": "shadow_trade_v2",
                 "status": "closed_stop",
+                "entry_triggered_at": "2026-07-28T01:30:00+00:00",
+                "closed_at": "2026-07-29T01:30:00+00:00",
+                "entry_observation_key": "2026-07-28T09:30:00+08:00",
+                "closed_observation_key": "2026-07-29T09:30:00+08:00",
                 "entry_price": 10.0,
                 "quantity": 100,
                 "net_return_pct": -10.5,
                 "net_pnl": -105.0,
+                "max_return_pct": 1.0,
+                "min_return_pct": -10.0,
             }
         },
     }
@@ -1692,6 +1751,71 @@ async def test_candidate_performance_is_diagnostic_deduplicated_and_governed():
     assert [item["code"] for item in result["items"]] == ["002558"]
     assert result["items"][0]["counts_as_governed_decision_sample"] is False
     assert result["items"][0]["represents_real_account_position"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_performance_quarantines_legacy_unordered_shadow_results():
+    class Cursor:
+        def sort(self, *_args):
+            return self
+
+        def limit(self, *_args):
+            return self
+
+        async def to_list(self, *, length):
+            return [
+                {
+                    "_id": ObjectId(),
+                    "generated_at": datetime(2026, 8, 5, tzinfo=timezone.utc),
+                    "candidates": [
+                        {
+                            "code": "002645",
+                            "name": "华宏科技",
+                            "price_plan": {
+                                "entry_price": 17.06,
+                                "stop_price": 16.52,
+                                "target_price": 23.75,
+                            },
+                            "performance": {
+                                "observation_count": 43,
+                                "shadow_trade": {
+                                    "status": "closed_stop",
+                                    "entry_triggered_at": "2026-08-06T01:20:05+00:00",
+                                    "closed_at": "2026-08-06T01:20:05+00:00",
+                                    "entry_price": 17.06,
+                                    "exit_price": 16.52,
+                                    "latest_price": 18.5,
+                                    "return_pct": 8.44,
+                                    "net_return_pct": -3.79,
+                                    "min_return_pct": 8.44,
+                                },
+                            },
+                        }
+                    ],
+                }
+            ]
+
+    settings = SimpleNamespace(find_one=AsyncMock(return_value={}))
+    runs = SimpleNamespace(find=MagicMock(return_value=Cursor()))
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+    )
+    service.db = {
+        "user_holding_settings": settings,
+        "ai_candidate_runs": runs,
+    }
+
+    result = await service.performance_summary("admin-id")
+
+    assert result["sample_count"] == 0
+    assert result["closed_count"] == 0
+    assert result["invalid_shadow_sample_count"] == 1
+    assert result["invalid_shadow_by_reason"] == {
+        "legacy_path_unverifiable": 1
+    }
+    assert result["items"] == []
 
 
 @pytest.mark.asyncio

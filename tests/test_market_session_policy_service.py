@@ -215,6 +215,46 @@ async def test_event_confirmation_allows_only_small_same_request_clock_skew():
 
 
 @pytest.mark.asyncio
+async def test_pre_open_future_provider_timestamp_is_explicitly_unusable():
+    policy = MarketSessionPolicyService(calendar=StubCalendar(authoritative_calendar()))
+    now = datetime(2026, 8, 6, 8, 41, tzinfo=SHANGHAI)
+
+    result = await policy.quote_status(
+        {
+            "source": "tencent",
+            "provider_updated_at": "2026-08-06T09:15:00+08:00",
+            "quote_time_semantics": "provider_snapshot_updated_at",
+            "exchange_trade_time_verified": False,
+        },
+        now=now,
+    )
+
+    assert result["actionable"] is False
+    assert result["display_usable"] is False
+    assert result["tracking_usable"] is False
+    assert result["status"] == "future_provider_timestamp"
+
+
+@pytest.mark.asyncio
+async def test_provider_timestamp_allows_only_five_seconds_of_clock_skew():
+    policy = MarketSessionPolicyService(calendar=StubCalendar(authoritative_calendar()))
+    now = datetime(2026, 8, 6, 10, 0, tzinfo=SHANGHAI)
+
+    tolerated = await policy.quote_status(
+        {"source": "tencent", "provider_updated_at": "2026-08-06T10:00:05+08:00"},
+        now=now,
+    )
+    rejected = await policy.quote_status(
+        {"source": "tencent", "provider_updated_at": "2026-08-06T10:00:06+08:00"},
+        now=now,
+    )
+
+    assert tolerated["actionable"] is True
+    assert tolerated["status"] == "fresh"
+    assert rejected["status"] == "future_provider_timestamp"
+
+
+@pytest.mark.asyncio
 async def test_quote_status_preserves_session_subsecond_precision_for_freshness():
     policy = MarketSessionPolicyService(calendar=StubCalendar(authoritative_calendar()))
     session = await policy.classify(

@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from apscheduler.triggers.combining import OrTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import Settings
 from app.core.database import create_database_indexes
@@ -145,11 +146,21 @@ async def test_scheduler_registers_refresh_first_and_bounded_tracking_job():
         "decision_tracking_poller",
     ]
     tracking = scheduler.jobs[1]
+    refresh = scheduler.jobs[0]
+    assert isinstance(refresh["trigger"], CronTrigger)
+    shanghai = ZoneInfo("Asia/Shanghai")
+    assert refresh["trigger"].get_next_fire_time(
+        None,
+        datetime(2026, 8, 6, 9, 40, tzinfo=shanghai),
+    ) == datetime(2026, 8, 6, 9, 45, tzinfo=shanghai)
+    assert refresh["trigger"].get_next_fire_time(
+        datetime(2026, 8, 6, 9, 45, tzinfo=shanghai),
+        datetime(2026, 8, 6, 9, 45, tzinfo=shanghai),
+    ) == datetime(2026, 8, 7, 9, 45, tzinfo=shanghai)
     assert tracking["max_instances"] == 1
     assert tracking["coalesce"] is True
     assert tracking["misfire_grace_time"] == 30
     assert isinstance(tracking["trigger"], OrTrigger)
-    shanghai = ZoneInfo("Asia/Shanghai")
     trigger = tracking["trigger"]
     assert trigger.get_next_fire_time(
         None,
