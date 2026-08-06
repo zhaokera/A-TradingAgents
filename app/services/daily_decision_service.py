@@ -93,7 +93,7 @@ _TOP_LEVEL_VOLATILE_FIELDS = {
 _MONEY_OR_PERCENT_RE = re.compile(
     r"(?:price|amount|assets|cash|loss|pct|percent|exposure|score|value)$"
 )
-_SOURCE_PRIORITY = {"tushare": 0, "baostock": 1, "akshare": 2}
+_SOURCE_PRIORITY = {"tushare": 0, "baostock": 1, "cninfo": 2, "akshare": 3}
 
 
 class DecisionPersistenceError(RuntimeError):
@@ -272,6 +272,87 @@ def material_hash(packet: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def decision_state_hash(packet: Mapping[str, Any]) -> str:
+    """Hash decision semantics while excluding quote transport observations."""
+
+    market = packet.get("market")
+    market = market if isinstance(market, Mapping) else {}
+    payload: Dict[str, Any] = {
+        "decision_date": packet.get("decision_date"),
+        "market_phase": packet.get("market_phase"),
+        "candidate_run_id": packet.get("candidate_run_id"),
+        "authority": packet.get("authority"),
+        "is_final_decision": packet.get("is_final_decision"),
+        "summary": packet.get("summary"),
+        "market": {
+            key: market.get(key)
+            for key in (
+                "combined_regime",
+                "domestic_regime",
+                "global_regime",
+            )
+        },
+        "permission_prefilter_excluded": packet.get(
+            "permission_prefilter_excluded"
+        ),
+    }
+    for bucket in BUCKETS:
+        values = []
+        for raw in packet.get(bucket, []) or []:
+            if not isinstance(raw, Mapping):
+                continue
+            identity = raw.get("identity")
+            identity = identity if isinstance(identity, Mapping) else {}
+            execution = raw.get("execution")
+            execution = execution if isinstance(execution, Mapping) else {}
+            allocation = raw.get("allocation")
+            allocation = allocation if isinstance(allocation, Mapping) else {}
+            invalidation = raw.get("invalidation")
+            invalidation = (
+                invalidation if isinstance(invalidation, Mapping) else {}
+            )
+            values.append(
+                {
+                    "code": _normalise_code(identity.get("code")),
+                    "plan_id": raw.get("plan_id"),
+                    "action": raw.get("action"),
+                    "reason_codes": raw.get("reason_codes"),
+                    "execution": {
+                        key: execution.get(key)
+                        for key in ("status", "order_limit_price")
+                    },
+                    "allocation": {
+                        key: allocation.get(key)
+                        for key in (
+                            "status",
+                            "reason",
+                            "reason_codes",
+                            "quantity",
+                            "amount",
+                            "position_pct",
+                        )
+                    },
+                    "planned_loss": raw.get("planned_loss"),
+                    "invalidation": {
+                        "stop_price": invalidation.get("stop_price"),
+                        "plan_expires_at": invalidation.get(
+                            "plan_expires_at"
+                        ),
+                        "risk_flags": invalidation.get("risk_flags"),
+                    },
+                }
+            )
+        payload[bucket] = values
+    encoded = json.dumps(
+        _normalise_numbers(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _stable_plan_id(
     *, user_id: str, candidate_run_id: Any, candidate: Mapping[str, Any], allocation: Mapping[str, Any]
 ) -> str:
@@ -387,11 +468,14 @@ def _plan_has_expired(value: Any, now: datetime) -> bool:
 
 def _profile_complete(profile: Mapping[str, Any]) -> bool:
     quality = profile.get("data_quality")
-    if isinstance(quality, Mapping) and quality.get("complete") is True:
-        return True
+    if isinstance(quality, Mapping):
+        if quality.get("decision_critical_complete") is True:
+            return True
+        if quality.get("decision_critical_missing_fields"):
+            return False
     return all(
         str(profile.get(field) or "").strip()
-        for field in ("provider_sector", "industry", "main_business")
+        for field in ("provider_sector", "industry")
     )
 
 
@@ -1167,6 +1251,7 @@ class DailyDecisionService:
             "rule_version": RULE_VERSION,
         }
         packet = _normalise_numbers(packet)
+        packet["decision_state_hash"] = decision_state_hash(packet)
         packet["material_hash"] = material_hash(packet)
         return packet
 
@@ -1413,6 +1498,7 @@ class DailyDecisionService:
             parsed_limit = max(1, min(int(limit), 100))
         except (TypeError, ValueError, OverflowError):
             parsed_limit = 20
+        fetch_limit = min(500, max(parsed_limit * 20, 100))
         try:
             db = await self._get_db()
             cursor = (
@@ -1425,12 +1511,28 @@ class DailyDecisionService:
                         ("revision", -1),
                     ]
                 )
-                .limit(parsed_limit)
+                .limit(fetch_limit)
             )
-            rows = await cursor.to_list(length=parsed_limit)
+            rows = await cursor.to_list(length=fetch_limit)
         except Exception as exc:
             raise DecisionPersistenceError("decision_history_unavailable") from exc
-        return [_serialize_mongo(row) for row in rows]
+        compacted = []
+        seen_states: set[str] = set()
+        for row in rows:
+            serialized = _serialize_mongo(row)
+            state_hash = str(
+                serialized.get("decision_state_hash")
+                or decision_state_hash(serialized)
+            )
+            if state_hash in seen_states:
+                continue
+            seen_states.add(state_hash)
+            serialized["decision_state_hash"] = state_hash
+            serialized["history_compacted"] = True
+            compacted.append(serialized)
+            if len(compacted) >= parsed_limit:
+                break
+        return compacted
 
 
 daily_decision_service = DailyDecisionService()

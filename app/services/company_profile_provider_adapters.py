@@ -557,7 +557,7 @@ async def fetch_akshare_profile(
     provider: Any = None,
     execution_context: _ProviderExecutionContext | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch and parse AKShare's item/value company information frame."""
+    """Fetch AKShare quote metadata plus its CNInfo company-profile endpoint."""
 
     try:
         provider = await _connected_provider(
@@ -571,38 +571,90 @@ async def fetch_akshare_profile(
             provider_errors=[_endpoint_error("akshare", "connect", exc)]
         )
     raw = getattr(provider, "ak", None) if provider is not None else None
-    method = getattr(raw, "stock_individual_info_em", None) if raw is not None else None
-    if not callable(method):
-        return ProfileFetchResult()
-    try:
-        frame = await _call_with_timeout(
-            method, symbol=_code(code), execution_context=execution_context
-        )
-    except Exception as exc:
-        return ProfileFetchResult(
-            provider_errors=[
+    documents: list[dict[str, Any]] = []
+    display_only: list[dict[str, Any]] = []
+    provider_errors: list[dict[str, Any]] = []
+
+    individual_method = (
+        getattr(raw, "stock_individual_info_em", None)
+        if raw is not None
+        else None
+    )
+    if callable(individual_method):
+        try:
+            frame = await _call_with_timeout(
+                individual_method,
+                symbol=_code(code),
+                execution_context=execution_context,
+            )
+            values = {}
+            for row in _rows(frame):
+                item = _clean(row.get("item"))
+                if item is not None:
+                    values[str(item)] = _clean(row.get("value"))
+            documents.append(
+                _document(
+                    code,
+                    "akshare",
+                    "stock_individual_info_em",
+                    f"{_code(code)}:stock_individual_info_em",
+                    name=values.get("股票简称") or values.get("名称"),
+                    industry=values.get("所属行业") or values.get("行业"),
+                    main_business=values.get("主营业务"),
+                    business_scope=values.get("经营范围"),
+                    listing_date=values.get("上市时间") or values.get("上市日期"),
+                    source_updated_at=(
+                        values.get("更新时间") or values.get("数据更新时间")
+                    ),
+                )
+            )
+        except Exception as exc:
+            provider_errors.append(
                 _endpoint_error("akshare", "stock_individual_info_em", exc)
-            ]
-        )
-    values = {}
-    for row in _rows(frame):
-        item = _clean(row.get("item"))
-        if item is not None:
-            values[str(item)] = _clean(row.get("value"))
-    return [
-        _document(
-            code,
-            "akshare",
-            "stock_individual_info_em",
-            f"{_code(code)}:stock_individual_info_em",
-            name=values.get("股票简称") or values.get("名称"),
-            industry=values.get("所属行业") or values.get("行业"),
-            main_business=values.get("主营业务"),
-            business_scope=values.get("经营范围"),
-            listing_date=values.get("上市时间") or values.get("上市日期"),
-            source_updated_at=values.get("更新时间") or values.get("数据更新时间"),
-        )
-    ]
+            )
+
+    profile_method = (
+        getattr(raw, "stock_profile_cninfo", None) if raw is not None else None
+    )
+    if callable(profile_method):
+        try:
+            frame = await _call_with_timeout(
+                profile_method,
+                symbol=_code(code),
+                execution_context=execution_context,
+            )
+            for row in _rows(frame):
+                returned_code = row.get("A股代码") or row.get("股票代码")
+                if _provider_code(returned_code) != _code(code):
+                    display_only.append(
+                        _code_mismatch(
+                            "cninfo", "stock_profile_cninfo", returned_code
+                        )
+                    )
+                    continue
+                documents.append(
+                    _document(
+                        code,
+                        "cninfo",
+                        "stock_profile_cninfo",
+                        f"{_code(code)}:stock_profile_cninfo",
+                        name=row.get("A股简称") or row.get("公司简称"),
+                        industry=row.get("所属行业") or row.get("行业"),
+                        main_business=row.get("主营业务"),
+                        business_scope=row.get("经营范围"),
+                        source_updated_at=_source_updated(row),
+                    )
+                )
+        except Exception as exc:
+            provider_errors.append(
+                _endpoint_error("cninfo", "stock_profile_cninfo", exc)
+            )
+
+    return ProfileFetchResult(
+        documents,
+        display_only=display_only,
+        provider_errors=provider_errors,
+    )
 
 
 def build_default_profile_fetchers(

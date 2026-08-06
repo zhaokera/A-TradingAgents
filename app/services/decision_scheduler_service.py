@@ -10,7 +10,6 @@ from typing import Any, Dict, Mapping, Optional
 
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
 from app.core.database import get_mongo_db
 from app.services.daily_decision_service import daily_decision_service
@@ -188,11 +187,17 @@ async def register_decision_scheduler_jobs(
     if bool(config.DECISION_REFRESH_ENABLED):
         scheduler.add_job(
             runtime.refresh_active_users,
-            IntervalTrigger(minutes=5, timezone=config.TIMEZONE),
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=9,
+                minute=45,
+                timezone=config.TIMEZONE,
+            ),
             id="decision_daily_refresh",
-            name="可审计每日决策刷新",
+            name="09:45可审计正式决策基线刷新",
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=15 * 60,
         )
         added.append("decision_daily_refresh")
 

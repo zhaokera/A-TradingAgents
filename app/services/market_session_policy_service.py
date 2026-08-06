@@ -153,6 +153,8 @@ class MarketSessionPolicyService:
         )
         result = {
             "actionable": False,
+            "display_usable": False,
+            "tracking_usable": False,
             "status": "missing_trade_at",
             "source": source,
             "phase": phase,
@@ -181,6 +183,27 @@ class MarketSessionPolicyService:
             "event_age_seconds": serialized_event_age,
         }
 
+        # Tencent's provider timestamp is useful as an audited display timestamp,
+        # but a future snapshot must never be presented as a current quote.  A
+        # bounded five-second skew covers clocks sampled within the same request.
+        if (
+            source == "tencent"
+            and trade_at is not None
+            and age_seconds is not None
+            and age_seconds >= -EVENT_MAX_FUTURE_SKEW_SECONDS
+        ):
+            result["display_usable"] = True
+        if (
+            trade_at is not None
+            and age_seconds is not None
+            and age_seconds < -EVENT_MAX_FUTURE_SKEW_SECONDS
+        ):
+            return {
+                **result,
+                "display_usable": False,
+                "status": "future_provider_timestamp",
+            }
+
         if phase == "calendar_unknown":
             return {**result, "status": "calendar_unknown"}
         if phase == "post_close":
@@ -203,8 +226,6 @@ class MarketSessionPolicyService:
             return result
         if trade_at.date() != local_now.date():
             return {**result, "status": "wrong_trade_date"}
-        if age_seconds is not None and age_seconds < 0:
-            return {**result, "status": "future_trade_at"}
         if age_seconds is not None and age_seconds > self.quote_max_age_seconds:
             return {**result, "status": "stale_trade_at"}
         if event_confirmation_required:
@@ -222,7 +243,12 @@ class MarketSessionPolicyService:
                 and event_age_seconds > self.quote_max_age_seconds
             ):
                 return {**result, "status": "stale_event_confirmation"}
-        return {**result, "actionable": True, "status": "fresh"}
+        return {
+            **result,
+            "actionable": True,
+            "tracking_usable": True,
+            "status": "fresh",
+        }
 
 
 market_session_policy_service = MarketSessionPolicyService()

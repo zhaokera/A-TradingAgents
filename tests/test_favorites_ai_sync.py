@@ -345,3 +345,80 @@ async def test_manual_chinext_favorite_is_preserved_as_permission_blocked_resear
         "chi_next_market_permission_denied"
     )
     assert item["market_permission"]["reason_code"] == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_future_provider_quote_is_audited_but_not_displayed(monkeypatch):
+    user_favorites = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "user_id": "admin-id",
+                "favorites": [
+                    {
+                        "stock_code": "603005",
+                        "stock_name": "晶方科技",
+                        "source": "manual",
+                    }
+                ],
+            }
+        )
+    )
+    settings = SimpleNamespace(find_one=AsyncMock(return_value={}))
+    basic_cursor = SimpleNamespace(to_list=AsyncMock(return_value=[]))
+    basic_info = SimpleNamespace(find=MagicMock(return_value=basic_cursor))
+    db = MagicMock()
+    db.user_favorites = user_favorites
+    db.__getitem__.side_effect = lambda name: {
+        "user_holding_settings": settings,
+        "stock_basic_info": basic_info,
+    }[name]
+    quote_service = SimpleNamespace(
+        get_quotes=AsyncMock(
+            return_value={
+                "603005": {
+                    "price": 30.39,
+                    "pct_chg": 1.2,
+                    "volume": 1000,
+                    "source": "tencent",
+                    "provider_updated_at": "2026-08-06T09:15:00+08:00",
+                }
+            }
+        )
+    )
+    market_session = SimpleNamespace(
+        classify=AsyncMock(
+            return_value={
+                "phase": "pre_open",
+                "classified_at": "2026-08-06T08:41:00+08:00",
+            }
+        ),
+        quote_status=AsyncMock(
+            return_value={
+                "status": "future_provider_timestamp",
+                "actionable": False,
+                "display_usable": False,
+                "tracking_usable": False,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.favorites_service.get_quotes_service",
+        lambda: quote_service,
+    )
+    monkeypatch.setattr(
+        "app.core.unified_config.UnifiedConfigManager."
+        "get_data_source_configs_async",
+        AsyncMock(return_value=[]),
+    )
+    service = FavoritesService(market_session=market_session)
+    service.db = db
+
+    items = await service.get_user_favorites("admin-id")
+
+    item = items[0]
+    assert item["current_price"] is None
+    assert item["change_percent"] is None
+    assert item["volume"] is None
+    assert item["quote_provider_updated_at"] == "2026-08-06T09:15:00+08:00"
+    assert item["quote_status"] == "future_provider_timestamp"
+    assert item["quote_display_usable"] is False

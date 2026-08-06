@@ -40,6 +40,10 @@ from app.services.investment_policy import (
 from app.services.global_macro_risk_service import GlobalMacroRiskService
 from app.services.stock_master_data_service import StockMasterDataService
 from app.services.a_share_calendar_service import AShareCalendarService
+from app.services.market_session_policy_service import (
+    MarketSessionPolicyService,
+    market_session_policy_service,
+)
 from app.services.notifications_service import get_notifications_service
 from app.services.tencent_quote_service import (
     TencentQuoteService,
@@ -976,6 +980,7 @@ class AICandidateService:
         stock_master: Any = None,
         macro_risk: Any = None,
         trading_calendar: Any = None,
+        market_session: Optional[MarketSessionPolicyService] = None,
         market_status_loader: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._research_runner = research_runner
@@ -984,6 +989,7 @@ class AICandidateService:
         self._stock_master = stock_master or StockMasterDataService()
         self._macro_risk = macro_risk or GlobalMacroRiskService()
         self._trading_calendar = trading_calendar or AShareCalendarService()
+        self._market_session = market_session or market_session_policy_service
         self._market_status_loader = (
             market_status_loader or _load_current_market_status
         )
@@ -1150,14 +1156,17 @@ class AICandidateService:
         allocation = candidate.get("portfolio_allocation")
         allocation = allocation if isinstance(allocation, Mapping) else {}
         quantity = int(allocation.get("quantity") or 0)
-        low = session_low if session_low is not None else current_price
-        high = session_high if session_high is not None else current_price
+        # Session high/low are cumulative fields and do not prove whether entry,
+        # stop, or target happened first.  Shadow v2 only consumes the current
+        # event price from independently observed Tencent quote events.
         entry_triggered = bool(
             entry
             and quantity > 0
+            and (stop is None or current_price > stop)
+            and (target is None or current_price < target)
             and (
-                (strategy == "breakout" and high is not None and high >= entry)
-                or (strategy != "breakout" and low is not None and low <= entry)
+                (strategy == "breakout" and current_price >= entry)
+                or (strategy != "breakout" and current_price <= entry)
             )
         )
         if status == "waiting_entry" and entry_triggered and entry is not None:
@@ -1172,18 +1181,26 @@ class AICandidateService:
                 max_return_pct=0.0,
                 min_return_pct=0.0,
                 benchmark_entry_price=benchmark_price,
+                tracking_version="shadow_trade_v2",
+                observation_source="tencent_event_current_price",
+                entry_observation_key=observation_key,
             )
             status = "active"
-        if status == "active":
+        is_ordered_v2_observation = bool(
+            status == "active"
+            and shadow.get("tracking_version") == "shadow_trade_v2"
+            and shadow.get("entry_observation_key") != observation_key
+        )
+        if is_ordered_v2_observation:
             actual_entry = _finite_number(shadow.get("entry_price"))
             actual_quantity = int(shadow.get("quantity") or 0)
             if actual_entry and actual_quantity > 0:
                 exit_price = current_price
                 exit_reason = None
-                if stop is not None and low is not None and low <= stop:
-                    exit_price, exit_reason = stop, "stop"
-                elif target is not None and high is not None and high >= target:
-                    exit_price, exit_reason = target, "target"
+                if stop is not None and current_price <= stop:
+                    exit_reason = "stop"
+                elif target is not None and current_price >= target:
+                    exit_reason = "target"
                 gross_return = (current_price - actual_entry) / actual_entry * 100
                 shadow["latest_price"] = current_price
                 shadow["return_pct"] = round(gross_return, 2)
@@ -1216,6 +1233,7 @@ class AICandidateService:
                         closed_at=checked_at,
                         exit_price=round(exit_price, 4),
                         exit_reason=exit_reason,
+                        closed_observation_key=observation_key,
                         sell_fee=round(sell_fee, 2),
                         stamp_duty=round(stamp_duty, 2),
                         net_pnl=round(net_pnl, 2),
@@ -1403,7 +1421,12 @@ class AICandidateService:
             ),
         }
 
-    async def _apply_objective_profiles(self, document: Dict[str, Any]) -> None:
+    async def _apply_objective_profiles(
+        self,
+        document: Dict[str, Any],
+        *,
+        refresh: bool = False,
+    ) -> None:
         candidates = [
             item for item in document.get("candidates", []) if isinstance(item, dict)
         ]
@@ -1412,7 +1435,12 @@ class AICandidateService:
             db = await self._get_db()
             if getattr(self._stock_master, "db", None) is None:
                 self._stock_master.db = db
-            profiles = await self._stock_master.resolve_many(codes)
+            if refresh:
+                profiles = await self._stock_master.resolve_many(
+                    codes, refresh=True
+                )
+            else:
+                profiles = await self._stock_master.resolve_many(codes)
         except Exception:
             logger.exception("Failed to resolve authoritative stock profiles")
             profiles = {}
@@ -1447,23 +1475,43 @@ class AICandidateService:
                     and not missing_fields
                 )
             )
+            decision_critical_complete = bool(
+                data_quality.get("decision_critical_complete") is True
+                or all(
+                    stock_profile.get(field)
+                    for field in ("provider_sector", "industry")
+                )
+            )
+            noncritical_missing = list(
+                data_quality.get("noncritical_missing_fields") or []
+            )
             profile_warning = {
                 "status": profile_status,
                 "confidence": str(
                     stock_profile.get("confidence") or "missing"
                 ),
                 "complete": profile_complete,
+                "decision_critical_complete": decision_critical_complete,
                 "missing_fields": missing_fields,
                 "warning_code": (
                     None
                     if profile_complete
-                    else "stock_profile_evidence_incomplete"
+                    else (
+                        "stock_profile_noncritical_fields_missing"
+                        if decision_critical_complete
+                        else "stock_profile_evidence_incomplete"
+                    )
                 ),
                 "message": (
                     "主营与行业证据完整。"
                     if profile_complete
-                    else "主营或行业证据不完整，当前候选仅作价格提醒，不提升为可执行结论。"
+                    else (
+                        "行业与板块证据已验证；主营字段仍待权威来源补齐。"
+                        if decision_critical_complete
+                        else "行业或板块证据不完整，当前候选仅作价格提醒，不提升为可执行结论。"
+                    )
                 ),
+                "noncritical_missing_fields": noncritical_missing,
             }
             profile = classify_investment_objective(
                 code,
@@ -1473,7 +1521,7 @@ class AICandidateService:
             candidate.update(profile)
             candidate["stock_profile"] = stock_profile
             candidate["profile_evidence"] = profile_warning
-            if not profile_complete:
+            if not decision_critical_complete:
                 risk_flags = (
                     candidate.get("risk_flags")
                     if isinstance(candidate.get("risk_flags"), list)
@@ -1678,8 +1726,8 @@ class AICandidateService:
         ]
         candidates.sort(
             key=lambda item: (
-                _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
                 objective_tier_rank(item.get("objective_tier")),
+                _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
                 -float(item.get("rank_score") or 0),
             )
         )
@@ -1702,8 +1750,8 @@ class AICandidateService:
                 _ALLOCATION_ORDER.get(
                     str((item.get("portfolio_allocation") or {}).get("status")), 9
                 ),
-                _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
                 objective_tier_rank(item.get("objective_tier")),
+                _ACTIONABILITY_ORDER.get(str(item.get("actionability")), 99),
                 -float(item.get("rank_score") or 0),
             )
         )
@@ -1775,6 +1823,7 @@ class AICandidateService:
         self._apply_candidate_governance(document, governance)
         refresh_now = datetime.now(timezone.utc)
         checked_at = refresh_now.isoformat()
+        quote_session = await self._market_session.classify(now=refresh_now)
         candidates = [
             item for item in document.get("candidates", []) if isinstance(item, dict)
         ]
@@ -1853,8 +1902,16 @@ class AICandidateService:
                     ),
                 }
             )
+            quote_policy = await self._market_session.quote_status(
+                current_quote,
+                now=refresh_now,
+                session=quote_session,
+            )
+            current_quote["freshness"] = quote_policy
             candidate["quote"] = current_quote
-            if current_price is not None:
+            display_usable = quote_policy.get("display_usable") is True
+            tracking_usable = quote_policy.get("tracking_usable") is True
+            if current_price is not None and display_usable:
                 candidate.setdefault(
                     "initial_reference_price", candidate.get("reference_price")
                 )
@@ -1877,7 +1934,7 @@ class AICandidateService:
                 candidate.clear()
                 candidate.update(refreshed)
             candidate["plan_expired"] = plan_expired
-            if event_change_detected:
+            if event_change_detected and tracking_usable:
                 self._update_performance(
                     candidate,
                     current_price=current_price,
@@ -1912,7 +1969,7 @@ class AICandidateService:
                 if candidate.get("code") in favorite_codes
                 else "not_added"
             )
-            if notify and event_change_detected:
+            if notify and event_change_detected and tracking_usable:
                 await self._publish_transition(
                     user_id=user_id,
                     candidate=candidate,
@@ -2037,6 +2094,7 @@ class AICandidateService:
         await self._apply_macro_policy(document)
         await self._apply_account_policy(document, user_id=str(user_id))
         document["candidates"] = list(document.get("candidates", []))[:max_candidates]
+        await self._apply_objective_profiles(document, refresh=True)
         await self._apply_account_policy(document, user_id=str(user_id))
         self._update_run_counts(document)
         db = await self._get_db()
@@ -2420,6 +2478,7 @@ class AICandidateService:
         excluded_by_reason: Dict[str, int] = {}
         duplicate_plan_count = 0
         raw_tracked_item_count = 0
+        invalid_shadow_by_reason: Dict[str, int] = {}
         for document in documents:
             for candidate in document.get("candidates", []):
                 if not isinstance(candidate, Mapping):
@@ -2444,6 +2503,19 @@ class AICandidateService:
                 seen_plan_ids.add(plan_identity)
                 shadow = performance.get("shadow_trade")
                 if isinstance(shadow, Mapping):
+                    invalid_reason = None
+                    if shadow.get("tracking_version") != "shadow_trade_v2":
+                        invalid_reason = "legacy_path_unverifiable"
+                    elif str(shadow.get("status") or "").startswith("closed_"):
+                        entry_key = shadow.get("entry_observation_key")
+                        closed_key = shadow.get("closed_observation_key")
+                        if not entry_key or not closed_key or entry_key == closed_key:
+                            invalid_reason = "observation_order_unverifiable"
+                    if invalid_reason:
+                        invalid_shadow_by_reason[invalid_reason] = (
+                            invalid_shadow_by_reason.get(invalid_reason, 0) + 1
+                        )
+                        continue
                     value = _finite_number(
                         shadow.get("net_return_pct"), shadow.get("return_pct")
                     )
@@ -2521,6 +2593,12 @@ class AICandidateService:
             "legacy_baseline_count": len(legacy_rows),
             "total_item_count": len(rows),
             "raw_tracked_item_count": raw_tracked_item_count,
+            "invalid_shadow_sample_count": sum(
+                invalid_shadow_by_reason.values()
+            ),
+            "invalid_shadow_by_reason": dict(
+                sorted(invalid_shadow_by_reason.items())
+            ),
             "duplicate_plan_count": duplicate_plan_count,
             "governance_excluded_count": sum(excluded_by_reason.values()),
             "governance_excluded_by_reason": dict(sorted(excluded_by_reason.items())),
