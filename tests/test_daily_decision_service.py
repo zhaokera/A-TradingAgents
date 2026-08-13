@@ -1091,6 +1091,10 @@ async def test_request_and_briefing_build_times_do_not_create_new_revision():
 async def test_current_candidate_live_gate_overrides_stale_briefing_regime():
     run = _run()
     run["market"] = {
+        "session": "quote_refresh_only",
+        "is_trading_hours": False,
+        "execution_usable": False,
+        "execution_status": "research_snapshot_not_execution_decision",
         "domestic_regime": "green",
         "regime": "green",
         "live_gate": {
@@ -1099,6 +1103,12 @@ async def test_current_candidate_live_gate_overrides_stale_briefing_regime():
             "source": "tencent_major_indices+akshare_sina_public_breadth",
             "trade_date": "2026-07-22",
             "checked_at": "2026-07-22T10:00:00+08:00",
+            "is_trading_hours": True,
+            "market_session": {
+                "session": "morning",
+                "is_trading_hours": True,
+                "local_time": "2026-07-22T10:00:00+08:00",
+            },
             "market_gate": {
                 "status": "ok",
                 "level": "green",
@@ -1122,11 +1132,67 @@ async def test_current_candidate_live_gate_overrides_stale_briefing_regime():
     assert packet["market"]["combined_regime"] == "green"
     assert packet["market"]["live_gate"]["usable"] is True
     assert packet["market"]["discovery_snapshot"]["domestic_regime"] == "red"
+    assert packet["market_phase"] == "live_am"
+    assert packet["market"]["session"] == "live_am"
+    assert packet["market"]["is_trading_hours"] is True
+    assert packet["market"]["execution_usable"] is True
+    assert packet["market"]["execution_status"] == "live_market_gate_usable"
     assert all(
         "market_red" not in item["reason_codes"]
         for bucket in ("buy_now", "condition_order", "wait", "avoid")
         for item in packet[bucket]
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_current_candidate_scan_keeps_live_market_semantics_but_blocks_execution():
+    run = _run()
+    run["current_scan_available"] = False
+    run["serving_mode"] = "stale_completed_run_fallback"
+    run["candidate_research"] = {
+        "job_id": "6a7d2070014a33ad279387f4",
+        "status": "failed",
+        "stage": "candidate_discovery",
+        "error": {"code": "candidate_discovery_unavailable"},
+    }
+    run["market"] = {
+        "session": "quote_refresh_only",
+        "is_trading_hours": False,
+        "execution_usable": False,
+        "regime": "green",
+        "domestic_regime": "green",
+        "live_gate": {
+            "usable": True,
+            "is_trading_hours": True,
+            "trade_date": "2026-07-22",
+            "market_session": {
+                "session": "morning",
+                "is_trading_hours": True,
+            },
+            "market_gate": {
+                "status": "ok",
+                "level": "green",
+                "trade_date": "2026-07-22",
+            },
+        },
+    }
+
+    packet = await _service(run=run).today("user-1", now=NOW)
+
+    assert packet["market_phase"] == "live_am"
+    assert packet["market"]["session"] == "live_am"
+    assert packet["market"]["is_trading_hours"] is True
+    assert packet["market"]["execution_usable"] is False
+    assert packet["market"]["execution_status"] == (
+        "current_candidate_scan_unavailable"
+    )
+    assert packet["candidate_research"]["stage"] == "candidate_discovery"
+    assert packet["data_quality"]["current_candidate_scan_available"] is False
+    assert not packet["buy_now"]
+    assert not packet["condition_order"]
+    assert packet["wait"][0]["reason_codes"] == [
+        "current_candidate_scan_unavailable"
+    ]
 
 
 @pytest.mark.asyncio

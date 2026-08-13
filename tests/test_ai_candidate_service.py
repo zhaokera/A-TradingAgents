@@ -519,6 +519,7 @@ async def test_missing_stock_profile_remains_a_nonblocking_visible_warning():
 
 @pytest.mark.asyncio
 async def test_latest_reconciles_favorite_status_with_current_favorites():
+    failed_job_id = ObjectId()
     collection = SimpleNamespace(
         find_one=AsyncMock(
             return_value={
@@ -533,8 +534,27 @@ async def test_latest_reconciles_favorite_status_with_current_favorites():
         ),
         update_one=AsyncMock(),
     )
+    jobs = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "_id": failed_job_id,
+                "user_id": "admin-id",
+                "status": "failed",
+                "created_at": datetime.now(timezone.utc),
+                "completed_at": datetime.now(timezone.utc),
+                "progress": {"stage": "failed", "percent": 100},
+                "error": {
+                    "code": "candidate_discovery_unavailable",
+                    "message": "公开全市场候选发现不可用",
+                    "stage": "candidate_discovery",
+                },
+            }
+        )
+    )
     db = MagicMock()
-    db.__getitem__.return_value = collection
+    db.__getitem__.side_effect = lambda name: (
+        jobs if name == "ai_candidate_jobs" else collection
+    )
     favorites = SimpleNamespace(
         get_favorite_codes=AsyncMock(return_value={"600001"})
     )
@@ -550,13 +570,71 @@ async def test_latest_reconciles_favorite_status_with_current_favorites():
     )
     service.db = db
 
-    result = await service.latest("admin-id")
+    result = await service.latest("admin-id", refresh_quotes=False)
 
     assert result is not None
     assert [item["favorite_status"] for item in result["candidates"]] == [
         "not_added",
         "in_favorites",
     ]
+    assert result["candidate_research"] == {
+        "job_id": str(failed_job_id),
+        "status": "failed",
+        "stage": "candidate_discovery",
+        "error": {
+            "code": "candidate_discovery_unavailable",
+            "message": "公开全市场候选发现不可用",
+            "stage": "candidate_discovery",
+        },
+        "created_at": result["candidate_research"]["created_at"],
+        "started_at": None,
+        "completed_at": result["candidate_research"]["completed_at"],
+        "run_id": None,
+        "is_today": True,
+        "current_scan_available": False,
+        "serving_mode": "stale_completed_run_fallback",
+    }
+    assert result["current_scan_available"] is False
+    assert result["serving_mode"] == "stale_completed_run_fallback"
+
+
+@pytest.mark.asyncio
+async def test_latest_without_completed_run_exposes_running_research_job():
+    job_id = ObjectId()
+    runs = SimpleNamespace(find_one=AsyncMock(return_value=None))
+    jobs = SimpleNamespace(
+        find_one=AsyncMock(
+            return_value={
+                "_id": job_id,
+                "user_id": "admin-id",
+                "status": "running",
+                "created_at": datetime.now(timezone.utc),
+                "started_at": datetime.now(timezone.utc),
+                "progress": {"stage": "technical_deep_check", "percent": 45},
+            }
+        )
+    )
+    db = MagicMock()
+    db.__getitem__.side_effect = lambda name: {
+        "ai_candidate_runs": runs,
+        "ai_candidate_jobs": jobs,
+    }[name]
+    stock_master, macro_risk = _offline_research_dependencies()
+    service = AICandidateService(
+        favorites=SimpleNamespace(),
+        quotes=SimpleNamespace(),
+        stock_master=stock_master,
+        macro_risk=macro_risk,
+    )
+    service.db = db
+
+    result = await service.latest("admin-id", refresh_quotes=False)
+
+    assert result["status"] == "candidate_research_running"
+    assert result["candidates"] == []
+    assert result["candidate_research"]["job_id"] == str(job_id)
+    assert result["candidate_research"]["stage"] == "technical_deep_check"
+    assert result["candidate_research"]["current_scan_available"] is False
 
 
 @pytest.mark.asyncio

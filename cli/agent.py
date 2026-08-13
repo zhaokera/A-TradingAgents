@@ -254,6 +254,8 @@ def _decision_projection(data: Dict[str, Any], *, view: str) -> Dict[str, Any]:
         "market_phase": data.get("market_phase"),
         "as_of": data.get("as_of"),
         "candidate_run_id": data.get("candidate_run_id"),
+        "candidate_research": data.get("candidate_research"),
+        "data_quality": data.get("data_quality"),
         "briefing_as_of": data.get("briefing_as_of"),
         "account": data.get("account"),
         "execution_capabilities": data.get("execution_capabilities"),

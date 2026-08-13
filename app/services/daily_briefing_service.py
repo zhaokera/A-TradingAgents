@@ -162,6 +162,13 @@ class DailyBriefingService:
             "candidate_run": {
                 "run_id": (candidate_run or {}).get("run_id"),
                 "generated_at": (candidate_run or {}).get("generated_at"),
+                "current_scan_available": (candidate_run or {}).get(
+                    "current_scan_available"
+                ),
+                "serving_mode": (candidate_run or {}).get("serving_mode"),
+                "research": deepcopy(
+                    (candidate_run or {}).get("candidate_research") or {}
+                ),
                 "candidate_count": len(candidates),
                 "executable_count": len(executable),
                 "executable_candidates": executable,

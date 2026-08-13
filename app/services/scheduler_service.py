@@ -112,7 +112,15 @@ class SchedulerService:
         existing = await self._get_db().scheduler_executions.find_one(
             {
                 "job_id": job_id,
-                "status": {"$in": ["running", "success", "failed", "missed"]},
+                "status": {
+                    "$in": [
+                        "running",
+                        "dispatched",
+                        "success",
+                        "failed",
+                        "missed",
+                    ]
+                },
                 "timestamp": {"$gte": day_start, "$lt": day_end},
             },
             sort=[("timestamp", -1)],
@@ -473,10 +481,94 @@ class SchedulerService:
 
                 executions.append(doc)
 
+            if job_id == "ai_candidate_daily_research":
+                await self._attach_candidate_research_outcomes(executions)
+
             return executions
         except Exception as e:
             logger.error(f"❌ 获取任务执行历史失败: {e}")
             return []
+
+    async def _attach_candidate_research_outcomes(
+        self,
+        executions: List[Dict[str, Any]],
+    ) -> None:
+        if not executions:
+            return
+        timestamps: List[datetime] = []
+        for execution in executions:
+            for field in ("scheduled_time", "timestamp"):
+                value = execution.get(field)
+                if isinstance(value, str):
+                    try:
+                        value = datetime.fromisoformat(value)
+                    except ValueError:
+                        value = None
+                if isinstance(value, datetime):
+                    timestamps.append(value)
+                    break
+        if not timestamps:
+            return
+        local_start = min(timestamps).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        utc_start = local_start - timedelta(hours=8)
+        jobs_cursor = self._get_db().ai_candidate_jobs.find(
+            {"created_at": {"$gte": utc_start}}
+        ).sort("created_at", -1)
+        jobs = await jobs_cursor.to_list(length=500)
+        for execution in executions:
+            scheduled = execution.get("scheduled_time") or execution.get("timestamp")
+            if isinstance(scheduled, str):
+                try:
+                    scheduled = datetime.fromisoformat(scheduled)
+                except ValueError:
+                    scheduled = None
+            if not isinstance(scheduled, datetime):
+                continue
+            scheduled_utc = scheduled - timedelta(hours=8)
+            matched: List[Dict[str, Any]] = []
+            for job in jobs:
+                created_at = job.get("created_at")
+                if not isinstance(created_at, datetime):
+                    continue
+                delta = (created_at - scheduled_utc).total_seconds()
+                if delta < -5 or delta > 300:
+                    continue
+                error = job.get("error")
+                error = dict(error) if isinstance(error, dict) else None
+                progress = job.get("progress")
+                progress = progress if isinstance(progress, dict) else {}
+                matched.append(
+                    {
+                        "job_id": str(job.get("_id")),
+                        "user_id": str(job.get("user_id") or ""),
+                        "status": str(job.get("status") or "unknown"),
+                        "stage": (error or {}).get("stage")
+                        or progress.get("stage"),
+                        "error": error,
+                        "run_id": job.get("run_id"),
+                        "created_at": created_at.isoformat(),
+                        "completed_at": (
+                            job.get("completed_at").isoformat()
+                            if isinstance(job.get("completed_at"), datetime)
+                            else None
+                        ),
+                    }
+                )
+            execution["candidate_jobs"] = matched
+            execution["dispatch_status"] = (
+                "dispatched" if matched else "dispatch_result_unlinked"
+            )
+            statuses = {item["status"] for item in matched}
+            if "running" in statuses or "queued" in statuses:
+                execution["research_status"] = "running"
+            elif "failed" in statuses:
+                execution["research_status"] = "failed"
+            elif matched and statuses == {"completed"}:
+                execution["research_status"] = "completed"
+            else:
+                execution["research_status"] = "unknown"
 
     async def count_job_executions(
         self,
@@ -849,12 +941,21 @@ class SchedulerService:
             now = datetime.now(event.scheduled_run_time.tzinfo)
             execution_time = (now - event.scheduled_run_time).total_seconds()
 
+        return_data = event.retval if isinstance(event.retval, dict) else None
+        status = (
+            "dispatched"
+            if event.job_id == "ai_candidate_daily_research"
+            and isinstance(return_data, dict)
+            and return_data.get("research_completed") is False
+            else "success"
+        )
         asyncio.create_task(self._record_job_execution(
             job_id=event.job_id,
-            status="success",
+            status=status,
             scheduled_time=event.scheduled_run_time,
             execution_time=execution_time,
             return_value=str(event.retval) if event.retval else None,
+            return_data=return_data,
             progress=100  # 任务完成，进度100%
         ))
 
@@ -892,6 +993,7 @@ class SchedulerService:
         scheduled_time: datetime = None,
         execution_time: float = None,
         return_value: str = None,
+        return_data: dict = None,
         error_message: str = None,
         traceback: str = None,
         progress: int = None,
@@ -919,7 +1021,7 @@ class SchedulerService:
             job_name = job.name if job else job_id
 
             # 如果是完成状态（success/failed），先查找是否有对应的 running 记录
-            if status in ["success", "failed"]:
+            if status in ["success", "failed", "dispatched"]:
                 # 查找最近的 running 记录（5分钟内）
                 five_minutes_ago = get_utc8_now() - timedelta(minutes=5)
                 existing_record = await db.scheduler_executions.find_one(
@@ -941,6 +1043,11 @@ class SchedulerService:
 
                     if return_value:
                         update_data["return_value"] = return_value
+                    if return_data:
+                        update_data["result"] = return_data
+                        update_data["outcome_status"] = return_data.get(
+                            "dispatch_status"
+                        ) or return_data.get("status")
                     if error_message:
                         update_data["error_message"] = error_message
                     if traceback:
@@ -983,6 +1090,11 @@ class SchedulerService:
 
             if return_value:
                 execution_record["return_value"] = return_value
+            if return_data:
+                execution_record["result"] = return_data
+                execution_record["outcome_status"] = return_data.get(
+                    "dispatch_status"
+                ) or return_data.get("status")
             if error_message:
                 execution_record["error_message"] = error_message
             if traceback:
@@ -995,6 +1107,12 @@ class SchedulerService:
             # 记录日志
             if status == "success":
                 logger.info(f"✅ [任务执行] {job_name} 执行成功，耗时: {execution_time:.2f}秒")
+            elif status == "dispatched":
+                logger.info(
+                    "✅ [任务派发] %s 已创建后台任务，耗时: %.2f秒",
+                    job_name,
+                    execution_time,
+                )
             elif status == "failed":
                 logger.error(f"❌ [任务执行] {job_name} 执行失败: {error_message}")
             elif status == "missed":
