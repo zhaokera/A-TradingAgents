@@ -1022,7 +1022,34 @@ async def test_background_job_keeps_discovery_stage_from_error_details():
             "公开全市场候选发现不可用",
             code="candidate_discovery_unavailable",
             exit_code=4,
-            details={"stage": "candidate_discovery"},
+            details={
+                "stage": "candidate_discovery",
+                "candidate_discovery": {
+                    "status": "candidate_discovery_unavailable",
+                    "source": "akshare.sina.stock_zh_a_spot+tencent_batch_quotes",
+                    "benchmark_trade_date": "2026-08-13",
+                    "provider_expected_count": 5542,
+                    "universe_count": 5539,
+                    "total_coverage_ratio": 5539 / 5542,
+                    "rejection_counts": {"future_trade_at": 1},
+                    "quality_counts": {},
+                    "provider_errors": [],
+                    "stage_sources": {
+                        "public_snapshot": {
+                            "provider": "akshare.sina.stock_zh_a_spot",
+                            "status": "ok",
+                        },
+                        "tencent_verification": {
+                            "provider": "tencent_batch_quotes",
+                            "status": "ok",
+                        },
+                    },
+                    "permission_prefilter_excluded_count": 2349,
+                    "permission_prefilter_excluded": [
+                        {"code": "300001", "reason_code": "permission_denied"}
+                    ],
+                },
+            },
         )
 
     service = AICandidateService(
@@ -1048,6 +1075,32 @@ async def test_background_job_keeps_discovery_stage_from_error_details():
 
     failed_update = jobs.update_one.await_args_list[-1].args[1]["$set"]
     assert failed_update["status"] == "failed"
+    expected_diagnostic = {
+        "stage": "candidate_discovery",
+        "candidate_discovery": {
+            "status": "candidate_discovery_unavailable",
+            "source": "akshare.sina.stock_zh_a_spot+tencent_batch_quotes",
+            "benchmark_trade_date": "2026-08-13",
+            "provider_expected_count": 5542,
+            "universe_count": 5539,
+            "total_coverage_ratio": 5539 / 5542,
+            "rejection_counts": {"future_trade_at": 1},
+            "quality_counts": {},
+            "provider_errors": [],
+            "stage_sources": {
+                "public_snapshot": {
+                    "provider": "akshare.sina.stock_zh_a_spot",
+                    "status": "ok",
+                },
+                "tencent_verification": {
+                    "provider": "tencent_batch_quotes",
+                    "status": "ok",
+                },
+            },
+            "permission_prefilter_excluded_count": 2349,
+        },
+    }
+    assert failed_update["attempts"][0]["diagnostic"] == expected_diagnostic
     assert failed_update["error"] == {
         "code": "candidate_discovery_unavailable",
         "message": "公开全市场候选发现不可用",
@@ -1058,8 +1111,10 @@ async def test_background_job_keeps_discovery_stage_from_error_details():
                 "attempt": 1,
                 "code": "candidate_discovery_unavailable",
                 "stage": "candidate_discovery",
+                "diagnostic": expected_diagnostic,
             }
         ],
+        "diagnostic": expected_diagnostic,
     }
 
 

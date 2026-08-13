@@ -20,6 +20,7 @@ from app.services.public_market_breadth import (
     MIN_PUBLIC_SNAPSHOT_COVERAGE_RATIO,
 )
 from app.services.tencent_quote_service import (
+    TENCENT_RESEARCH_FRESHNESS_REJECTION_STATUSES,
     assess_tencent_research_quote_freshness,
 )
 
@@ -41,6 +42,43 @@ _SNAPSHOT_METRIC_FAILURE_STATUSES = frozenset(
         "public_breadth_universe_too_small",
     }
 )
+
+# Stable audit vocabulary shared with consumers that validate discovery
+# metadata. These are rejection outcomes, not discovery failures.
+PUBLIC_CANDIDATE_REJECTION_KEYS = frozenset(
+    {
+        "amplitude_out_of_range",
+        "below_min_amount",
+        "below_min_circ_mv",
+        "below_min_total_mv",
+        "code_mismatch",
+        "duplicate_code",
+        "exchange_mismatch",
+        "invalid_amplitude",
+        "invalid_amount",
+        "invalid_circ_mv",
+        "invalid_limit_up",
+        "invalid_pct_chg",
+        "invalid_price",
+        "invalid_quote",
+        "invalid_response",
+        "invalid_total_mv",
+        "invalid_turnover_rate",
+        "missing_amplitude",
+        "missing_circ_mv",
+        "missing_pct_chg",
+        "missing_response",
+        "missing_total_mv",
+        "missing_turnover_rate",
+        "near_limit_up",
+        "outside_move_window",
+        "special_treatment",
+        "stale_quote",
+        "turnover_rate_out_of_range",
+        "unexpected_code",
+        "unsupported_code",
+    }
+) | TENCENT_RESEARCH_FRESHNESS_REJECTION_STATUSES
 
 logger = logging.getLogger(__name__)
 

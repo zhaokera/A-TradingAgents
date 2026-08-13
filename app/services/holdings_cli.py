@@ -74,6 +74,7 @@ from app.services.public_candidate_deep_check import (
     validate_public_technical_screen_metadata,
 )
 from app.services.public_candidate_discovery_service import (
+    PUBLIC_CANDIDATE_REJECTION_KEYS,
     discover_public_candidate_universe,
 )
 from app.services.public_candidate_earnings_risk import (
@@ -4434,28 +4435,7 @@ _PUBLIC_CANDIDATE_DISCOVERY_SCALAR_FIELDS = (
     "earnings_actual_report_period",
     "permission_prefilter_excluded_count",
 )
-_PUBLIC_DISCOVERY_REJECTION_KEYS = {
-    "amplitude_out_of_range",
-    "below_min_amount",
-    "below_min_circ_mv",
-    "below_min_total_mv",
-    "code_mismatch",
-    "duplicate_code",
-    "exchange_mismatch",
-    "invalid_amount",
-    "invalid_limit_up",
-    "invalid_price",
-    "invalid_quote",
-    "invalid_response",
-    "missing_response",
-    "near_limit_up",
-    "outside_move_window",
-    "special_treatment",
-    "stale_quote",
-    "turnover_rate_out_of_range",
-    "unexpected_code",
-    "unsupported_code",
-}
+_PUBLIC_DISCOVERY_REJECTION_KEYS = set(PUBLIC_CANDIDATE_REJECTION_KEYS)
 _PUBLIC_DISCOVERY_QUALITY_KEYS = {
     "invalid_volume_ratio",
     "missing_volume_ratio",

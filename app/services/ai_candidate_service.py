@@ -130,6 +130,56 @@ class InvalidAICandidateSelectionError(ValueError):
     """The requested codes are not part of the persisted run."""
 
 
+_FAILURE_DISCOVERY_AUDIT_FIELDS = (
+    "status",
+    "source",
+    "benchmark_trade_date",
+    "checked_at",
+    "freshness",
+    "degraded",
+    "cache_age_seconds",
+    "attempt_count",
+    "provider_health",
+    "provider_expected_count",
+    "provider_expected_exchange_counts",
+    "raw_row_count",
+    "unique_row_count",
+    "universe_count",
+    "exchange_counts",
+    "total_coverage_ratio",
+    "exchange_coverage_ratio",
+    "eligible_count",
+    "public_preselected_count",
+    "tencent_requested_count",
+    "tencent_minimum_verified_count",
+    "tencent_verified_count",
+    "tencent_rank_population_count",
+    "selected_count",
+    "permission_prefilter_excluded_count",
+    "rejection_counts",
+    "quality_counts",
+    "provider_errors",
+    "stage_sources",
+)
+
+
+def _candidate_failure_diagnostic(details: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(details, Mapping):
+        return None
+    diagnostic: Dict[str, Any] = {}
+    stage = details.get("stage")
+    if isinstance(stage, str) and stage:
+        diagnostic["stage"] = stage
+    discovery = details.get("candidate_discovery")
+    if isinstance(discovery, Mapping):
+        diagnostic["candidate_discovery"] = {
+            field: deepcopy(discovery[field])
+            for field in _FAILURE_DISCOVERY_AUDIT_FIELDS
+            if field in discovery
+        }
+    return diagnostic or None
+
+
 def _finite_number(*values: Any) -> Optional[float]:
     for value in values:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -2286,13 +2336,15 @@ class AICandidateService:
                 error_code = str(
                     getattr(exc, "code", "candidate_research_failed")
                 )
-                attempts.append(
-                    {
-                        "attempt": attempt,
-                        "code": error_code,
-                        "stage": str(stage) if stage else None,
-                    }
-                )
+                diagnostic = _candidate_failure_diagnostic(details)
+                attempt_audit = {
+                    "attempt": attempt,
+                    "code": error_code,
+                    "stage": str(stage) if stage else None,
+                }
+                if diagnostic is not None:
+                    attempt_audit["diagnostic"] = diagnostic
+                attempts.append(attempt_audit)
                 if (
                     error_code in _RETRYABLE_RESEARCH_CODES
                     and attempt < AI_CANDIDATE_RESEARCH_MAX_ATTEMPTS
@@ -2320,6 +2372,8 @@ class AICandidateService:
                     "attempt_count": attempt,
                     "attempts": deepcopy(attempts),
                 }
+                if diagnostic is not None:
+                    error["diagnostic"] = diagnostic
                 await jobs.update_one(
                     {"_id": job_id, "user_id": str(user_id)},
                     {

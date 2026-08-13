@@ -6609,6 +6609,46 @@ def test_public_discovery_unavailable_is_structured_stderr_error(monkeypatch):
     assert "rows" not in expected_details["candidate_discovery"]
 
 
+@pytest.mark.parametrize(
+    "rejection_reason",
+    [
+        "future_trade_at",
+        "stale_trade_at",
+        "off_session",
+        "trade_date_mismatch",
+        "missing_pct_chg",
+        "missing_turnover_rate",
+        "invalid_total_mv",
+    ],
+)
+def test_public_discovery_metadata_accepts_producer_rejection_reasons(
+    rejection_reason,
+):
+    discovery = _make_public_research_discovery("ok")
+    metadata = discovery["candidate_discovery"]
+    metadata["rejection_counts"] = {rejection_reason: 1}
+
+    assert holdings_cli_module._valid_public_candidate_discovery_metadata(
+        metadata,
+        discovery_status="ok",
+        tencent_stage_status="ok",
+        raw_definitions=discovery["definitions"],
+    ) is True
+
+
+def test_public_discovery_metadata_rejects_unknown_rejection_reason():
+    discovery = _make_public_research_discovery("ok")
+    metadata = discovery["candidate_discovery"]
+    metadata["rejection_counts"] = {"unreviewed_provider_status": 1}
+
+    assert holdings_cli_module._valid_public_candidate_discovery_metadata(
+        metadata,
+        discovery_status="ok",
+        tencent_stage_status="ok",
+        raw_definitions=discovery["definitions"],
+    ) is False
+
+
 def test_public_builder_error_preserves_valid_failure_snapshot_coverage(monkeypatch):
     snapshot = _make_incomplete_public_snapshot()
     context = make_opportunity_market_context(
