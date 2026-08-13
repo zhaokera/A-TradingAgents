@@ -1094,6 +1094,77 @@ class AICandidateService:
                 result[field] = value.isoformat()
         return result
 
+    async def _latest_job_audit(
+        self,
+        user_id: str,
+        *,
+        run_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        db = await self._get_db()
+        document = await db["ai_candidate_jobs"].find_one(
+            {"user_id": str(user_id)},
+            sort=[("created_at", -1)],
+        )
+        if not isinstance(document, Mapping):
+            return None
+        job = self._serialize_job(document)
+        progress = job.get("progress")
+        progress = progress if isinstance(progress, Mapping) else {}
+        error = job.get("error")
+        error = deepcopy(dict(error)) if isinstance(error, Mapping) else None
+        stage = (
+            (error or {}).get("stage")
+            or progress.get("stage")
+            or ("completed" if job.get("status") == "completed" else None)
+        )
+        effective_now = now or datetime.now(timezone.utc)
+        if effective_now.tzinfo is None:
+            effective_now = effective_now.replace(tzinfo=timezone.utc)
+        created_at = job.get("created_at")
+        try:
+            created_dt = datetime.fromisoformat(
+                str(created_at).replace("Z", "+00:00")
+            )
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            created_local_date = created_dt.astimezone(
+                timezone(timedelta(hours=8))
+            ).date()
+        except (TypeError, ValueError):
+            created_local_date = None
+        is_today = created_local_date == effective_now.astimezone(
+            timezone(timedelta(hours=8))
+        ).date()
+        current_scan_available = bool(
+            is_today
+            and job.get("status") == "completed"
+            and job.get("run_id")
+            and str(job.get("run_id")) == str(run_id or "")
+        )
+        status = str(job.get("status") or "unknown")
+        if current_scan_available:
+            serving_mode = "current_completed_run"
+        elif run_id:
+            serving_mode = "stale_completed_run_fallback"
+        elif status in {"queued", "running"}:
+            serving_mode = "candidate_research_pending"
+        else:
+            serving_mode = "candidate_research_unavailable"
+        return {
+            "job_id": job.get("job_id"),
+            "status": status,
+            "stage": stage,
+            "error": error,
+            "created_at": job.get("created_at"),
+            "started_at": job.get("started_at"),
+            "completed_at": job.get("completed_at"),
+            "run_id": job.get("run_id"),
+            "is_today": is_today,
+            "current_scan_available": current_scan_available,
+            "serving_mode": serving_mode,
+        }
+
     @staticmethod
     def _update_performance(
         candidate: Dict[str, Any],
@@ -2451,18 +2522,29 @@ class AICandidateService:
                 user_ids.append(user_id)
         started = 0
         failed = 0
+        jobs: List[Dict[str, Any]] = []
         for user_id in user_ids:
             try:
                 job = await self.start_run(user_id, max_candidates=5)
+                jobs.append(
+                    {
+                        "user_id": user_id,
+                        "job_id": job.get("job_id"),
+                        "status": job.get("status"),
+                    }
+                )
                 if job.get("status") == "queued":
                     started += 1
             except Exception:
                 failed += 1
                 logger.exception("Daily AI candidate research failed to start: user=%s", user_id)
         return {
+            "dispatch_status": "candidate_jobs_started",
+            "research_completed": False,
             "active_user_count": len(user_ids),
             "started_count": started,
             "failed_count": failed,
+            "jobs": jobs,
         }
 
     async def performance_summary(self, user_id: str) -> Dict[str, Any]:
@@ -2631,7 +2713,27 @@ class AICandidateService:
             sort=[("generated_at", -1)],
         )
         if not document:
-            return None
+            job_audit = await self._latest_job_audit(str(user_id))
+            if not job_audit:
+                return None
+            job_status = str(job_audit.get("status") or "unknown")
+            return {
+                "status": (
+                    "candidate_research_running"
+                    if job_status in {"queued", "running"}
+                    else "candidate_research_failed"
+                ),
+                "candidates": [],
+                "candidate_count": 0,
+                "candidate_research": job_audit,
+                "current_scan_available": False,
+                "serving_mode": job_audit.get("serving_mode"),
+                "execution": {
+                    "actionable": False,
+                    "status": "research_unavailable",
+                    "requires_daily_decision": True,
+                },
+            }
         if refresh_quotes:
             document = await self._refresh_document(
                 document,
@@ -2657,7 +2759,21 @@ class AICandidateService:
             await self._apply_macro_policy(document)
             await self._apply_account_policy(document, user_id=str(user_id))
             self._update_run_counts(document)
-        return self._serialize_run(document)
+        result = self._serialize_run(document)
+        job_audit = await self._latest_job_audit(
+            str(user_id),
+            run_id=str(result.get("run_id") or ""),
+        )
+        if job_audit:
+            result["candidate_research"] = job_audit
+            result["current_scan_available"] = bool(
+                job_audit.get("current_scan_available")
+            )
+            result["serving_mode"] = job_audit.get("serving_mode")
+        else:
+            result["current_scan_available"] = False
+            result["serving_mode"] = "candidate_research_not_scheduled"
+        return result
 
     async def reconcile_user_governance(
         self,

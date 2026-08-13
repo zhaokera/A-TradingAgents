@@ -69,6 +69,7 @@ AVOID_REASON_CODES = (
     "hard_data_failure",
 )
 WAIT_REASON_CODES = (
+    "current_candidate_scan_unavailable",
     "account_blocked",
     "calendar_unknown",
     "profile_incomplete",
@@ -739,8 +740,11 @@ class DailyDecisionService:
         briefing: Mapping[str, Any],
         profile: Mapping[str, Any],
         allocation: Mapping[str, Any],
+        current_scan_available: bool = True,
     ) -> list[str]:
         reasons = DailyDecisionService._explicit_reason_codes(candidate)
+        if not current_scan_available:
+            reasons.append("current_candidate_scan_unavailable")
         account = briefing.get("account")
         account = account if isinstance(account, Mapping) else {}
         total_assets = _finite_decimal(account.get("total_assets"))
@@ -970,6 +974,30 @@ class DailyDecisionService:
                 or candidate_market.get("domestic_regime")
                 or "red"
             )
+        market["session"] = phase
+        market["is_trading_hours"] = phase in LIVE_PHASES
+        live_gate_trading = bool(
+            isinstance(live_gate, Mapping)
+            and live_gate.get("usable") is True
+            and live_gate.get("is_trading_hours") is True
+        )
+        current_scan_available = (
+            candidate_run.get("current_scan_available") is not False
+        )
+        execution_usable = (
+            phase in LIVE_PHASES
+            and live_gate_trading
+            and current_scan_available
+        )
+        market["execution_usable"] = execution_usable
+        if execution_usable:
+            market["execution_status"] = "live_market_gate_usable"
+        elif phase in LIVE_PHASES and not current_scan_available:
+            market["execution_status"] = "current_candidate_scan_unavailable"
+        else:
+            market["execution_status"] = (
+                "research_snapshot_not_execution_decision"
+            )
         bucket_items: Dict[str, list[Dict[str, Any]]] = {name: [] for name in BUCKETS}
         profile_errors: list[Any] = []
         profile_conflicts: list[Any] = []
@@ -1017,6 +1045,9 @@ class DailyDecisionService:
                 briefing=briefing,
                 profile=profile,
                 allocation=allocation,
+                current_scan_available=(
+                    candidate_run.get("current_scan_available") is not False
+                ),
             )
             if avoid_reasons:
                 bucket = "avoid"
@@ -1215,6 +1246,9 @@ class DailyDecisionService:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "candidate_run_id": candidate_run.get("run_id"),
             "candidate_generated_at": candidate_run.get("generated_at"),
+            "candidate_research": deepcopy(
+                candidate_run.get("candidate_research") or {}
+            ),
             "briefing_as_of": briefing.get("as_of"),
             "market_session": stable_session,
             "account": deepcopy(account),
@@ -1244,6 +1278,10 @@ class DailyDecisionService:
             "permission_prefilter_excluded": permission_prefilter_excluded,
             "data_quality": {
                 "candidate_run_available": bool(candidate_run),
+                "current_candidate_scan_available": (
+                    candidate_run.get("current_scan_available") is not False
+                ),
+                "candidate_serving_mode": candidate_run.get("serving_mode"),
                 "profile_errors": profile_errors,
                 "profile_conflicts": profile_conflicts,
                 "calendar_authoritative": session.get("calendar_authoritative"),
