@@ -420,6 +420,21 @@ def assess_tencent_research_quote_freshness(
     }
 
 
+TENCENT_RESEARCH_FRESHNESS_REJECTION_STATUSES = frozenset(
+    {
+        "future_benchmark_trade_date",
+        "future_trade_at",
+        "invalid_benchmark_trade_date",
+        "invalid_now",
+        "invalid_source",
+        "missing_trade_at",
+        "off_session",
+        "stale_trade_at",
+        "trade_date_mismatch",
+    }
+)
+
+
 def _normalize_bar_date(value: Any) -> Optional[str]:
     if isinstance(value, datetime):
         return value.date().isoformat()
