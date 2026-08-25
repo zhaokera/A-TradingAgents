@@ -255,6 +255,19 @@ def _sample_decision() -> Dict[str, Any]:
             }
         },
         "market": {"combined_regime": "green"},
+        "rolling_pool": {
+            "capacity": 100,
+            "total_count": 70,
+            "formal_research_capacity": 15,
+            "formal_research_count": 15,
+            "candidates": [
+                {
+                    "code": "600406",
+                    "selected_for_formal_research": True,
+                    "selection_reason": "dynamic_formal_research_selected",
+                }
+            ],
+        },
         "summary": {
             "buy_now_count": 0,
             "condition_order_count": 1,
@@ -288,6 +301,8 @@ def test_decision_today_summary_is_compact_and_machine_readable(
     assert data["authority"] == "software_baseline"
     assert data["is_final_decision"] is False
     assert data["execution_capabilities"]["condition_order"]["eligible"] is True
+    assert data["rolling_pool"]["total_count"] == 70
+    assert data["rolling_pool"]["formal_research_count"] == 15
     assert data["condition_order"][0] == {
         "code": "600406",
         "name": "国电南瑞",
@@ -332,6 +347,7 @@ def test_decision_today_actionable_omits_wait_and_avoid(fake_client: FakeClient)
     data = json.loads(result.stdout)["data"]
     assert set(data).isdisjoint({"wait", "avoid"})
     assert data["condition_order"][0]["code"] == "600406"
+    assert data["rolling_pool"]["capacity"] == 100
 
 
 def test_decision_explain_returns_one_symbol_with_bucket(fake_client: FakeClient) -> None:

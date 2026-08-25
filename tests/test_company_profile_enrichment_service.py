@@ -605,6 +605,15 @@ def evidence_doc(source, endpoint, **fields):
     }
 
 
+def fresh_runtime_evidence_doc(source, endpoint, **fields):
+    return evidence_doc(
+        source,
+        endpoint,
+        retrieved_at=datetime.now(timezone.utc) - timedelta(days=1),
+        **fields,
+    )
+
+
 def test_normalize_provider_sector_keeps_raw_taxonomy_and_version():
     assert normalize_provider_sector("计算机") == {
         "value": "信息技术",
@@ -973,7 +982,9 @@ def test_invalid_or_unproven_documents_are_display_only():
 
 @pytest.mark.asyncio
 async def test_refresh_false_reads_cache_without_calling_providers():
-    cached = evidence_doc("tushare", "stock_basic", industry="cached industry")
+    cached = fresh_runtime_evidence_doc(
+        "tushare", "stock_basic", industry="cached industry"
+    )
     collection = FakeCollection([{"code": "000001", "source_documents": [cached]}])
     db = FakeDatabase(collection)
     fetcher = AsyncMock(side_effect=AssertionError("refresh=False must not fetch"))
@@ -991,18 +1002,18 @@ async def test_refresh_false_reads_cache_without_calling_providers():
 @pytest.mark.asyncio
 async def test_refresh_true_skips_providers_for_fresh_complete_cache():
     cached_documents = [
-        evidence_doc(
+        fresh_runtime_evidence_doc(
             "tushare",
             "stock_basic",
             industry="计算机",
             provider_sector="计算机",
         ),
-        evidence_doc(
+        fresh_runtime_evidence_doc(
             "tushare",
             "stock_company",
             main_business="真实主营",
         ),
-        evidence_doc(
+        fresh_runtime_evidence_doc(
             "tushare",
             "fina_mainbz",
             report_period="2026-03-31",
@@ -1094,7 +1105,9 @@ async def test_recent_failed_refresh_attempt_backoff_skips_provider_calls():
 
 @pytest.mark.asyncio
 async def test_refresh_persists_source_documents_and_structured_errors():
-    fresh = evidence_doc("tushare", "stock_basic", industry="fresh industry")
+    fresh = fresh_runtime_evidence_doc(
+        "tushare", "stock_basic", industry="fresh industry"
+    )
     collection = FakeCollection(
         [
             {
@@ -1252,8 +1265,12 @@ async def test_slower_refresh_cannot_overwrite_newer_generation():
     slow_started = asyncio.Event()
     release_slow = asyncio.Event()
 
-    slow_doc = evidence_doc("tushare", "stock_basic", industry="slow generation")
-    fast_doc = evidence_doc("tushare", "stock_basic", industry="fast generation")
+    slow_doc = fresh_runtime_evidence_doc(
+        "tushare", "stock_basic", industry="slow generation"
+    )
+    fast_doc = fresh_runtime_evidence_doc(
+        "tushare", "stock_basic", industry="fast generation"
+    )
 
     async def slow_fetch(_code):
         slow_started.set()
@@ -1395,7 +1412,7 @@ async def test_resolve_many_normalises_exchange_code_forms(input_code):
             {
                 "code": "600406",
                 "source_documents": [
-                    evidence_doc(
+                    fresh_runtime_evidence_doc(
                         "tushare",
                         "stock_basic",
                         code="600406",

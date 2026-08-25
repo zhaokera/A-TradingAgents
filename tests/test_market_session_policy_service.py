@@ -255,6 +255,26 @@ async def test_provider_timestamp_allows_only_five_seconds_of_clock_skew():
 
 
 @pytest.mark.asyncio
+async def test_provider_timestamp_107_seconds_in_future_remains_fail_closed():
+    service = MarketSessionPolicyService(
+        calendar=StubCalendar(authoritative_calendar())
+    )
+
+    result = await service.quote_status(
+        {
+            "source": "tencent",
+            "provider_updated_at": "2026-08-20T10:01:47+08:00",
+            "price": 10.0,
+        },
+        now=datetime.fromisoformat("2026-08-20T10:00:00+08:00"),
+    )
+
+    assert result["status"] == "future_provider_timestamp"
+    assert result["actionable"] is False
+    assert result["display_usable"] is False
+
+
+@pytest.mark.asyncio
 async def test_quote_status_preserves_session_subsecond_precision_for_freshness():
     policy = MarketSessionPolicyService(calendar=StubCalendar(authoritative_calendar()))
     session = await policy.classify(

@@ -3501,12 +3501,12 @@ def test_manual_candidate_earnings_unavailable_fails_closed(monkeypatch):
     assert lot_plan["suggested_quantity"] == 0
 
 
-def test_manual_candidates_reject_more_than_earnings_review_capacity():
+def test_manual_candidates_reject_more_than_rolling_pool_capacity():
     with pytest.raises(CLIError) as exc_info:
         build_opportunities_payload(
             make_fake_db(),
             username="hermes",
-            candidate_codes=[f"600{index:03d}" for index in range(9)],
+            candidate_codes=[f"60{index:04d}" for index in range(101)],
         )
 
     assert exc_info.value.code == "too_many_manual_candidates"
@@ -5176,7 +5176,7 @@ def test_earnings_command_validates_codes_before_market_context(
     }
 
 
-def test_earnings_command_rejects_more_than_eight_codes_before_market_context(
+def test_earnings_command_rejects_more_than_pool_capacity_before_market_context(
     monkeypatch,
 ):
     context_called = []
@@ -5186,8 +5186,8 @@ def test_earnings_command_rejects_more_than_eight_codes_before_market_context(
         lambda: context_called.append(True),
     )
     args = ["earnings"]
-    for index in range(9):
-        args.extend(["--code", f"60000{index}"])
+    for index in range(101):
+        args.extend(["--code", f"60{index:04d}"])
 
     result = CliRunner().invoke(holdings_app, args)
 
@@ -5473,7 +5473,7 @@ def test_notices_command_validates_codes_before_market_context(
     }
 
 
-def test_notices_command_rejects_more_than_eight_codes_before_market_context(
+def test_notices_command_rejects_more_than_pool_capacity_before_market_context(
     monkeypatch,
 ):
     context_called = []
@@ -5483,8 +5483,8 @@ def test_notices_command_rejects_more_than_eight_codes_before_market_context(
         lambda: context_called.append(True),
     )
     args = ["notices"]
-    for index in range(9):
-        args.extend(["--code", f"60000{index}"])
+    for index in range(101):
+        args.extend(["--code", f"60{index:04d}"])
 
     result = CliRunner().invoke(holdings_app, args)
 
@@ -5620,7 +5620,12 @@ def _make_public_deep_check(
         for index, definition in enumerate(rejected_definitions)
     ]
     candidates = []
-    for code in selected_codes:
+    deep_codes = set(earnings_screen["selected_codes"][:15])
+    earnings_by_code = {
+        item["code"]: item for item in earnings_screen["results"]
+    }
+    blocked_code_set = set(earnings_screen["blocked_codes"])
+    for code in technical_selected_codes:
         definition = definitions_by_code.get(code, {})
         source_quote = discovery.get("quote_map", {}).get(code, {})
         candidates.append(
@@ -5660,7 +5665,31 @@ def _make_public_deep_check(
                     "nearest_action": None,
                     "is_reference_only": True,
                 },
-                "risk_flags": [],
+                "risk_flags": (
+                    [
+                        {
+                            "code": "earnings_risk_blocked",
+                            "severity": "blocked",
+                            "message": "业绩硬风险复核阻止进入执行层。",
+                        }
+                    ]
+                    if code in blocked_code_set
+                    else []
+                ),
+                "research_tier": "deep" if code in deep_codes else "structured",
+                "rolling_pool_state": "current",
+                "structured_review": {
+                    "technical": {"status": "passed"},
+                    "earnings": earnings_by_code[code],
+                    "hard_risk_status": (
+                        "blocked" if code in blocked_code_set else "clear"
+                    ),
+                    "hard_risk_reasons": (
+                        ["earnings_risk_blocked"]
+                        if code in blocked_code_set
+                        else []
+                    ),
+                },
                 "triggers": {
                     "source": "configured_historical_reference",
                     "observation_zone": definition.get("observation_zone"),
@@ -5681,6 +5710,12 @@ def _make_public_deep_check(
             "passed_count": len(technical_selected_codes),
             "selected_count": len(technical_selected_codes),
             "selected_codes": list(technical_selected_codes),
+            "deep_research_selected_count": min(
+                len(earnings_screen["selected_codes"]), 15
+            ),
+            "deep_research_selected_codes": list(
+                earnings_screen["selected_codes"][:15]
+            ),
             "status_counts": {
                 **(
                     {"ok": len(technical_selected_codes)}
@@ -8337,7 +8372,7 @@ def test_public_research_payload_rejects_invalid_discovery_definition_codes(
     )
 
 
-def test_public_research_payload_screens_more_than_eight_and_keeps_top_eight(
+def test_public_research_payload_keeps_all_technical_passes_below_pool_cap(
     monkeypatch,
 ):
     discovery = _make_public_research_discovery(candidate_count=9)
@@ -8372,17 +8407,31 @@ def test_public_research_payload_screens_more_than_eight_and_keeps_top_eight(
                 "amplitude": 3.0,
             }
         )
-    selected_codes = [item["code"] for item in discovery["definitions"][:8]]
+    selected_codes = [item["code"] for item in discovery["definitions"]]
     deep_check = _make_public_deep_check(discovery, codes=selected_codes)
     deep_check["technical_screen"] = {
         "status": "ok",
         "screened_count": 9,
         "passed_count": 9,
-        "selected_count": 8,
+        "selected_count": 9,
         "selected_codes": selected_codes,
+        "deep_research_selected_count": 9,
+        "deep_research_selected_codes": selected_codes,
         "status_counts": {"ok": 9},
         "closest_rejection_count": 0,
         "closest_rejections": [],
+    }
+    deep_check["pipeline_metrics"] = {
+        "rolling_pool_capacity": 100,
+        "deep_research_capacity": 15,
+        "technical_input_count": 9,
+        "technical_worker_count": 6,
+        "technical_data_calls": 9,
+        "technical_cache_hit_count": 7,
+        "earnings_batch_calls": 1,
+        "notice_batch_calls": 1,
+        "candidate_build_calls": 1,
+        "total_seconds": 12.5,
     }
     monkeypatch.setattr(
         holdings_cli_module,
@@ -8400,8 +8449,11 @@ def test_public_research_payload_screens_more_than_eight_and_keeps_top_eight(
     assert [item["code"] for item in payload["data"]["candidates"]] == selected_codes
     assert candidate_discovery["technical_screened_count"] == 9
     assert candidate_discovery["technical_passed_count"] == 9
-    assert candidate_discovery["technical_selected_count"] == 8
-    assert candidate_discovery["technical_checked_count"] == 8
+    assert candidate_discovery["technical_selected_count"] == 9
+    assert candidate_discovery["technical_checked_count"] == 9
+    assert candidate_discovery["deep_research_selected_count"] == 9
+    assert candidate_discovery["pipeline_metrics"]["rolling_pool_capacity"] == 100
+    assert candidate_discovery["pipeline_metrics"]["technical_cache_hit_count"] == 7
     assert candidate_discovery["technical_screen_status_counts"] == {"ok": 9}
     assert candidate_discovery["stage_sources"]["technical_screen"] == {
         "provider": "tencent_daily_bars",
@@ -8492,7 +8544,7 @@ def test_public_research_payload_exposes_closest_technical_rejections_safely(
     _assert_public_research_safety(payload)
 
 
-def test_public_research_payload_filters_loss_forecasts_with_audit_evidence(
+def test_public_research_payload_keeps_loss_forecasts_as_blocked_audit_entries(
     monkeypatch,
 ):
     discovery = _make_public_research_discovery(candidate_count=3)
@@ -8518,12 +8570,16 @@ def test_public_research_payload_filters_loss_forecasts_with_audit_evidence(
     )
 
     candidate_discovery = payload["data"]["candidate_discovery"]
-    assert [item["code"] for item in payload["data"]["candidates"]] == selected_codes
+    assert [item["code"] for item in payload["data"]["candidates"]] == technical_codes
+    assert all(
+        item["structured_review"]["hard_risk_status"] == "blocked"
+        for item in payload["data"]["candidates"][:2]
+    )
     assert candidate_discovery["technical_selected_count"] == 3
     assert candidate_discovery["earnings_screened_count"] == 3
     assert candidate_discovery["earnings_blocked_count"] == 2
     assert candidate_discovery["earnings_selected_count"] == 1
-    assert candidate_discovery["technical_checked_count"] == 1
+    assert candidate_discovery["technical_checked_count"] == 3
     assert candidate_discovery["earnings_report_period"] == "20260630"
     assert candidate_discovery["earnings_actual_report_period"] == "20260331"
     assert candidate_discovery["earnings_screen_status_counts"] == {
@@ -8555,7 +8611,7 @@ def test_public_research_payload_filters_loss_forecasts_with_audit_evidence(
     _assert_public_research_safety(payload)
 
 
-def test_public_research_payload_filters_latest_actual_loss_with_audit_evidence(
+def test_public_research_payload_keeps_latest_actual_loss_as_blocked_audit_entry(
     monkeypatch,
 ):
     discovery = _make_public_research_discovery(candidate_count=2)
@@ -8581,9 +8637,10 @@ def test_public_research_payload_filters_latest_actual_loss_with_audit_evidence(
     )
 
     candidate_discovery = payload["data"]["candidate_discovery"]
-    assert [item["code"] for item in payload["data"]["candidates"]] == [
-        selected_code
-    ]
+    assert [item["code"] for item in payload["data"]["candidates"]] == technical_codes
+    assert payload["data"]["candidates"][0]["structured_review"][
+        "hard_risk_status"
+    ] == "blocked"
     assert candidate_discovery["earnings_blocked_count"] == 1
     assert candidate_discovery["earnings_actual_status_counts"] == {
         "actual_loss": 1,
@@ -8599,7 +8656,7 @@ def test_public_research_payload_filters_latest_actual_loss_with_audit_evidence(
     _assert_public_research_safety(payload)
 
 
-def test_public_research_payload_returns_empty_when_all_technical_survivors_forecast_loss(
+def test_public_research_payload_keeps_all_loss_survivors_as_blocked_audit_entries(
     monkeypatch,
 ):
     discovery = _make_public_research_discovery(candidate_count=2)
@@ -8610,7 +8667,6 @@ def test_public_research_payload_returns_empty_when_all_technical_survivors_fore
         technical_codes=technical_codes,
         blocked_codes=technical_codes,
     )
-    deep_check["candidates"] = []
     monkeypatch.setattr(
         holdings_cli_module,
         "build_market_status_payload",
@@ -8624,10 +8680,14 @@ def test_public_research_payload_returns_empty_when_all_technical_survivors_fore
     )
 
     candidate_discovery = payload["data"]["candidate_discovery"]
-    assert payload["data"]["candidates"] == []
+    assert [item["code"] for item in payload["data"]["candidates"]] == technical_codes
+    assert all(
+        item["structured_review"]["hard_risk_status"] == "blocked"
+        for item in payload["data"]["candidates"]
+    )
     assert candidate_discovery["earnings_blocked_count"] == 2
     assert candidate_discovery["earnings_selected_count"] == 0
-    assert candidate_discovery["technical_checked_count"] == 0
+    assert candidate_discovery["technical_checked_count"] == 2
     assert candidate_discovery["stage_sources"]["technical_deep_check"] == {
         "provider": "cninfo_dividend_calendar",
         "status": "not_called_no_earnings_survivors",
@@ -9002,6 +9062,19 @@ def test_public_research_payload_preserves_complete_discovery_and_sanitizes_all_
         "provider": holdings_cli_module.EARNINGS_REVIEW_SOURCE,
         "status": "not_called_legacy_deep_check",
     }
+    expected_discovery.update(
+        {
+            "notice_reviewed_count": 0,
+            "notice_hard_blocked_count": 0,
+            "notice_manual_review_count": 0,
+            "pipeline_metrics": {},
+        }
+    )
+    expected_discovery["stage_sources"]["recent_notice_review"] = {
+        "provider": holdings_cli_module.NOTICE_REVIEW_SOURCE,
+        "status": "not_requested",
+        "error_type": None,
+    }
     assert payload["ok"] is True
     assert payload["data"]["mode"] == "research_only"
     assert payload["data"]["candidate_discovery"] == expected_discovery
@@ -9087,6 +9160,10 @@ def test_public_research_payload_preserves_no_candidate_coverage_without_source_
     }
     expected_discovery["stage_sources"]["earnings_forecast_review"] = {
         "provider": holdings_cli_module.EARNINGS_REVIEW_SOURCE,
+        "status": "not_called_no_candidates",
+    }
+    expected_discovery["stage_sources"]["recent_notice_review"] = {
+        "provider": holdings_cli_module.NOTICE_REVIEW_SOURCE,
         "status": "not_called_no_candidates",
     }
     assert payload["data"]["candidate_discovery"] == expected_discovery

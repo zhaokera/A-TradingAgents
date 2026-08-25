@@ -1170,12 +1170,77 @@ class TencentQuoteService:
         return quote
 
     async def get_quotes(self, codes: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+        requests: List[tuple[str, str, str]] = []
+        seen_provider_codes: set[str] = set()
+        for value in codes:
+            raw = str(value or "").strip().lower()
+            provider_code = (
+                raw if raw in _TENCENT_MAJOR_INDEX_SYMBOLS else normalize_cn_code(raw)
+            )
+            if not provider_code or provider_code in seen_provider_codes:
+                continue
+            seen_provider_codes.add(provider_code)
+            result_code = normalize_cn_code(provider_code)
+            cache_code = (
+                provider_code
+                if provider_code in _TENCENT_MAJOR_INDEX_SYMBOLS
+                else result_code
+            )
+            requests.append((result_code, provider_code, cache_code))
+
         result: Dict[str, Dict[str, Any]] = {}
-        for code in codes:
-            normalized = normalize_cn_code(code)
-            quote = await self.get_quote(str(code))
-            if quote:
-                result[normalized] = quote
+        missing: List[tuple[str, str, str]] = []
+        now = time.time()
+        async with self._lock:
+            for result_code, provider_code, cache_code in requests:
+                cached = self._cache.get(cache_code)
+                if cached and (now - self._cache_ts.get(cache_code, 0)) < self._ttl:
+                    result[result_code] = dict(cached)
+                else:
+                    missing.append((result_code, provider_code, cache_code))
+
+        if not missing:
+            return result
+        batch = await asyncio.to_thread(
+            fetch_tencent_quotes_batched_sync,
+            [provider_code for _, provider_code, _ in missing],
+            timeout=10.0,
+        )
+        if not isinstance(batch, Mapping) or batch.get("status") != "ok":
+            return result
+        rows = batch.get("rows")
+        if not isinstance(rows, list):
+            return result
+        rows_by_key: Dict[str, Dict[str, Any]] = {}
+        for raw_row in rows:
+            if not isinstance(raw_row, Mapping):
+                continue
+            row = dict(raw_row)
+            if row.get("parse_status") not in {None, "ok"}:
+                continue
+            provider_symbol = str(row.get("provider_symbol") or "").lower()
+            key = (
+                provider_symbol
+                if provider_symbol in _TENCENT_MAJOR_INDEX_SYMBOLS
+                else normalize_cn_code(row.get("code"))
+            )
+            if key:
+                rows_by_key[key] = row
+
+        refreshed_at = time.time()
+        async with self._lock:
+            for result_code, provider_code, cache_code in missing:
+                lookup_key = (
+                    provider_code
+                    if provider_code in _TENCENT_MAJOR_INDEX_SYMBOLS
+                    else result_code
+                )
+                quote = rows_by_key.get(lookup_key)
+                if quote is None:
+                    continue
+                self._cache[cache_code] = dict(quote)
+                self._cache_ts[cache_code] = refreshed_at
+                result[result_code] = dict(quote)
         return result
 
 

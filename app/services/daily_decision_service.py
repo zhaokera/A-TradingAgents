@@ -58,6 +58,8 @@ VALID_PHASES = frozenset(
     }
 )
 BUCKETS = ("avoid", "wait", "buy_now", "condition_order")
+FORMAL_RESEARCH_CAPACITY = 15
+ROLLING_POOL_CAPACITY = 100
 
 AVOID_REASON_CODES = (
     "plan_invalidated",
@@ -160,6 +162,97 @@ def _permission_prefilter_reason(
     market_permissions = execution_capabilities.get("market_permissions")
     permission = permission_for_code(code, market_permissions)
     return permission.get("exclusion_reason_code")
+
+
+def _candidate_formal_research_order(
+    candidate: Mapping[str, Any],
+) -> tuple[int, int, Decimal, Decimal, Decimal, str]:
+    state = str(candidate.get("rolling_pool_state") or "current")
+    hard_blocked = _candidate_has_hard_risk(candidate)
+    objective_order = {
+        "core": 0,
+        "adjacent": 1,
+        "non_core": 2,
+    }.get(str(candidate.get("objective_tier") or ""), 1)
+    plan = candidate.get("price_plan")
+    plan = plan if isinstance(plan, Mapping) else {}
+    distance = _finite_decimal(plan.get("distance_to_entry_pct"))
+    rank_score = _finite_decimal(candidate.get("rank_score")) or Decimal(0)
+    rank = _finite_decimal(candidate.get("rank")) or Decimal("Infinity")
+    return (
+        1 if state in {"expired", "invalidated"} or hard_blocked else 0,
+        objective_order,
+        abs(distance) if distance is not None else Decimal("Infinity"),
+        -rank_score,
+        rank,
+        _normalise_code(candidate.get("code")),
+    )
+
+
+def _candidate_has_hard_risk(candidate: Mapping[str, Any]) -> bool:
+    structured = candidate.get("structured_review")
+    structured = structured if isinstance(structured, Mapping) else {}
+    return bool(
+        candidate.get("earnings_risk_blocked") is True
+        or candidate.get("notice_risk_blocked") is True
+        or structured.get("hard_risk_clear") is False
+    )
+
+
+def _select_formal_research_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    capacity: int = FORMAL_RESEARCH_CAPACITY,
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    ordered = sorted(
+        (dict(item) for item in candidates),
+        key=_candidate_formal_research_order,
+    )
+    selected: list[Dict[str, Any]] = []
+    audit: list[Dict[str, Any]] = []
+    for candidate in ordered:
+        state = str(candidate.get("rolling_pool_state") or "current")
+        hard_blocked = _candidate_has_hard_risk(candidate)
+        selectable = state not in {"expired", "invalidated"} and not hard_blocked
+        chosen = selectable and len(selected) < max(0, capacity)
+        if chosen:
+            selected.append(candidate)
+        structured = candidate.get("structured_review")
+        structured = structured if isinstance(structured, Mapping) else {}
+        audit.append(
+            {
+                "code": _normalise_code(candidate.get("code")),
+                "name": str(candidate.get("name") or candidate.get("code") or ""),
+                "lifecycle_state": state,
+                "age_trading_days": candidate.get("rolling_age_trading_days", 0),
+                "discovery_research_tier": candidate.get("research_tier"),
+                "objective_tier": candidate.get("objective_tier"),
+                "rank": candidate.get("rank"),
+                "rank_score": candidate.get("rank_score"),
+                "distance_to_entry_pct": (
+                    (candidate.get("price_plan") or {}).get("distance_to_entry_pct")
+                    if isinstance(candidate.get("price_plan"), Mapping)
+                    else None
+                ),
+                "hard_risk_clear": structured.get("hard_risk_clear"),
+                "selected_for_formal_research": chosen,
+                "selection_reason": (
+                    "dynamic_formal_research_selected"
+                    if chosen
+                    else (
+                        "rolling_candidate_not_active"
+                        if not selectable
+                        and not hard_blocked
+                        else (
+                            "structured_hard_risk_blocked"
+                            if hard_blocked
+                            else "outside_dynamic_formal_research_tier"
+                        )
+                    )
+                ),
+            }
+        )
+    return selected, audit
 
 
 def _as_shanghai(value: Any) -> datetime:
@@ -858,7 +951,10 @@ class DailyDecisionService:
                     permission_audit_keys.add(audit_key)
                 continue
             permitted_candidates.append(candidate)
-        raw_candidates = permitted_candidates
+        rolling_candidates = permitted_candidates[:ROLLING_POOL_CAPACITY]
+        raw_candidates, rolling_candidate_audit = (
+            _select_formal_research_candidates(rolling_candidates)
+        )
         holdings_payload = briefing.get("holdings")
         holdings_payload = holdings_payload if isinstance(holdings_payload, Mapping) else {}
         raw_holdings = [
@@ -1261,6 +1357,29 @@ class DailyDecisionService:
                 "holding_valuation_audit": deepcopy(
                     holding_valuation_audit
                 ),
+            },
+            "rolling_pool": {
+                "capacity": ROLLING_POOL_CAPACITY,
+                "total_count": len(rolling_candidates),
+                "formal_research_capacity": FORMAL_RESEARCH_CAPACITY,
+                "formal_research_count": len(raw_candidates),
+                "current_count": sum(
+                    str(item.get("rolling_pool_state") or "current") == "current"
+                    for item in rolling_candidates
+                ),
+                "aging_count": sum(
+                    item.get("rolling_pool_state") == "aging"
+                    for item in rolling_candidates
+                ),
+                "expired_count": sum(
+                    item.get("rolling_pool_state") == "expired"
+                    for item in rolling_candidates
+                ),
+                "invalidated_count": sum(
+                    item.get("rolling_pool_state") == "invalidated"
+                    for item in rolling_candidates
+                ),
+                "candidates": rolling_candidate_audit,
             },
             "effective_policy": effective_policy,
             "authority": "software_baseline",

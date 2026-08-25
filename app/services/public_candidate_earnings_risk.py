@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 EARNINGS_FORECAST_SOURCE = "akshare.eastmoney.stock_yjyg_em"
 EARNINGS_ACTUAL_SOURCE = "akshare.eastmoney.stock_yjbb_em"
 EARNINGS_REVIEW_SOURCE = f"{EARNINGS_FORECAST_SOURCE}+{EARNINGS_ACTUAL_SOURCE}"
-MAX_EARNINGS_SCREEN_CANDIDATES = 8
+MAX_EARNINGS_SCREEN_CANDIDATES = 100
 SEVERE_EARNINGS_DECLINE_PCT = -30.0
 PUBLIC_EARNINGS_SCREEN_STATUS_KEYS = frozenset(
     {
@@ -416,7 +416,7 @@ def screen_public_candidate_earnings_risk(
     loader: Optional[ForecastLoader] = None,
     actual_loader: Optional[ActualLoader] = None,
 ) -> Dict[str, Any]:
-    """Screen at most eight technical survivors against current earnings evidence."""
+    """Screen the bounded rolling pool against current earnings evidence."""
     if not isinstance(codes, list):
         return _invalid_result("codes_invalid")
     if len(codes) > MAX_EARNINGS_SCREEN_CANDIDATES:

@@ -260,6 +260,7 @@ def _decision_projection(data: Dict[str, Any], *, view: str) -> Dict[str, Any]:
         "account": data.get("account"),
         "execution_capabilities": data.get("execution_capabilities"),
         "market": data.get("market"),
+        "rolling_pool": data.get("rolling_pool"),
         "summary": data.get("summary"),
         "rule_version": data.get("rule_version"),
         "material_hash": data.get("material_hash"),
@@ -1058,7 +1059,7 @@ def version(ctx: typer.Context) -> None:
 @candidates_app.command("run")
 def candidates_run(
     ctx: typer.Context,
-    max_candidates: int = typer.Option(5, "--max-candidates", min=1, max=10),
+    max_candidates: int = typer.Option(100, "--max-candidates", min=1, max=100),
     wait: bool = typer.Option(True, "--wait/--no-wait"),
 ) -> None:
     options = _root_options(ctx)

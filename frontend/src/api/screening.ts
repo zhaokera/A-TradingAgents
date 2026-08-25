@@ -310,7 +310,7 @@ export interface AddAICandidatesResult {
 export const screeningApi = {
   run: (payload: ScreeningRunReq, options?: { timeout?: number }) =>
     ApiClient.post<ScreeningRunResp>('/api/screening/run', payload, { timeout: options?.timeout ?? 120000 }),
-  runAiCandidates: (maxCandidates: number = 5) =>
+  runAiCandidates: (maxCandidates: number = 100) =>
     ApiClient.post<AICandidateJob>(
       '/api/screening/ai-candidates/run',
       { max_candidates: maxCandidates },

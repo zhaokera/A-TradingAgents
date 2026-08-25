@@ -57,6 +57,9 @@ AI_CANDIDATE_RUN_TTL_DAYS = 90
 AI_CANDIDATE_JOB_TTL_DAYS = 7
 AI_CANDIDATE_RESEARCH_MAX_ATTEMPTS = 2
 AI_CANDIDATE_RETRY_BACKOFF_SECONDS = 1.0
+AI_CANDIDATE_ROLLING_POOL_CAPACITY = 100
+AI_CANDIDATE_DEEP_RESEARCH_CAPACITY = 15
+AI_CANDIDATE_ROLLING_LIFECYCLE_TRADING_DAYS = 10
 _A_SHARE_CODE = re.compile(r"^[0-9]{6}$")
 logger = logging.getLogger(__name__)
 _RETRYABLE_RESEARCH_CODES = {
@@ -120,6 +123,130 @@ _ENTRY_STATUS_LABELS = {
     "quote_unavailable": "行情待刷新",
     "plan_unavailable": "暂无可靠入手价",
 }
+
+
+def _as_utc_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _weekday_sessions_between(start: datetime, end: datetime) -> int:
+    if end <= start:
+        return 0
+    current = start.date() + timedelta(days=1)
+    final = end.date()
+    count = 0
+    while current <= final:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def merge_rolling_candidate_pool(
+    current_candidates: Iterable[Mapping[str, Any]],
+    previous_candidates: Iterable[Mapping[str, Any]],
+    *,
+    generated_at: datetime,
+    capacity: int = AI_CANDIDATE_ROLLING_POOL_CAPACITY,
+    lifecycle_trading_days: int = AI_CANDIDATE_ROLLING_LIFECYCLE_TRADING_DAYS,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Merge today's validated pool with still-live prior observations."""
+
+    now = _as_utc_datetime(generated_at) or datetime.now(timezone.utc)
+    previous_by_code = {
+        str(item.get("code") or ""): deepcopy(dict(item))
+        for item in previous_candidates
+        if isinstance(item, Mapping) and item.get("code")
+    }
+    active: List[Dict[str, Any]] = []
+    retired: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    now_text = now.isoformat()
+
+    for raw in current_candidates:
+        if not isinstance(raw, Mapping):
+            continue
+        item = deepcopy(dict(raw))
+        code = str(item.get("code") or "")
+        if not code or code in seen:
+            continue
+        prior = previous_by_code.get(code, {})
+        first_seen = _as_utc_datetime(prior.get("first_seen_at")) or now
+        item.update(
+            {
+                "first_seen_at": first_seen.isoformat(),
+                "last_seen_at": now_text,
+                "rolling_age_trading_days": _weekday_sessions_between(
+                    first_seen, now
+                ),
+                "rolling_pool_state": "current",
+            }
+        )
+        active.append(item)
+        seen.add(code)
+
+    aging_rows: List[Dict[str, Any]] = []
+    for code, prior in previous_by_code.items():
+        if code in seen:
+            continue
+        item = deepcopy(prior)
+        first_seen = _as_utc_datetime(item.get("first_seen_at"))
+        if first_seen is None:
+            first_seen = _as_utc_datetime(item.get("last_seen_at")) or now
+        age = _weekday_sessions_between(first_seen, now)
+        terminal = str(item.get("rolling_pool_state") or "") in {
+            "expired",
+            "invalidated",
+        } or str(item.get("actionability") or "") in {"expired", "invalidated"}
+        item.update(
+            {
+                "first_seen_at": first_seen.isoformat(),
+                "rolling_age_trading_days": age,
+                "execution_actionable": False,
+                "condition_order_ready": False,
+                "can_add_to_favorites": False,
+            }
+        )
+        if terminal or age >= lifecycle_trading_days:
+            item["rolling_pool_state"] = (
+                "invalidated" if str(item.get("actionability")) == "invalidated" else "expired"
+            )
+            item["rolling_exit_reason"] = (
+                "plan_invalidated" if item["rolling_pool_state"] == "invalidated" else "lifecycle_expired"
+            )
+            retired.append(item)
+            continue
+        item["rolling_pool_state"] = "aging"
+        item["rolling_revalidation_required"] = True
+        aging_rows.append(item)
+
+    aging_rows.sort(
+        key=lambda item: (
+            -float(item.get("rank_score") or 0),
+            str(item.get("code") or ""),
+        )
+    )
+    available_slots = max(0, capacity - len(active))
+    active.extend(aging_rows[:available_slots])
+    for item in aging_rows[available_slots:]:
+        item["rolling_pool_state"] = "expired"
+        item["rolling_exit_reason"] = "rolling_pool_capacity"
+        retired.append(item)
+    return active[:capacity], retired
 
 
 class AICandidateRunNotFoundError(LookupError):
@@ -862,6 +989,15 @@ def normalize_ai_candidate(
         "favorite_status": "in_favorites" if code in favorite_codes else "not_added",
         "source": "public_full_market",
         "is_reference_only": True,
+        "research_tier": str(candidate.get("research_tier") or "deep"),
+        "rolling_pool_state": str(
+            candidate.get("rolling_pool_state") or "current"
+        ),
+        "structured_review": deepcopy(
+            candidate.get("structured_review")
+            if isinstance(candidate.get("structured_review"), Mapping)
+            else {}
+        ),
     }
     _apply_candidate_state(normalized)
     normalized["rank_score"] = _candidate_rank_score(normalized)
@@ -895,7 +1031,7 @@ def normalize_ai_candidate_run(
             item["code"],
         )
     )
-    candidates = candidates[:max_candidates]
+    candidates = candidates[:AI_CANDIDATE_ROLLING_POOL_CAPACITY]
     discovery = (
         data.get("candidate_discovery")
         if isinstance(data.get("candidate_discovery"), Mapping)
@@ -931,6 +1067,27 @@ def normalize_ai_candidate_run(
         status: sum(item.get("actionability") == status for item in candidates)
         for status in _ACTIONABILITY_LABELS
     }
+    rolling_pool = {
+        "capacity": AI_CANDIDATE_ROLLING_POOL_CAPACITY,
+        "current_count": sum(
+            item.get("rolling_pool_state") == "current" for item in candidates
+        ),
+        "aging_count": sum(
+            item.get("rolling_pool_state") == "aging" for item in candidates
+        ),
+        "expired_count": sum(
+            item.get("rolling_pool_state") == "expired" for item in candidates
+        ),
+        "invalidated_count": sum(
+            item.get("rolling_pool_state") == "invalidated" for item in candidates
+        ),
+        "deep_count": sum(
+            item.get("research_tier") == "deep" for item in candidates
+        ),
+        "structured_count": sum(
+            item.get("research_tier") == "structured" for item in candidates
+        ),
+    }
     provider_errors = discovery.get("provider_errors")
     provider_errors = (
         [
@@ -958,6 +1115,7 @@ def normalize_ai_candidate_run(
         },
         "candidate_count": len(candidates),
         "candidates": candidates,
+        "rolling_pool": rolling_pool,
         "actionability_counts": actionability_counts,
         "objective": {
             "id": INVESTMENT_OBJECTIVE["id"],
@@ -987,6 +1145,45 @@ def normalize_ai_candidate_run(
             "selected_count": discovery.get("selected_count"),
             "technical_passed_count": discovery.get("technical_passed_count"),
             "earnings_selected_count": discovery.get("earnings_selected_count"),
+            **(
+                {
+                    "technical_selected_count": discovery.get(
+                        "technical_selected_count"
+                    )
+                }
+                if "technical_selected_count" in discovery
+                else {}
+            ),
+            **(
+                {
+                    "deep_research_selected_count": discovery.get(
+                        "deep_research_selected_count"
+                    )
+                }
+                if "deep_research_selected_count" in discovery
+                else {}
+            ),
+            **(
+                {
+                    "notice_reviewed_count": discovery.get(
+                        "notice_reviewed_count"
+                    ),
+                    "notice_hard_blocked_count": discovery.get(
+                        "notice_hard_blocked_count"
+                    ),
+                }
+                if "notice_reviewed_count" in discovery
+                else {}
+            ),
+            **(
+                {
+                    "pipeline_metrics": deepcopy(
+                        discovery.get("pipeline_metrics") or {}
+                    )
+                }
+                if "pipeline_metrics" in discovery
+                else {}
+            ),
             "total_coverage_ratio": discovery.get("total_coverage_ratio"),
             "permission_prefilter_excluded_count": discovery.get(
                 "permission_prefilter_excluded_count", 0
@@ -1551,7 +1748,17 @@ class AICandidateService:
         candidates = [
             item for item in document.get("candidates", []) if isinstance(item, dict)
         ]
-        codes = [str(item.get("code") or "") for item in candidates if item.get("code")]
+        profile_candidates = [
+            item
+            for item in candidates
+            if item.get("research_tier") in {None, "deep"}
+        ][:AI_CANDIDATE_DEEP_RESEARCH_CAPACITY]
+        codes = [
+            str(item.get("code") or "")
+            for item in profile_candidates
+            if item.get("code")
+        ]
+        profile_codes = set(codes)
         try:
             db = await self._get_db()
             if getattr(self._stock_master, "db", None) is None:
@@ -1567,10 +1774,11 @@ class AICandidateService:
             profiles = {}
         for candidate in candidates:
             code = str(candidate.get("code") or "")
+            deferred = code not in profile_codes
             stock_profile = profiles.get(code) or {
                 "code": code,
-                "status": "missing",
-                "confidence": "missing",
+                "status": "deferred_structured_layer" if deferred else "missing",
+                "confidence": "deferred" if deferred else "missing",
                 "industry": None,
                 "main_business": None,
                 "source": None,
@@ -1642,7 +1850,7 @@ class AICandidateService:
             candidate.update(profile)
             candidate["stock_profile"] = stock_profile
             candidate["profile_evidence"] = profile_warning
-            if not decision_critical_complete:
+            if not decision_critical_complete and not deferred:
                 risk_flags = (
                     candidate.get("risk_flags")
                     if isinstance(candidate.get("risk_flags"), list)
@@ -1884,11 +2092,40 @@ class AICandidateService:
         candidates = [
             item for item in document.get("candidates", []) if isinstance(item, Mapping)
         ]
+        retired = [
+            item
+            for item in document.get("rolling_pool_retired", [])
+            if isinstance(item, Mapping)
+        ]
         document["actionability_counts"] = {
             status: sum(item.get("actionability") == status for item in candidates)
             for status in _ACTIONABILITY_LABELS
         }
         document["candidate_count"] = len(candidates)
+        document["rolling_pool"] = {
+            "capacity": AI_CANDIDATE_ROLLING_POOL_CAPACITY,
+            "lifecycle_trading_days": AI_CANDIDATE_ROLLING_LIFECYCLE_TRADING_DAYS,
+            "total_count": len(candidates),
+            "current_count": sum(
+                item.get("rolling_pool_state") == "current" for item in candidates
+            ),
+            "aging_count": sum(
+                item.get("rolling_pool_state") == "aging" for item in candidates
+            ),
+            "deep_count": sum(
+                item.get("research_tier") == "deep" for item in candidates
+            ),
+            "structured_count": sum(
+                item.get("research_tier") == "structured" for item in candidates
+            ),
+            "retired_count": len(retired),
+            "expired_count": sum(
+                item.get("rolling_pool_state") == "expired" for item in retired
+            ),
+            "invalidated_count": sum(
+                item.get("rolling_pool_state") == "invalidated" for item in retired
+            ),
+        }
 
     async def _publish_transition(
         self,
@@ -2174,7 +2411,9 @@ class AICandidateService:
                 {
                     "$set": {
                         "candidates": deepcopy(document["candidates"]),
+                        "candidate_count": document["candidate_count"],
                         "actionability_counts": document["actionability_counts"],
+                        "rolling_pool": deepcopy(document.get("rolling_pool") or {}),
                         "objective": deepcopy(document.get("objective")),
                         "account": deepcopy(document.get("account")),
                         "portfolio_plan": deepcopy(document.get("portfolio_plan")),
@@ -2192,13 +2431,27 @@ class AICandidateService:
             )
         return document
 
-    async def run(self, user_id: str, *, max_candidates: int = 5) -> Dict[str, Any]:
+    async def run(self, user_id: str, *, max_candidates: int = 100) -> Dict[str, Any]:
         favorite_codes = await self._favorites.get_favorite_codes(user_id)
         governance = await self._candidate_governance(str(user_id))
+        db = await self._get_db()
+        previous_run: Mapping[str, Any] = {}
+        runs = db["ai_candidate_runs"]
+        find_one = getattr(runs, "find_one", None)
+        if callable(find_one):
+            try:
+                loaded_previous = await find_one(
+                    {"user_id": str(user_id)},
+                    sort=[("generated_at", -1)],
+                )
+                if isinstance(loaded_previous, Mapping):
+                    previous_run = loaded_previous
+            except (AttributeError, TypeError):
+                previous_run = {}
         payload = await self._run_research(governance)
         normalized = normalize_ai_candidate_run(
             payload,
-            max_candidates=max(20, max_candidates * 4),
+            max_candidates=AI_CANDIDATE_ROLLING_POOL_CAPACITY,
             favorite_codes=favorite_codes,
         )
         now = datetime.now(timezone.utc)
@@ -2206,19 +2459,30 @@ class AICandidateService:
             "_id": ObjectId(),
             "user_id": str(user_id),
             "generated_at": now,
-            "plan_expires_at": now + timedelta(days=3),
+            "plan_expires_at": now + timedelta(days=14),
             "expires_at": now + timedelta(days=AI_CANDIDATE_RUN_TTL_DAYS),
             **normalized,
         }
+        document["candidate_discovery"] = deepcopy(
+            normalized.get("discovery") or {}
+        )
+        active_candidates, retired_candidates = merge_rolling_candidate_pool(
+            document.get("candidates", []),
+            previous_run.get("candidates", [])
+            if isinstance(previous_run.get("candidates"), list)
+            else [],
+            generated_at=now,
+        )
+        document["candidates"] = active_candidates
+        document["rolling_pool_retired"] = retired_candidates
         self._apply_candidate_governance(document, governance)
         await self._apply_objective_profiles(document)
         await self._apply_macro_policy(document)
         await self._apply_account_policy(document, user_id=str(user_id))
-        document["candidates"] = list(document.get("candidates", []))[:max_candidates]
-        await self._apply_objective_profiles(document, refresh=True)
-        await self._apply_account_policy(document, user_id=str(user_id))
+        document["candidates"] = list(document.get("candidates", []))[
+            :AI_CANDIDATE_ROLLING_POOL_CAPACITY
+        ]
         self._update_run_counts(document)
-        db = await self._get_db()
         await db["ai_candidate_runs"].insert_one(deepcopy(document))
         sync_auto_candidates = getattr(
             self._favorites,
@@ -2393,8 +2657,9 @@ class AICandidateService:
         self,
         user_id: str,
         *,
-        max_candidates: int = 5,
+        max_candidates: int = 100,
     ) -> Dict[str, Any]:
+        max_candidates = AI_CANDIDATE_ROLLING_POOL_CAPACITY
         db = await self._get_db()
         jobs = db["ai_candidate_jobs"]
         stale_before = datetime.now(timezone.utc) - timedelta(minutes=30)
@@ -2579,7 +2844,10 @@ class AICandidateService:
         jobs: List[Dict[str, Any]] = []
         for user_id in user_ids:
             try:
-                job = await self.start_run(user_id, max_candidates=5)
+                job = await self.start_run(
+                    user_id,
+                    max_candidates=AI_CANDIDATE_ROLLING_POOL_CAPACITY,
+                )
                 jobs.append(
                     {
                         "user_id": user_id,

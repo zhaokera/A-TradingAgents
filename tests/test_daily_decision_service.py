@@ -464,6 +464,128 @@ async def test_packet_separates_current_briefing_time_from_candidate_generation_
 
 
 @pytest.mark.asyncio
+async def test_decision_exposes_full_rolling_pool_but_deep_researches_top_fifteen():
+    candidates = []
+    for index in range(20):
+        code = f"60{index:04d}"
+        candidates.append(
+            _candidate(
+                code,
+                name=f"候选{index}",
+                rank=index + 1,
+                rank_score=100 - index,
+                objective_tier="core" if index < 17 else "adjacent",
+                rolling_pool_state="current" if index < 18 else "aging",
+                research_tier="structured",
+                price_plan={
+                    **_candidate()["price_plan"],
+                    "distance_to_entry_pct": float(index),
+                },
+            )
+        )
+    resolver = FakeProfileResolver()
+    service = DailyDecisionService(
+        briefing_service=FakeBriefingService(),
+        candidate_service=FakeCandidateService(_run(candidates)),
+        market_session_policy=FakeSessionPolicy("live_am"),
+        profile_resolver=resolver,
+        diversification_service=FakeDiversificationService(),
+        tracking_service=FakeTrackingService(),
+        db=FakeDatabase(),
+        duplicate_key_errors=(FakeDuplicateKeyError,),
+    )
+
+    packet = await service._compose_packet("user-1", refresh=True, now=NOW)
+
+    assert packet["rolling_pool"]["total_count"] == 20
+    assert packet["rolling_pool"]["formal_research_count"] == 15
+    assert packet["rolling_pool"]["formal_research_capacity"] == 15
+    assert len(packet["rolling_pool"]["candidates"]) == 20
+    assert sum(
+        len(packet[name]) for name in ("avoid", "wait", "buy_now", "condition_order")
+    ) == 15
+    assert len(resolver.calls) == 1
+    assert len(resolver.calls[0][0]) == 15
+    assert all(
+        item["selection_reason"] == "dynamic_formal_research_selected"
+        for item in packet["rolling_pool"]["candidates"][:15]
+    )
+    assert all(
+        item["selection_reason"] == "outside_dynamic_formal_research_tier"
+        for item in packet["rolling_pool"]["candidates"][15:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_aging_candidate_remains_visible_and_can_be_dynamically_revalidated():
+    candidates = [
+        _candidate(
+            "600001",
+            rolling_pool_state="aging",
+            rolling_age_trading_days=4,
+            rank_score=99,
+            objective_tier="core",
+        ),
+        _candidate(
+            "600002",
+            rolling_pool_state="current",
+            rank_score=80,
+            objective_tier="adjacent",
+        ),
+    ]
+
+    packet = await _service(run=_run(candidates))._compose_packet(
+        "user-1", refresh=True, now=NOW
+    )
+
+    aging = next(
+        item for item in packet["rolling_pool"]["candidates"] if item["code"] == "600001"
+    )
+    assert aging["lifecycle_state"] == "aging"
+    assert aging["selected_for_formal_research"] is True
+    assert any(
+        item["identity"]["code"] == "600001"
+        for bucket in ("avoid", "wait", "buy_now", "condition_order")
+        for item in packet[bucket]
+    )
+
+
+@pytest.mark.asyncio
+async def test_structured_hard_risk_stays_auditable_but_skips_formal_research():
+    blocked = _candidate(
+        "600001",
+        rank=1,
+        rank_score=100,
+        structured_review={
+            "hard_risk_status": "blocked",
+            "hard_risk_clear": False,
+            "hard_risk_reasons": ["notice_risk_blocked"],
+        },
+    )
+    eligible = _candidate("600002", rank=2, rank_score=90)
+    resolver = FakeProfileResolver()
+    service = DailyDecisionService(
+        briefing_service=FakeBriefingService(),
+        candidate_service=FakeCandidateService(_run([blocked, eligible])),
+        market_session_policy=FakeSessionPolicy("live_am"),
+        profile_resolver=resolver,
+        diversification_service=FakeDiversificationService(),
+        tracking_service=FakeTrackingService(),
+        db=FakeDatabase(),
+        duplicate_key_errors=(FakeDuplicateKeyError,),
+    )
+
+    packet = await service._compose_packet("user-1", refresh=True, now=NOW)
+
+    assert resolver.calls[0][0] == ("600002",)
+    blocked_audit = next(
+        item for item in packet["rolling_pool"]["candidates"] if item["code"] == "600001"
+    )
+    assert blocked_audit["selected_for_formal_research"] is False
+    assert blocked_audit["selection_reason"] == "structured_hard_risk_blocked"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reason_code",
     [

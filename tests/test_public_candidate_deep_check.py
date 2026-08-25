@@ -168,6 +168,56 @@ def _earnings_screen(
     }
 
 
+def _notice_review(codes, *, hard_risk_codes=()):
+    hard_risk_codes = set(hard_risk_codes)
+    results = []
+    for code in codes:
+        hard_risk = code in hard_risk_codes
+        notices = (
+            [
+                {
+                    "announcement_date": "2026-07-17",
+                    "title": "重大风险提示公告",
+                    "notice_type": "风险提示",
+                    "url": f"https://example.com/{code}",
+                    "attention_tags": ["risk_warning"],
+                    "manual_review_required": True,
+                }
+            ]
+            if hard_risk
+            else []
+        )
+        results.append(
+            {
+                "code": code,
+                "name": f"candidate-{code}" if notices else None,
+                "status": "notices_found" if notices else "no_recent_notices",
+                "total_notice_count": len(notices),
+                "returned_notice_count": len(notices),
+                "truncated": False,
+                "attention_tags": ["risk_warning"] if hard_risk else [],
+                "manual_review_required": hard_risk,
+                "notices": notices,
+            }
+        )
+    return {
+        "status": "ok",
+        "source": deep_check.NOTICE_REVIEW_SOURCE,
+        "start_date": "2026-07-11",
+        "end_date": "2026-07-17",
+        "lookback_calendar_days": 7,
+        "reviewed_count": len(codes),
+        "codes_with_notices_count": len(hard_risk_codes),
+        "manual_review_code_count": len(hard_risk_codes),
+        "total_notice_count": len(hard_risk_codes),
+        "returned_notice_count": len(hard_risk_codes),
+        "attention_tag_code_counts": (
+            {"risk_warning": len(hard_risk_codes)} if hard_risk_codes else {}
+        ),
+        "results": results,
+    }
+
+
 def test_deep_check_zero_remaining_returns_timeout_without_spawning():
     calls = []
 
@@ -272,7 +322,11 @@ def test_deep_check_timeout_terminates_sleeping_worker(monkeypatch):
     ("definitions", "quote_map", "expected_error"),
     [
         ("invalid", {}, "definitions_invalid"),
-        ([_definition(f"600{index:03d}") for index in range(9)], {}, "too_many_candidates"),
+        (
+            [_definition(f"60{index:04d}") for index in range(101)],
+            {},
+            "too_many_candidates",
+        ),
         ([_definition(), _definition()], {"600000": _quote()}, "duplicate_code"),
         ([_definition("ABC")], {"ABC": {}}, "invalid_code"),
         ([_definition()], [], "quote_map_invalid"),
@@ -464,6 +518,8 @@ def test_technical_funnel_accepts_160_candidates_and_uses_one_bounded_worker():
                         "passed_count": 2,
                         "selected_count": 2,
                         "selected_codes": selected_codes,
+                        "deep_research_selected_count": 2,
+                        "deep_research_selected_codes": selected_codes,
                         "status_counts": {"ok": 2, "net_rr_below_1_5": 158},
                         "closest_rejection_count": 5,
                         "closest_rejections": closest_rejections,
@@ -495,7 +551,7 @@ def test_technical_funnel_accepts_160_candidates_and_uses_one_bounded_worker():
     assert set(worker_input["quote_map"]) == set(quote_map)
 
 
-def test_technical_funnel_worker_screens_all_and_builds_only_top_eight():
+def test_technical_funnel_worker_keeps_all_passed_candidates_below_pool_cap():
     definitions = [
         {
             **_definition(f"{600000 + index:06d}"),
@@ -534,7 +590,7 @@ def test_technical_funnel_worker_screens_all_and_builds_only_top_eight():
         candidate_builder=fake_builder,
     )
 
-    expected_codes = [f"{600000 + index:06d}" for index in range(11, 3, -1)]
+    expected_codes = [f"{600000 + index:06d}" for index in range(11, -1, -1)]
     assert result["status"] == "ok"
     assert set(screened_codes) == set(quote_map)
     assert len(screened_codes) == 12
@@ -542,13 +598,15 @@ def test_technical_funnel_worker_screens_all_and_builds_only_top_eight():
         "status": "ok",
         "screened_count": 12,
         "passed_count": 12,
-        "selected_count": 8,
+        "selected_count": 12,
         "selected_codes": expected_codes,
+        "deep_research_selected_count": 12,
+        "deep_research_selected_codes": expected_codes,
         "status_counts": {"ok": 12},
         "closest_rejection_count": 0,
         "closest_rejections": [],
     }
-    assert result["earnings_screen"]["screened_count"] == 8
+    assert result["earnings_screen"]["screened_count"] == 12
     assert result["earnings_screen"]["blocked_count"] == 0
     assert result["earnings_screen"]["selected_codes"] == expected_codes
     assert [item["code"] for item in result["candidates"]] == expected_codes
@@ -557,9 +615,154 @@ def test_technical_funnel_worker_screens_all_and_builds_only_top_eight():
     assert set(builder_calls[0]["technical_plan_snapshots"]) == set(expected_codes)
     assert builder_calls[0]["cash"] is None
     assert builder_calls[0]["allow_reference_price_plan"] is True
+    assert all(
+        item["research_tier"] == "deep"
+        for item in result["candidates"]
+    )
 
 
-def test_technical_funnel_reserves_top_eight_for_core_objective_first():
+def test_technical_funnel_caps_rolling_pool_at_100_and_deep_research_at_15():
+    definitions = [
+        {
+            **_definition(f"{600000 + index:06d}"),
+            "tencent_score": round(0.1 + index / 1000, 4),
+            "tencent_one_lot_amount": 1000.0 + index,
+        }
+        for index in range(120)
+    ]
+    quote_map = {
+        definition["code"]: _quote(definition["code"])
+        for definition in definitions
+    }
+    earnings_calls = []
+    corporate_action_calls = []
+
+    def fake_earnings(codes, **_kwargs):
+        earnings_calls.append(list(codes))
+        return _earnings_screen(codes)
+
+    def fake_corporate_action(code):
+        corporate_action_calls.append(code)
+        time.sleep(0.003)
+        return {
+            "ok": True,
+            "source": "test",
+            "code": code,
+            "status": "no_upcoming_corporate_action",
+            "blocks_new_position": False,
+            "price_plan_adjustment_required": False,
+            "nearest_action": None,
+            "is_reference_only": True,
+        }
+
+    result = deep_check._run_technical_funnel_worker_payload(
+        {
+            "definitions": definitions,
+            "quote_map": quote_map,
+            "benchmark_trade_date": "2026-07-17",
+        },
+        technical_screener=lambda definition, _quote_value: _screen_result(
+            definition["code"],
+            net_reward_risk=2.0,
+        ),
+        earnings_screener=fake_earnings,
+        corporate_action_loader=fake_corporate_action,
+        candidate_builder=lambda selected, **_kwargs: [
+            {"code": item["code"]} for item in selected
+        ],
+    )
+
+    technical = result["technical_screen"]
+    assert technical["screened_count"] == 120
+    assert technical["passed_count"] == 120
+    assert technical["selected_count"] == 100
+    assert len(technical["selected_codes"]) == 100
+    assert technical["deep_research_selected_count"] == 15
+    assert len(technical["deep_research_selected_codes"]) == 15
+    assert earnings_calls == [technical["selected_codes"]]
+    assert sorted(corporate_action_calls) == sorted(technical["selected_codes"])
+    assert len(result["candidates"]) == 100
+    assert sum(
+        item["research_tier"] == "deep" for item in result["candidates"]
+    ) == 15
+    assert sum(
+        item["research_tier"] == "structured" for item in result["candidates"]
+    ) == 85
+    assert result["pipeline_metrics"] == {
+        "rolling_pool_capacity": 100,
+        "deep_research_capacity": 15,
+        "technical_input_count": 120,
+            "technical_worker_count": 6,
+        "technical_data_calls": 120,
+        "technical_cache_hit_count": 0,
+        "earnings_batch_calls": 1,
+        "notice_batch_calls": 0,
+        "candidate_build_calls": 1,
+        "corporate_action_calls": 100,
+        "technical_seconds": pytest.approx(
+            result["pipeline_metrics"]["technical_seconds"]
+        ),
+        "earnings_seconds": pytest.approx(
+            result["pipeline_metrics"]["earnings_seconds"]
+        ),
+        "notice_seconds": 0.0,
+        "candidate_build_seconds": pytest.approx(
+            result["pipeline_metrics"]["candidate_build_seconds"]
+        ),
+        "corporate_action_seconds": pytest.approx(
+            result["pipeline_metrics"]["corporate_action_seconds"]
+        ),
+        "total_seconds": pytest.approx(
+            result["pipeline_metrics"]["total_seconds"]
+        ),
+    }
+    assert result["pipeline_metrics"]["total_seconds"] < 1.0
+
+
+def test_technical_funnel_reviews_notices_once_for_whole_pool_and_blocks_hard_risk():
+    definitions = [
+        {
+            **_definition(f"{600000 + index:06d}"),
+            "tencent_score": 0.8,
+            "tencent_one_lot_amount": 1000.0,
+        }
+        for index in range(20)
+    ]
+    codes = [item["code"] for item in definitions]
+    notice_calls = []
+
+    def fake_notice(requested_codes, **_kwargs):
+        notice_calls.append(list(requested_codes))
+        return _notice_review(requested_codes, hard_risk_codes={codes[0]})
+
+    result = deep_check._run_technical_funnel_worker_payload(
+        {
+            "definitions": definitions,
+            "quote_map": {code: _quote(code) for code in codes},
+            "benchmark_trade_date": "2026-07-17",
+            "enable_notice_review": True,
+        },
+        technical_screener=lambda definition, _quote_value: _screen_result(
+            definition["code"]
+        ),
+        earnings_screener=lambda requested, **_kwargs: _earnings_screen(requested),
+        notice_screener=fake_notice,
+        candidate_builder=lambda selected, **_kwargs: [
+            {"code": item["code"]} for item in selected
+        ],
+    )
+
+    assert notice_calls == [result["technical_screen"]["selected_codes"]]
+    assert result["notice_review"]["reviewed_count"] == 20
+    blocked = next(item for item in result["candidates"] if item["code"] == codes[0])
+    assert blocked["structured_review"]["hard_risk_status"] == "blocked"
+    assert "notice_risk_blocked" in blocked["structured_review"][
+        "hard_risk_reasons"
+    ]
+    assert blocked["research_tier"] == "structured"
+
+
+def test_technical_funnel_prioritizes_core_objective_in_rolling_pool():
     definitions = [
         {
             **_definition(f"{600000 + index:06d}"),
@@ -602,7 +805,7 @@ def test_technical_funnel_reserves_top_eight_for_core_objective_first():
     )
 
     assert result["technical_screen"]["selected_codes"][0] == "600406"
-    assert len(result["technical_screen"]["selected_codes"]) == 8
+    assert len(result["technical_screen"]["selected_codes"]) == 9
 
 
 def test_technical_funnel_worker_retains_closest_net_rr_rejections_for_audit():
@@ -930,7 +1133,7 @@ def test_technical_funnel_worker_rejects_inconsistent_screen_result(
     assert builder_calls == []
 
 
-def test_technical_funnel_worker_filters_loss_forecast_before_builder():
+def test_technical_funnel_worker_keeps_loss_forecast_in_audited_pool_but_blocks_it():
     definitions = [
         {
             **_definition(code),
@@ -981,15 +1184,30 @@ def test_technical_funnel_worker_filters_loss_forecast_before_builder():
         "002165",
     ]
     assert result["earnings_screen"]["selected_codes"] == ["300113"]
-    assert [item["code"] for item in result["candidates"]] == ["300113"]
+    assert [item["code"] for item in result["candidates"]] == [
+        "688599",
+        "002165",
+        "300113",
+    ]
+    blocked = result["candidates"][:2]
+    assert all(
+        item["structured_review"]["hard_risk_status"] == "blocked"
+        and item["research_tier"] == "structured"
+        for item in blocked
+    )
+    assert result["candidates"][2]["research_tier"] == "deep"
     assert len(builder_calls) == 1
     assert [
         item["code"] for item in builder_calls[0]["definitions"]
-    ] == ["300113"]
-    assert set(builder_calls[0]["technical_plan_snapshots"]) == {"300113"}
+    ] == ["688599", "002165", "300113"]
+    assert set(builder_calls[0]["technical_plan_snapshots"]) == {
+        "688599",
+        "002165",
+        "300113",
+    }
 
 
-def test_technical_funnel_worker_filters_latest_actual_loss_before_builder():
+def test_technical_funnel_worker_keeps_actual_loss_in_audited_pool_but_blocks_it():
     definitions = [
         {
             **_definition(code),
@@ -1025,9 +1243,17 @@ def test_technical_funnel_worker_filters_latest_actual_loss_before_builder():
 
     assert result["earnings_screen"]["blocked_codes"] == ["300113"]
     assert result["earnings_screen"]["selected_codes"] == ["600000"]
-    assert [item["code"] for item in result["candidates"]] == ["600000"]
-    assert [[item["code"] for item in call] for call in builder_calls] == [
-        ["600000"]
+    assert [item["code"] for item in result["candidates"]] == [
+        "300113",
+        "600000",
+    ]
+    assert result["candidates"][0]["structured_review"]["hard_risk_status"] == (
+        "blocked"
+    )
+    assert result["candidates"][1]["research_tier"] == "deep"
+    assert [item["code"] for item in builder_calls[0]] == [
+        "300113",
+        "600000",
     ]
 
 
@@ -1107,8 +1333,10 @@ def test_technical_funnel_parent_rejects_inconsistent_earnings_metadata():
                         "status": "ok",
                         "screened_count": 1,
                         "passed_count": 1,
-                        "selected_count": 1,
-                        "selected_codes": ["600000"],
+                            "selected_count": 1,
+                            "selected_codes": ["600000"],
+                            "deep_research_selected_count": 1,
+                            "deep_research_selected_codes": ["600000"],
                         "status_counts": {"ok": 1},
                         "closest_rejection_count": 0,
                         "closest_rejections": [],

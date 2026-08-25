@@ -10,11 +10,12 @@ import math
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from copy import deepcopy
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.services.public_candidate_discovery_service import (
@@ -33,17 +34,26 @@ from app.services.public_candidate_earnings_risk import (
     latest_mandatory_actual_reporting_period,
     screen_public_candidate_earnings_risk,
 )
+from app.services.public_candidate_notice_review import (
+    NOTICE_LOOKBACK_CALENDAR_DAYS,
+    NOTICE_REVIEW_SOURCE,
+    review_public_candidate_notices,
+    validate_public_candidate_notice_review,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-MAX_PUBLIC_DEEP_CHECK_CANDIDATES = 8
+MAX_PUBLIC_ROLLING_POOL_CANDIDATES = 100
+MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES = 15
+# Backward-compatible import for callers that use this as a manual batch bound.
+MAX_PUBLIC_DEEP_CHECK_CANDIDATES = MAX_PUBLIC_ROLLING_POOL_CANDIDATES
 MAX_PUBLIC_TECHNICAL_CLOSEST_REJECTIONS = 5
 PUBLIC_MIN_NET_REWARD_RISK = 1.5
 TECHNICAL_DEEP_CHECK_TIMEOUT_SECONDS = 35.0
 TECHNICAL_FUNNEL_TIMEOUT_SECONDS = 50.0
-TECHNICAL_SCREEN_WORKERS = 12
+TECHNICAL_SCREEN_WORKERS = 6
 MIN_TECHNICAL_HISTORY_COVERAGE_RATIO = 0.9
 WORKER_STDERR_LOG_LIMIT = 512
 A_SHARE_STOCK_CODE_PATTERN = re.compile(
@@ -55,6 +65,11 @@ Runner = Callable[..., Any]
 CandidateBuilder = Callable[..., List[Dict[str, Any]]]
 TechnicalScreener = Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]
 EarningsScreener = Callable[..., Dict[str, Any]]
+NoticeScreener = Callable[..., Dict[str, Any]]
+CorporateActionLoader = Callable[[str], Dict[str, Any]]
+PUBLIC_NOTICE_HARD_RISK_TAGS = frozenset(
+    {"risk_warning", "sanctions_or_trade_restrictions"}
+)
 
 PUBLIC_TECHNICAL_SCREEN_STATUS_KEYS = frozenset(
     {
@@ -575,15 +590,28 @@ def validate_public_technical_screen_metadata(
         for field in count_fields
     ):
         return None, "InvalidTechnicalScreenMetadata"
+    deep_research_selected_count = value.get(
+        "deep_research_selected_count",
+        min(value["selected_count"], MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES),
+    )
     if (
         value["screened_count"] != len(expected_codes)
         or value["passed_count"] > value["screened_count"]
         or value["selected_count"]
-        != min(value["passed_count"], MAX_PUBLIC_DEEP_CHECK_CANDIDATES)
+        != min(value["passed_count"], MAX_PUBLIC_ROLLING_POOL_CANDIDATES)
+        or not isinstance(deep_research_selected_count, int)
+        or isinstance(deep_research_selected_count, bool)
+        or deep_research_selected_count < 0
+        or deep_research_selected_count
+        > min(value["selected_count"], MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES)
     ):
         return None, "InvalidTechnicalScreenMetadata"
 
     selected_codes = value.get("selected_codes")
+    deep_research_selected_codes = value.get(
+        "deep_research_selected_codes",
+        list(selected_codes[:deep_research_selected_count]),
+    )
     if (
         not isinstance(selected_codes, list)
         or len(selected_codes) != value["selected_count"]
@@ -592,6 +620,15 @@ def validate_public_technical_screen_metadata(
             not isinstance(code, str) or code not in expected_codes
             for code in selected_codes
         )
+    ):
+        return None, "InvalidTechnicalScreenMetadata"
+    if (
+        not isinstance(deep_research_selected_codes, list)
+        or len(deep_research_selected_codes)
+        != deep_research_selected_count
+        or len(set(deep_research_selected_codes))
+        != len(deep_research_selected_codes)
+        or any(code not in selected_codes for code in deep_research_selected_codes)
     ):
         return None, "InvalidTechnicalScreenMetadata"
 
@@ -659,6 +696,8 @@ def validate_public_technical_screen_metadata(
         "passed_count": value["passed_count"],
         "selected_count": value["selected_count"],
         "selected_codes": list(selected_codes),
+        "deep_research_selected_count": deep_research_selected_count,
+        "deep_research_selected_codes": list(deep_research_selected_codes),
         "status_counts": {
             str(key): int(count)
             for key, count in sorted(status_counts.items())
@@ -994,7 +1033,7 @@ def run_public_candidate_technical_funnel(
     command_remaining_seconds: Any,
     runner: Optional[Runner] = None,
 ) -> Dict[str, Any]:
-    """Screen up to 160 candidates, then fully build at most eight survivors."""
+    """Screen the bounded universe and retain up to 100 structured candidates."""
     selected_definitions, selected_quotes, validation_error = _validate_inputs(
         definitions,
         quote_map,
@@ -1030,6 +1069,8 @@ def run_public_candidate_technical_funnel(
                 "passed_count": 0,
                 "selected_count": 0,
                 "selected_codes": [],
+                "deep_research_selected_count": 0,
+                "deep_research_selected_codes": [],
                 "status_counts": {},
                 "closest_rejection_count": 0,
                 "closest_rejections": [],
@@ -1044,6 +1085,7 @@ def run_public_candidate_technical_funnel(
             {
                 "mode": "technical_funnel",
                 "benchmark_trade_date": normalized_trade_date,
+                "enable_notice_review": True,
                 "definitions": selected_definitions,
                 "quote_map": selected_quotes,
             },
@@ -1127,15 +1169,52 @@ def run_public_candidate_technical_funnel(
     assert earnings_screen is not None
     candidates, candidate_error = _validate_candidates(
         payload.get("candidates"),
-        earnings_screen["selected_codes"],
+        technical_screen["selected_codes"],
     )
     if candidate_error:
         return _failure_result(candidate_error)
+    raw_notice_review = payload.get("notice_review")
+    if (
+        isinstance(raw_notice_review, Mapping)
+        and raw_notice_review.get("status") == "ok"
+    ):
+        benchmark_date = date.fromisoformat(normalized_trade_date)
+        notice_review, notice_error = validate_public_candidate_notice_review(
+            raw_notice_review,
+            expected_codes=technical_screen["selected_codes"],
+            expected_start_date=(
+                benchmark_date - timedelta(days=NOTICE_LOOKBACK_CALENDAR_DAYS - 1)
+            ),
+            expected_end_date=benchmark_date,
+        )
+        if notice_error or notice_review is None:
+            return _failure_result(notice_error or "InvalidNoticeReviewMetadata")
+    elif isinstance(raw_notice_review, Mapping) and raw_notice_review.get(
+        "status"
+    ) in {"unavailable", "not_requested"}:
+        notice_review = {
+            "status": raw_notice_review.get("status"),
+            "source": str(raw_notice_review.get("source") or NOTICE_REVIEW_SOURCE),
+            "error_type": raw_notice_review.get("error_type"),
+            "results": [],
+        }
+    else:
+        notice_review = {
+            "status": "not_requested",
+            "source": NOTICE_REVIEW_SOURCE,
+            "results": [],
+        }
     return {
         "status": "ok",
         "candidates": candidates or [],
         "technical_screen": technical_screen,
         "earnings_screen": earnings_screen,
+        "notice_review": deepcopy(notice_review),
+        "pipeline_metrics": deepcopy(
+            payload.get("pipeline_metrics")
+            if isinstance(payload.get("pipeline_metrics"), Mapping)
+            else {}
+        ),
     }
 
 
@@ -1301,8 +1380,11 @@ def _run_technical_funnel_worker_payload(
     *,
     technical_screener: Optional[TechnicalScreener] = None,
     earnings_screener: Optional[EarningsScreener] = None,
+    notice_screener: Optional[NoticeScreener] = None,
+    corporate_action_loader: Optional[CorporateActionLoader] = None,
     candidate_builder: Optional[CandidateBuilder] = None,
 ) -> Dict[str, Any]:
+    pipeline_started = time.perf_counter()
     if not isinstance(payload, Mapping):
         return _invalid_input_result("payload_invalid")
     definitions, quote_map, validation_error = _validate_inputs(
@@ -1330,6 +1412,8 @@ def _run_technical_funnel_worker_payload(
                 "passed_count": 0,
                 "selected_count": 0,
                 "selected_codes": [],
+                "deep_research_selected_count": 0,
+                "deep_research_selected_codes": [],
                 "status_counts": {},
                 "closest_rejection_count": 0,
                 "closest_rejections": [],
@@ -1362,10 +1446,13 @@ def _run_technical_funnel_worker_payload(
             expected_code=code,
         )
 
+    technical_started = time.perf_counter()
+    worker_count = min(TECHNICAL_SCREEN_WORKERS, len(definitions))
     with ThreadPoolExecutor(
-        max_workers=min(TECHNICAL_SCREEN_WORKERS, len(definitions))
+        max_workers=worker_count
     ) as executor:
         screen_results = list(executor.map(screen_one, definitions))
+    technical_seconds = time.perf_counter() - technical_started
 
     if any(item["fatal_error"] for item in screen_results):
         return _failure_result("TechnicalScreenError")
@@ -1392,7 +1479,7 @@ def _run_technical_funnel_worker_payload(
             quote_map=quote_map,
         ),
     )[
-        :MAX_PUBLIC_DEEP_CHECK_CANDIDATES
+        :MAX_PUBLIC_ROLLING_POOL_CANDIDATES
     ]
     closest_rejections = _technical_closest_rejections(
         screen_results,
@@ -1410,6 +1497,7 @@ def _run_technical_funnel_worker_payload(
         effective_earnings_screener = (
             earnings_screener or screen_public_candidate_earnings_risk
         )
+        earnings_started = time.perf_counter()
         try:
             raw_earnings_screen = effective_earnings_screener(
                 technical_selected_codes,
@@ -1418,6 +1506,7 @@ def _run_technical_funnel_worker_payload(
         except Exception:
             logger.exception("Public candidate earnings screen failed")
             return _failure_result("EarningsForecastFetchError")
+        earnings_seconds = time.perf_counter() - earnings_started
         raw_earnings_status = (
             raw_earnings_screen.get("status")
             if isinstance(raw_earnings_screen, Mapping)
@@ -1446,9 +1535,72 @@ def _run_technical_funnel_worker_payload(
         assert normalized_earnings_screen is not None
         earnings_screen = normalized_earnings_screen
     else:
+        earnings_seconds = 0.0
         earnings_screen = _empty_earnings_screen(benchmark_trade_date)
 
-    selected_codes = earnings_screen["selected_codes"]
+    notice_review: Dict[str, Any] = {
+        "status": "not_requested",
+        "source": NOTICE_REVIEW_SOURCE,
+        "results": [],
+    }
+    notice_seconds = 0.0
+    if payload.get("enable_notice_review") is True and technical_selected_codes:
+        effective_notice_screener = (
+            notice_screener or review_public_candidate_notices
+        )
+        benchmark_date = date.fromisoformat(benchmark_trade_date)
+        notice_started = time.perf_counter()
+        try:
+            raw_notice_review = effective_notice_screener(
+                technical_selected_codes,
+                as_of_date=benchmark_date,
+            )
+        except Exception as exc:
+            logger.exception("Public candidate notice review failed")
+            raw_notice_review = {
+                "status": "notice_source_unavailable",
+                "source": NOTICE_REVIEW_SOURCE,
+                "error_type": type(exc).__name__,
+            }
+        if (
+            isinstance(raw_notice_review, Mapping)
+            and raw_notice_review.get("status") == "ok"
+        ):
+            normalized_notice, notice_error = (
+                validate_public_candidate_notice_review(
+                    raw_notice_review,
+                    expected_codes=technical_selected_codes,
+                    expected_start_date=(
+                        benchmark_date
+                        - timedelta(days=NOTICE_LOOKBACK_CALENDAR_DAYS - 1)
+                    ),
+                    expected_end_date=benchmark_date,
+                )
+            )
+            if notice_error or normalized_notice is None:
+                notice_review = {
+                    "status": "unavailable",
+                    "source": NOTICE_REVIEW_SOURCE,
+                    "error_type": notice_error or "InvalidNoticeReviewMetadata",
+                    "results": [],
+                }
+            else:
+                notice_review = normalized_notice
+        else:
+            notice_review = {
+                "status": "unavailable",
+                "source": NOTICE_REVIEW_SOURCE,
+                "error_type": (
+                    raw_notice_review.get("error_type")
+                    if isinstance(raw_notice_review, Mapping)
+                    else "InvalidNoticeReviewMetadata"
+                ),
+                "results": [],
+            }
+        notice_seconds = time.perf_counter() - notice_started
+
+    earnings_selected_codes = earnings_screen["selected_codes"]
+    selected_codes = technical_selected_codes
     selected_definitions = [definitions_by_code[code] for code in selected_codes]
     selected_results_by_code = {
         item["code"]: item for item in selected_results
@@ -1460,6 +1612,53 @@ def _run_technical_funnel_worker_payload(
         for code in selected_codes
     }
 
+    corporate_action_snapshots: Optional[Dict[str, Dict[str, Any]]] = None
+    corporate_action_seconds = 0.0
+    corporate_action_calls = 0
+    if selected_codes and (
+        candidate_builder is None or corporate_action_loader is not None
+    ):
+        if corporate_action_loader is None:
+            from app.services.corporate_action_service import (
+                fetch_cn_dividend_calendar_sync,
+            )
+
+            corporate_action_loader = fetch_cn_dividend_calendar_sync
+
+        corporate_action_started = time.perf_counter()
+
+        def load_corporate_action(code: str) -> tuple[str, Dict[str, Any]]:
+            assert corporate_action_loader is not None
+            try:
+                value = corporate_action_loader(code)
+            except Exception as exc:
+                logger.exception(
+                    "Public candidate corporate-action review failed: code=%s",
+                    code,
+                )
+                value = {
+                    "ok": False,
+                    "source": "cninfo_via_akshare",
+                    "code": code,
+                    "status": "corporate_action_unavailable",
+                    "blocks_new_position": False,
+                    "price_plan_adjustment_required": False,
+                    "nearest_action": None,
+                    "reason": type(exc).__name__,
+                    "is_reference_only": True,
+                }
+            return code, deepcopy(dict(value)) if isinstance(value, Mapping) else {}
+
+        with ThreadPoolExecutor(
+            max_workers=min(TECHNICAL_SCREEN_WORKERS, len(selected_codes))
+        ) as executor:
+            corporate_action_snapshots = dict(
+                executor.map(load_corporate_action, selected_codes)
+            )
+        corporate_action_calls = len(selected_codes)
+        corporate_action_seconds = time.perf_counter() - corporate_action_started
+
+    candidate_build_started = time.perf_counter()
     if not selected_codes:
         candidates = []
     else:
@@ -1476,15 +1675,88 @@ def _run_technical_funnel_worker_payload(
                 allow_reference_price_plan=True,
                 quote_snapshots={code: quote_map[code] for code in selected_codes},
                 technical_plan_snapshots=technical_plan_snapshots,
+                corporate_action_snapshots=corporate_action_snapshots,
             )
         except Exception as exc:
             logger.exception("Public candidate survivor deep check failed")
             return _failure_result(type(exc).__name__)
 
+    candidate_build_seconds = time.perf_counter() - candidate_build_started
     normalized, candidate_error = _validate_candidates(candidates, selected_codes)
     if candidate_error:
         return _failure_result(candidate_error)
+    earnings_results = {
+        item["code"]: item
+        for item in earnings_screen.get("results", [])
+        if isinstance(item, Mapping) and isinstance(item.get("code"), str)
+    }
+    notice_results = {
+        item["code"]: item
+        for item in notice_review.get("results", [])
+        if isinstance(item, Mapping) and isinstance(item.get("code"), str)
+    }
+    notice_unavailable = notice_review.get("status") == "unavailable"
+    notice_blocked_codes = {
+        code
+        for code, item in notice_results.items()
+        if set(item.get("attention_tags") or []).intersection(
+            PUBLIC_NOTICE_HARD_RISK_TAGS
+        )
+    }
+    deep_research_selected_codes = [
+        code
+        for code in earnings_selected_codes
+        if code not in notice_blocked_codes
+    ][:MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES]
+    deep_codes = set(deep_research_selected_codes)
+    for candidate in normalized or []:
+        code = candidate["code"]
+        earnings = deepcopy(earnings_results.get(code) or {})
+        notice = deepcopy(notice_results.get(code) or {})
+        earnings_blocked = code in set(earnings_screen["blocked_codes"])
+        notice_blocked = code in notice_blocked_codes
+        hard_risk_reasons = []
+        if earnings_blocked:
+            hard_risk_reasons.append("earnings_risk_blocked")
+        if notice_blocked:
+            hard_risk_reasons.append("notice_risk_blocked")
+        if notice_unavailable:
+            hard_risk_reasons.append("notice_evidence_unavailable")
+        blocked = bool(hard_risk_reasons)
+        candidate["research_tier"] = "deep" if code in deep_codes else "structured"
+        candidate["rolling_pool_state"] = "current"
+        candidate["structured_review"] = {
+            "technical": {"status": "passed"},
+            "earnings": earnings,
+            "notice": notice,
+            "hard_risk_status": "blocked" if blocked else "clear",
+            "hard_risk_clear": not blocked,
+            "hard_risk_reasons": hard_risk_reasons,
+        }
+        if blocked:
+            flags = candidate.get("risk_flags")
+            flags = list(flags) if isinstance(flags, list) else []
+            flags.append(
+                {
+                    "code": hard_risk_reasons[0],
+                    "severity": "blocked",
+                    "message": "结构化硬风险复核阻止进入执行层。",
+                }
+            )
+            candidate["risk_flags"] = flags
     status_counts = Counter(item["status"] for item in screen_results)
+    technical_cache_hit_count = sum(
+        bool(item.get("cache_hit"))
+        or bool(
+            isinstance(item.get("guarded_price_plan"), Mapping)
+            and isinstance(
+                item["guarded_price_plan"].get("history_evidence"), Mapping
+            )
+            and item["guarded_price_plan"]["history_evidence"].get("freshness")
+            in {"cache", "cached", "cached_fresh"}
+        )
+        for item in screen_results
+    )
     return {
         "status": "ok",
         "candidates": normalized or [],
@@ -1494,11 +1766,37 @@ def _run_technical_funnel_worker_payload(
             "passed_count": len(passing_results),
             "selected_count": len(technical_selected_codes),
             "selected_codes": technical_selected_codes,
+            "deep_research_selected_count": len(deep_research_selected_codes),
+            "deep_research_selected_codes": deep_research_selected_codes,
             "status_counts": dict(sorted(status_counts.items())),
             "closest_rejection_count": len(closest_rejections),
             "closest_rejections": closest_rejections,
         },
         "earnings_screen": earnings_screen,
+        "notice_review": notice_review,
+        "pipeline_metrics": {
+            "rolling_pool_capacity": MAX_PUBLIC_ROLLING_POOL_CANDIDATES,
+            "deep_research_capacity": MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES,
+            "technical_input_count": len(definitions),
+            "technical_worker_count": worker_count,
+            "technical_data_calls": len(definitions),
+            "technical_cache_hit_count": technical_cache_hit_count,
+            "earnings_batch_calls": 1 if technical_selected_codes else 0,
+            "notice_batch_calls": (
+                1
+                if payload.get("enable_notice_review") is True
+                and technical_selected_codes
+                else 0
+            ),
+            "candidate_build_calls": 1 if selected_codes else 0,
+            "corporate_action_calls": corporate_action_calls,
+            "technical_seconds": round(technical_seconds, 6),
+            "earnings_seconds": round(earnings_seconds, 6),
+            "notice_seconds": round(notice_seconds, 6),
+            "candidate_build_seconds": round(candidate_build_seconds, 6),
+            "corporate_action_seconds": round(corporate_action_seconds, 6),
+            "total_seconds": round(time.perf_counter() - pipeline_started, 6),
+        },
     }
 
 

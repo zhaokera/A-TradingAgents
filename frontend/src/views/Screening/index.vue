@@ -806,7 +806,7 @@ const waitForCandidateJob = async (job: AICandidateJob) => {
 const runAiCandidateResearch = async () => {
   aiCandidateLoading.value = true
   try {
-    const response = await screeningApi.runAiCandidates(5)
+    const response = await screeningApi.runAiCandidates(100)
     const job = ((response as any)?.data || response) as AICandidateJob
     const completed = await waitForCandidateJob(job)
     aiCandidateRun.value = completed.result || null

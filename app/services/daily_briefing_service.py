@@ -121,6 +121,48 @@ class DailyBriefingService:
             if isinstance(item, Mapping)
             and item.get("execution_actionable") is True
         ]
+        rolling_pool = deepcopy(
+            candidate_run.get("rolling_pool")
+            if isinstance(candidate_run, Mapping)
+            and isinstance(candidate_run.get("rolling_pool"), Mapping)
+            else {}
+        )
+        rolling_pool.setdefault("capacity", 100)
+        rolling_pool.setdefault("total_count", len(candidates))
+        rolling_pool.setdefault(
+            "current_count",
+            sum(
+                isinstance(item, Mapping)
+                and str(item.get("rolling_pool_state") or "current") == "current"
+                for item in candidates
+            ),
+        )
+        rolling_pool.setdefault(
+            "aging_count",
+            sum(
+                isinstance(item, Mapping)
+                and item.get("rolling_pool_state") == "aging"
+                for item in candidates
+            ),
+        )
+        rolling_pool["candidates"] = [
+            {
+                "code": item.get("code"),
+                "name": item.get("name"),
+                "lifecycle_state": str(
+                    item.get("rolling_pool_state") or "current"
+                ),
+                "research_tier": item.get("research_tier"),
+                "rank": item.get("rank"),
+                "rank_score": item.get("rank_score"),
+                "objective_tier": item.get("objective_tier"),
+                "actionability": item.get("actionability"),
+                "execution_actionable": item.get("execution_actionable") is True,
+                "structured_review": deepcopy(item.get("structured_review") or {}),
+            }
+            for item in candidates
+            if isinstance(item, Mapping)
+        ]
         premarket = await self.premarket_service.build(
             db=db,
             macro=macro,
@@ -170,6 +212,7 @@ class DailyBriefingService:
                     (candidate_run or {}).get("candidate_research") or {}
                 ),
                 "candidate_count": len(candidates),
+                "rolling_pool": rolling_pool,
                 "executable_count": len(executable),
                 "executable_candidates": executable,
                 "allocated_research_count": len(allocated_research),

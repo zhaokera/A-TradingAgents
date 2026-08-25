@@ -47,7 +47,7 @@ class ScreeningResponse(BaseModel):
 
 
 class AICandidateRunRequest(BaseModel):
-    max_candidates: int = Field(default=5, ge=1, le=10)
+    max_candidates: int = Field(default=100, ge=1, le=100)
 
 
 class AddAICandidatesRequest(BaseModel):

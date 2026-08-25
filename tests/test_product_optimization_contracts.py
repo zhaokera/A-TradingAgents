@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -118,7 +118,7 @@ def test_stock_master_prefers_authoritative_industry_and_business_evidence():
                 "source": "tushare",
                 "source_endpoint": "stock_basic",
                 "source_record_key": "600001.SH:stock_basic",
-                "retrieved_at": datetime(2026, 7, 20, tzinfo=timezone.utc),
+                "retrieved_at": datetime.now(timezone.utc) - timedelta(days=2),
             },
             {
                 "code": "600001",
@@ -127,7 +127,7 @@ def test_stock_master_prefers_authoritative_industry_and_business_evidence():
                 "source": "akshare",
                 "source_endpoint": "stock_individual_info_em",
                 "source_record_key": "600001:stock_individual_info_em",
-                "retrieved_at": datetime(2026, 7, 21, tzinfo=timezone.utc),
+                "retrieved_at": datetime.now(timezone.utc) - timedelta(days=1),
             },
         ],
     )

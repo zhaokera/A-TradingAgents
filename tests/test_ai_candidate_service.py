@@ -15,6 +15,7 @@ from app.services.ai_candidate_service import (
     _apply_candidate_state,
     normalize_ai_candidate,
     normalize_ai_candidate_run,
+    merge_rolling_candidate_pool,
 )
 from app.services.favorites_service import FavoritesService
 from app.services.holdings_cli import CLIError
@@ -315,6 +316,100 @@ def test_normalize_ai_candidate_run_sorts_core_objective_before_non_core():
     assert result["candidates"][1]["objective_tier"] == "non_core"
 
 
+def test_normalize_ai_candidate_run_does_not_truncate_rolling_pool_to_display_limit():
+    payload = _research_payload()
+    payload["data"]["candidates"] = [
+        {
+            "code": f"{600000 + index:06d}",
+            "name": f"候选{index}",
+            "priority": index + 1,
+            "quote": {"price": 10.0 + index / 100},
+            "guarded_price_plan": {"status": "history_unavailable"},
+            "risk_flags": [],
+            "research_tier": "deep" if index < 15 else "structured",
+        }
+        for index in range(100)
+    ]
+
+    result = normalize_ai_candidate_run(
+        payload,
+        max_candidates=5,
+        favorite_codes=set(),
+    )
+
+    assert result["candidate_count"] == 100
+    assert len(result["candidates"]) == 100
+    assert result["rolling_pool"] == {
+        "capacity": 100,
+        "current_count": 100,
+        "aging_count": 0,
+        "expired_count": 0,
+        "invalidated_count": 0,
+        "deep_count": 15,
+        "structured_count": 85,
+    }
+
+
+def test_merge_rolling_pool_preserves_unseen_candidates_as_aging():
+    current = [
+        {"code": "600001", "rank_score": 90.0, "rolling_pool_state": "current"}
+    ]
+    previous = [
+        {
+            "code": "600001",
+            "rank_score": 80.0,
+            "first_seen_at": "2026-08-20T01:40:00+00:00",
+            "last_seen_at": "2026-08-21T01:40:00+00:00",
+            "rolling_pool_state": "current",
+        },
+        {
+            "code": "600002",
+            "rank_score": 70.0,
+            "first_seen_at": "2026-08-20T01:40:00+00:00",
+            "last_seen_at": "2026-08-21T01:40:00+00:00",
+            "rolling_pool_state": "current",
+        },
+    ]
+
+    active, retired = merge_rolling_candidate_pool(
+        current,
+        previous,
+        generated_at=datetime.fromisoformat("2026-08-24T01:40:00+00:00"),
+    )
+
+    assert [item["code"] for item in active] == ["600001", "600002"]
+    assert active[0]["rolling_pool_state"] == "current"
+    assert active[0]["first_seen_at"] == "2026-08-20T01:40:00+00:00"
+    assert active[1]["rolling_pool_state"] == "aging"
+    assert active[1]["rolling_age_trading_days"] == 2
+    assert active[1]["execution_actionable"] is False
+    assert retired == []
+
+
+def test_merge_rolling_pool_expires_after_ten_trading_days_and_keeps_audit():
+    previous = [
+        {
+            "code": "600002",
+            "rank_score": 70.0,
+            "first_seen_at": "2026-08-10T01:40:00+00:00",
+            "last_seen_at": "2026-08-10T01:40:00+00:00",
+            "rolling_pool_state": "aging",
+        }
+    ]
+
+    active, retired = merge_rolling_candidate_pool(
+        [],
+        previous,
+        generated_at=datetime.fromisoformat("2026-08-24T01:40:00+00:00"),
+    )
+
+    assert active == []
+    assert retired[0]["code"] == "600002"
+    assert retired[0]["rolling_pool_state"] == "expired"
+    assert retired[0]["rolling_age_trading_days"] == 10
+    assert retired[0]["execution_actionable"] is False
+
+
 def test_breakout_price_ready_is_still_blocked_by_quote_risk():
     candidate = normalize_ai_candidate(
         {
@@ -458,11 +553,16 @@ async def test_run_persists_user_owned_candidate_batch():
 
     assert result["run_id"]
     assert result["user_id"] == "admin-id"
-    assert result["candidate_count"] == 1
-    assert result["candidates"][0]["code"] == "600001"
+    assert result["candidate_count"] == 2
+    assert [item["code"] for item in result["candidates"]] == [
+        "600001",
+        "600000",
+    ]
     stored = collection.insert_one.await_args.args[0]
     assert stored["user_id"] == "admin-id"
     assert stored["expires_at"] > stored["generated_at"]
+    assert stored["candidate_discovery"] == stored["discovery"]
+    assert result["candidate_discovery"] == result["discovery"]
     favorites.sync_auto_ai_candidates.assert_awaited_once()
     assert result["auto_favorites"]["selected_codes"] == ["600001"]
 
@@ -1007,6 +1107,8 @@ async def test_start_run_returns_background_job_without_waiting(monkeypatch):
 
     assert result["status"] == "queued"
     assert result["job_id"]
+    assert result["max_candidates"] == 100
+    assert collection.insert_one.await_args.args[0]["max_candidates"] == 100
     collection.insert_one.assert_awaited_once()
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -636,6 +637,52 @@ def test_fetch_tencent_quotes_batched_caps_the_public_screen_pool_at_160(monkeyp
     assert result["requested_codes"] == codes[:160]
     assert len(calls) == 4
     assert all(len(batch) == 40 for batch in calls)
+
+
+def test_quote_service_refreshes_100_candidate_pool_with_one_batched_call(
+    monkeypatch,
+):
+    codes = [f"{600000 + index:06d}" for index in range(100)]
+    calls = []
+
+    def fake_batched(requested, *, timeout):
+        requested_codes = list(requested)
+        calls.append({"codes": requested_codes, "timeout": timeout})
+        return {
+            "status": "ok",
+            "requested_codes": requested_codes,
+            "rows": [
+                {
+                    "code": code,
+                    "price": 10.0,
+                    "close": 10.0,
+                    "source": "tencent",
+                }
+                for code in requested_codes
+            ],
+            "error_type": None,
+            "batch_count": 3,
+            "completed_batch_count": 3,
+        }
+
+    monkeypatch.setattr(
+        quote_service,
+        "fetch_tencent_quotes_batched_sync",
+        fake_batched,
+    )
+    monkeypatch.setattr(
+        quote_service,
+        "fetch_tencent_quote_sync",
+        lambda _code: (_ for _ in ()).throw(
+            AssertionError("candidate-pool refresh must use the batch endpoint")
+        ),
+    )
+    service = quote_service.TencentQuoteService(ttl_seconds=15)
+
+    result = asyncio.run(service.get_quotes(codes))
+
+    assert len(result) == 100
+    assert calls == [{"codes": codes, "timeout": 10.0}]
 
 
 def test_fetch_tencent_quotes_returns_empty_without_request(monkeypatch):

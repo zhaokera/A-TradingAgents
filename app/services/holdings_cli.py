@@ -68,6 +68,7 @@ from app.services.public_candidate_deep_check import (
     A_SHARE_STOCK_CODE_PATTERN,
     MAX_PUBLIC_DEEP_CHECK_CANDIDATES,
     MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES,
+    PUBLIC_NOTICE_HARD_RISK_TAGS,
     PUBLIC_TECHNICAL_SCREEN_STATUS_KEYS,
     run_public_candidate_technical_funnel,
     validate_public_earnings_screen_metadata,
@@ -2040,6 +2041,7 @@ def _build_opportunity_candidates(
     allow_reference_price_plan: bool = False,
     quote_snapshots: Optional[Mapping[str, Dict[str, Any]]] = None,
     technical_plan_snapshots: Optional[Mapping[str, Dict[str, Any]]] = None,
+    corporate_action_snapshots: Optional[Mapping[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for definition in definitions:
@@ -2067,7 +2069,16 @@ def _build_opportunity_candidates(
                 key: definition.get(key, value)
                 for key, value in objective_profile.items()
             }
-        corporate_action = fetch_cn_dividend_calendar_sync(code)
+        injected_corporate_action = (
+            corporate_action_snapshots.get(code)
+            if isinstance(corporate_action_snapshots, Mapping)
+            else None
+        )
+        corporate_action = (
+            deepcopy(dict(injected_corporate_action))
+            if isinstance(injected_corporate_action, Mapping)
+            else fetch_cn_dividend_calendar_sync(code)
+        )
         upcoming_price_adjustment_required = bool(
             corporate_action.get("price_plan_adjustment_required")
         )
@@ -4427,12 +4438,16 @@ _PUBLIC_CANDIDATE_DISCOVERY_SCALAR_FIELDS = (
     "technical_screened_count",
     "technical_passed_count",
     "technical_selected_count",
+    "deep_research_selected_count",
     "technical_closest_rejection_count",
     "earnings_screened_count",
     "earnings_blocked_count",
     "earnings_selected_count",
     "earnings_report_period",
     "earnings_actual_report_period",
+    "notice_reviewed_count",
+    "notice_hard_blocked_count",
+    "notice_manual_review_count",
     "permission_prefilter_excluded_count",
 )
 _PUBLIC_DISCOVERY_REJECTION_KEYS = set(PUBLIC_CANDIDATE_REJECTION_KEYS)
@@ -5053,6 +5068,8 @@ def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str,
             "buy_lot_size",
             "one_lot_amount",
             "is_reference_only",
+            "research_tier",
+            "rolling_pool_state",
         ),
     )
     if isinstance(value.get("quote"), Mapping):
@@ -5071,6 +5088,43 @@ def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str,
         )
     if isinstance(value.get("triggers"), Mapping):
         sanitized["triggers"] = _sanitize_public_triggers(value.get("triggers"))
+    structured_review = value.get("structured_review")
+    if isinstance(structured_review, Mapping):
+        earnings = structured_review.get("earnings")
+        notice = structured_review.get("notice")
+        sanitized["structured_review"] = {
+            "technical": _copy_public_scalar_fields(
+                structured_review.get("technical"),
+                ("status",),
+            ),
+            "earnings": _copy_public_scalar_fields(
+                earnings,
+                (
+                    "code",
+                    "status",
+                    "blocks_new_position",
+                    "announcement_date",
+                    "reason_summary",
+                ),
+            ),
+            "notice": _copy_public_scalar_fields(
+                notice,
+                (
+                    "code",
+                    "name",
+                    "status",
+                    "total_notice_count",
+                    "returned_notice_count",
+                    "truncated",
+                    "manual_review_required",
+                ),
+            ),
+            "hard_risk_status": structured_review.get("hard_risk_status"),
+            "hard_risk_clear": structured_review.get("hard_risk_clear"),
+            "hard_risk_reasons": _copy_public_scalar_list(
+                structured_review.get("hard_risk_reasons")
+            ),
+        }
     return sanitized
 
 
@@ -6150,9 +6204,7 @@ def build_public_research_opportunities_payload(
                 definitions,
                 quote_map,
                 selected_codes=(
-                    earnings_screen["selected_codes"]
-                    if earnings_screen is not None
-                    else technical_screen["selected_codes"]
+                    technical_screen["selected_codes"]
                     if technical_screen is not None
                     else None
                 ),
@@ -6187,6 +6239,9 @@ def build_public_research_opportunities_payload(
                         ],
                         "technical_selected_count": technical_screen[
                             "selected_count"
+                        ],
+                        "deep_research_selected_count": technical_screen[
+                            "deep_research_selected_count"
                         ],
                         "technical_screen_status_counts": deepcopy(
                             technical_screen["status_counts"]
@@ -6238,6 +6293,47 @@ def build_public_research_opportunities_payload(
                     "provider": EARNINGS_REVIEW_SOURCE,
                     "status": "ok",
                 }
+            raw_notice_review = deep_check_result.get("notice_review")
+            notice_review = (
+                raw_notice_review
+                if isinstance(raw_notice_review, Mapping)
+                else {}
+            )
+            notice_status = str(notice_review.get("status") or "not_requested")
+            notice_results = [
+                item
+                for item in notice_review.get("results", [])
+                if isinstance(item, Mapping)
+            ]
+            candidate_discovery.update(
+                {
+                    "notice_reviewed_count": int(
+                        notice_review.get("reviewed_count") or 0
+                    ),
+                    "notice_hard_blocked_count": sum(
+                        bool(
+                            set(item.get("attention_tags") or []).intersection(
+                                PUBLIC_NOTICE_HARD_RISK_TAGS
+                            )
+                        )
+                        for item in notice_results
+                    ),
+                    "notice_manual_review_count": int(
+                        notice_review.get("manual_review_code_count") or 0
+                    ),
+                }
+            )
+            candidate_discovery["stage_sources"]["recent_notice_review"] = {
+                "provider": NOTICE_REVIEW_SOURCE,
+                "status": notice_status,
+                "error_type": notice_review.get("error_type"),
+            }
+            pipeline_metrics = deep_check_result.get("pipeline_metrics")
+            candidate_discovery["pipeline_metrics"] = (
+                deepcopy(dict(pipeline_metrics))
+                if isinstance(pipeline_metrics, Mapping)
+                else {}
+            )
         elif deep_status == "technical_deep_check_timeout":
             if deep_check_result.get("mode") == "technical_funnel":
                 raise CLIError(
@@ -6292,6 +6388,11 @@ def build_public_research_opportunities_payload(
         candidate_discovery["stage_sources"]["earnings_forecast_review"] = {
             "provider": EARNINGS_REVIEW_SOURCE,
             "status": earnings_status,
+        }
+    if "recent_notice_review" not in candidate_discovery["stage_sources"]:
+        candidate_discovery["stage_sources"]["recent_notice_review"] = {
+            "provider": NOTICE_REVIEW_SOURCE,
+            "status": "not_called_no_candidates",
         }
     candidate_discovery["stage_sources"]["technical_deep_check"] = {
         "provider": (
@@ -6350,6 +6451,11 @@ def build_public_research_opportunities_payload(
     if earnings_status == "ok":
         available_data.append("earnings_forecast_review")
         available_data.append("latest_actual_earnings")
+    notice_stage = candidate_discovery["stage_sources"].get(
+        "recent_notice_review"
+    )
+    if isinstance(notice_stage, Mapping) and notice_stage.get("status") == "ok":
+        available_data.append("recent_notice_review")
 
     payload = {
         "ok": True,
@@ -6389,6 +6495,11 @@ def build_public_research_opportunities_payload(
                 "quote_source": discovery_source,
                 "technical_deep_check_status": technical_status,
                 "earnings_forecast_review_status": earnings_status,
+                "recent_notice_review_status": (
+                    notice_stage.get("status")
+                    if isinstance(notice_stage, Mapping)
+                    else "not_called"
+                ),
                 "available_data": available_data,
                 "unavailable_data": [
                     "account",

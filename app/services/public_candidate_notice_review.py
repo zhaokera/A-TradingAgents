@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 NOTICE_REVIEW_SOURCE = "akshare.eastmoney.stock_notice_report"
 NOTICE_HISTORY_SOURCE = "akshare.eastmoney.stock_individual_notice_report"
-MAX_NOTICE_REVIEW_CANDIDATES = 8
+MAX_NOTICE_REVIEW_CANDIDATES = 100
 NOTICE_LOOKBACK_CALENDAR_DAYS = 7
 MAX_NOTICE_LOOKBACK_CALENDAR_DAYS = 90
 MAX_NOTICES_PER_CODE = 20
@@ -347,7 +347,7 @@ def review_public_candidate_notices(
     as_of_date: Any,
     loader: Optional[NoticeLoader] = None,
 ) -> Dict[str, Any]:
-    """Read seven calendar days of notices for at most eight requested codes."""
+    """Read seven calendar days of notices for the bounded rolling pool."""
     if not isinstance(codes, list) or not codes:
         return _invalid_result("codes_invalid")
     if len(codes) > MAX_NOTICE_REVIEW_CANDIDATES:
