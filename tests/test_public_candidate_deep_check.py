@@ -873,6 +873,67 @@ def test_technical_funnel_worker_retains_closest_net_rr_rejections_for_audit():
     assert earnings_calls == [["600007", "600006"]]
 
 
+def test_technical_screen_validator_accepts_objective_ranked_rejections():
+    definitions = [
+        {
+            **_definition("600000"),
+            "objective_tier": "non_core",
+            "tencent_score": 0.9,
+            "tencent_one_lot_amount": 1000.0,
+        },
+        {
+            **_definition("600001"),
+            "objective_tier": "core",
+            "tencent_score": 0.2,
+            "tencent_one_lot_amount": 1000.0,
+        },
+        {
+            **_definition("600002"),
+            "objective_tier": "core",
+            "tencent_score": 0.5,
+            "tencent_one_lot_amount": 1000.0,
+        },
+    ]
+    quote_map = {
+        definition["code"]: _quote(definition["code"])
+        for definition in definitions
+    }
+
+    def fake_screener(definition, _quote_value):
+        ratios = {"600000": 1.49, "600001": 0.2, "600002": 2.0}
+        ratio = ratios[definition["code"]]
+        return _screen_result(
+            definition["code"],
+            net_reward_risk=ratio,
+            status="ok" if ratio >= 1.5 else "net_rr_below_1_5",
+            passed=ratio >= 1.5,
+        )
+
+    result = deep_check._run_technical_funnel_worker_payload(
+        {
+            "definitions": definitions,
+            "quote_map": quote_map,
+            "benchmark_trade_date": "2026-07-17",
+        },
+        technical_screener=fake_screener,
+        earnings_screener=lambda codes, **_kwargs: _earnings_screen(codes),
+        candidate_builder=lambda selected, **_kwargs: [
+            {"code": item["code"]} for item in selected
+        ],
+    )
+
+    technical_screen = result["technical_screen"]
+    assert [
+        item["code"] for item in technical_screen["closest_rejections"]
+    ] == ["600001", "600000"]
+    validated, error = deep_check.validate_public_technical_screen_metadata(
+        technical_screen,
+        expected_definitions=definitions,
+    )
+    assert error is None
+    assert validated == technical_screen
+
+
 def test_real_technical_screen_falls_back_to_fee_aware_pullback_plan(monkeypatch):
     import app.services.holding_price_guardrails as guardrails
     import app.services.tencent_quote_service as quote_service

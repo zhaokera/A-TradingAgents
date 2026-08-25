@@ -681,6 +681,7 @@ def validate_public_technical_screen_metadata(
             definition.get("tencent_one_lot_amount")
         )
         return (
+            objective_tier_rank(definition.get("objective_tier")),
             -float(item["net_reward_risk"]),
             -float(item["tencent_score"]),
             one_lot_amount if one_lot_amount is not None else math.inf,
