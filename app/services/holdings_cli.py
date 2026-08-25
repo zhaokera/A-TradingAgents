@@ -5495,14 +5495,25 @@ def _valid_public_candidate_discovery_metadata(
         and (
             not degraded
             or (
-                public_provider
-                in {
-                    "mongo.candidate_market_snapshots",
-                    "mongo.market_quotes",
-                }
-                and value.get("freshness") == "cached_fresh"
-                and provider_errors_valid
+                provider_errors_valid
                 and bool(provider_errors)
+                and (
+                    (
+                        public_provider
+                        in {
+                            "mongo.candidate_market_snapshots",
+                            "mongo.market_quotes",
+                        }
+                        and value.get("freshness") == "cached_fresh"
+                    )
+                    or (
+                        public_provider == "akshare.sina.stock_zh_a_spot"
+                        and value.get("freshness") == "fresh"
+                        and public_stage.get("freshness") == "fresh"
+                        and public_stage.get("degraded") is True
+                        and public_stage.get("provider_errors") == provider_errors
+                    )
+                )
             )
         )
         and isinstance(tencent_stage, Mapping)

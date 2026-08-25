@@ -6684,6 +6684,35 @@ def test_public_discovery_metadata_rejects_unknown_rejection_reason():
     ) is False
 
 
+def test_public_discovery_metadata_accepts_fresh_retry_recovery_with_audit():
+    discovery = _make_public_research_discovery("ok")
+    metadata = discovery["candidate_discovery"]
+    provider_error = {
+        "provider": "akshare.sina.stock_zh_a_spot",
+        "status": "public_breadth_fetch_failed",
+        "error_type": "ReadTimeout",
+        "checked_at": "2026-07-15T02:00:00+00:00",
+    }
+    metadata["freshness"] = "fresh"
+    metadata["degraded"] = True
+    metadata["provider_errors"] = [provider_error]
+    metadata["stage_sources"]["public_snapshot"].update(
+        {
+            "provider": "akshare.sina.stock_zh_a_spot",
+            "freshness": "fresh",
+            "degraded": True,
+            "provider_errors": [provider_error],
+        }
+    )
+
+    assert holdings_cli_module._valid_public_candidate_discovery_metadata(
+        metadata,
+        discovery_status="ok",
+        tencent_stage_status="ok",
+        raw_definitions=discovery["definitions"],
+    ) is True
+
+
 def test_public_builder_error_preserves_valid_failure_snapshot_coverage(monkeypatch):
     snapshot = _make_incomplete_public_snapshot()
     context = make_opportunity_market_context(
