@@ -2830,6 +2830,50 @@ def test_snapshot_resilience_fails_closed_when_only_cache_is_stale():
     assert result["candidate_discovery"]["provider_errors"]
 
 
+def test_snapshot_resilience_accepts_same_day_morning_cache_during_midday_break():
+    db = _SnapshotCacheDB()
+    cached = _snapshot([_row("600610", amount=900_000_000.0)])
+    midday = datetime(
+        2026,
+        7,
+        15,
+        12,
+        19,
+        tzinfo=ZoneInfo("Asia/Shanghai"),
+    )
+    db["candidate_market_snapshots"].rows[
+        f"public_full_market:{BENCHMARK_TRADE_DATE}"
+    ] = {
+        "_id": f"public_full_market:{BENCHMARK_TRADE_DATE}",
+        "benchmark_trade_date": BENCHMARK_TRADE_DATE,
+        "checked_at": midday - timedelta(minutes=49),
+        "source": cached["source"],
+        "payload": cached,
+    }
+    service = PublicMarketSnapshotResilience(
+        db_factory=lambda: db,
+        sleeper=lambda _seconds: None,
+    )
+
+    snapshot = service.fetch(
+        fetcher=lambda **_kwargs: {
+            "status": "public_breadth_fetch_failed",
+            "source": "akshare.sina.stock_zh_a_spot",
+            "error_type": "RemoteDisconnected",
+            "rows": [],
+        },
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        timeout_seconds=20,
+        now=midday,
+        remaining_seconds=lambda: 20,
+    )
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["source"] == "mongo.candidate_market_snapshots"
+    assert snapshot["freshness"] == "cached_fresh"
+    assert snapshot["degraded"] is True
+
+
 def test_snapshot_resilience_uses_complete_fresh_market_quotes_fallback():
     codes = (
         [f"{600000 + index:06d}" for index in range(200)]

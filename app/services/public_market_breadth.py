@@ -475,6 +475,14 @@ def _normalize_sina_snapshot(
             and provider_seconds >= _seconds(time(14, 55))
             and provider_not_in_future
         )
+    elif time(11, 30) < current_time < time(13, 0):
+        # Sina can finish publishing exchange pages after the 11:30 close.
+        # During the break, bound that provider update by wall clock instead.
+        provider_time_is_fresh = bool(
+            provider_seconds is not None
+            and provider_seconds >= expected_seconds - MAX_PROVIDER_LAG_SECONDS
+            and provider_not_in_future
+        )
     else:
         provider_time_is_fresh = bool(
             provider_seconds is not None
@@ -566,6 +574,8 @@ def _normalize_sina_snapshot(
         "benchmark_trade_date": benchmark_date.isoformat(),
         "provider_trade_date": benchmark_date.isoformat(),
         "provider_time": provider_time.isoformat(),
+        "provider_time_semantics": "provider_snapshot_update_time",
+        "exchange_trade_time_verified": False,
         "universe_size": len(normalized_rows),
         "excluded_stale_count": excluded_stale_count,
         "duplicate_count": duplicate_count,

@@ -26,6 +26,7 @@ MAX_FETCH_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.25
 PROVIDER_FAILURE_COOLDOWN_SECONDS = 60
 LIVE_CACHE_MAX_AGE_SECONDS = 30 * 60
+MIDDAY_CACHE_MAX_AGE_SECONDS = 2 * 60 * 60
 OFF_HOURS_CACHE_MAX_AGE_SECONDS = 18 * 60 * 60
 _EXCHANGES = ("sh", "sz", "bj")
 _CODE_PATTERN = re.compile(r"^[0-9]{6}$")
@@ -89,9 +90,14 @@ def _local_now(value: datetime) -> datetime:
 
 def _cache_max_age_seconds(now: datetime) -> int:
     local = _local_now(now)
-    is_live = (
+    if (
         local.weekday() < 5
-        and clock_time(9, 15) <= local.time() <= clock_time(15, 10)
+        and clock_time(11, 30) < local.time() < clock_time(13, 0)
+    ):
+        return MIDDAY_CACHE_MAX_AGE_SECONDS
+    is_live = local.weekday() < 5 and (
+        clock_time(9, 15) <= local.time() <= clock_time(11, 30)
+        or clock_time(13, 0) <= local.time() <= clock_time(15, 10)
     )
     return LIVE_CACHE_MAX_AGE_SECONDS if is_live else OFF_HOURS_CACHE_MAX_AGE_SECONDS
 

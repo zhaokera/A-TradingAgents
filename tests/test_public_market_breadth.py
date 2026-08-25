@@ -408,6 +408,37 @@ def test_normalize_sina_public_breadth_intraday_time_tolerance_boundaries(
     assert result["status"] == expected_status
 
 
+def test_normalize_sina_public_breadth_accepts_delayed_midday_provider_update():
+    rows = _sina_rows(timestamp="11:30:00")
+    rows[-1]["时间戳"] = "11:36:02"
+
+    result = _normalize_sina_snapshot(
+        rows,
+        benchmark_trade_date="2026-07-15",
+        provider_anchor=_anchor(provider_time="11:36:00"),
+        provider_expected_counts=EXPECTED_COUNTS,
+        now=_now(hour=12, minute=19),
+    )
+
+    assert result["status"] == "ok"
+    assert result["provider_time"] == "11:36:02"
+    assert result["provider_time_semantics"] == "provider_snapshot_update_time"
+    assert result["exchange_trade_time_verified"] is False
+
+
+def test_normalize_sina_public_breadth_rejects_future_midday_provider_update():
+    result = _normalize_sina_snapshot(
+        _sina_rows(timestamp="12:22:01"),
+        benchmark_trade_date="2026-07-15",
+        provider_anchor=_anchor(provider_time="12:22:01"),
+        provider_expected_counts=EXPECTED_COUNTS,
+        now=_now(hour=12, minute=19),
+    )
+
+    assert result["status"] == "public_breadth_provider_time_stale"
+    assert result["rows"] == []
+
+
 @pytest.mark.parametrize(
     ("benchmark_trade_date", "local_now"),
     [
