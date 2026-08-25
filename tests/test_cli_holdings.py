@@ -8454,7 +8454,7 @@ def test_public_research_payload_keeps_all_technical_passes_below_pool_cap(
         "rolling_pool_capacity": 100,
         "deep_research_capacity": 15,
         "technical_input_count": 9,
-        "technical_worker_count": 6,
+        "technical_worker_count": 12,
         "technical_data_calls": 9,
         "technical_cache_hit_count": 7,
         "earnings_batch_calls": 1,

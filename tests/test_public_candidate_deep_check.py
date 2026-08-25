@@ -692,7 +692,7 @@ def test_technical_funnel_caps_rolling_pool_at_100_and_deep_research_at_15():
         "rolling_pool_capacity": 100,
         "deep_research_capacity": 15,
         "technical_input_count": 120,
-            "technical_worker_count": 6,
+        "technical_worker_count": 12,
         "technical_data_calls": 120,
         "technical_cache_hit_count": 0,
         "earnings_batch_calls": 1,
@@ -1035,10 +1035,10 @@ def test_technical_funnel_worker_excludes_isolated_history_fetch_error():
     }
 
 
-def test_technical_funnel_worker_caps_parallel_history_fetches_at_six(
+def test_technical_funnel_worker_caps_parallel_history_fetches_at_twelve(
     monkeypatch,
 ):
-    definitions = [_definition(f"{600000 + index:06d}") for index in range(9)]
+    definitions = [_definition(f"{600000 + index:06d}") for index in range(20)]
     quote_map = {
         definition["code"]: _quote(definition["code"])
         for definition in definitions
@@ -1078,8 +1078,8 @@ def test_technical_funnel_worker_caps_parallel_history_fetches_at_six(
     )
 
     assert result["status"] == "ok"
-    assert result["technical_screen"]["screened_count"] == 9
-    assert executor_calls == [6]
+    assert result["technical_screen"]["screened_count"] == 20
+    assert executor_calls == [12]
 
 
 @pytest.mark.parametrize(
