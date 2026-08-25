@@ -1035,6 +1035,44 @@ def test_research_quote_freshness_uses_intraday_age_boundaries():
     )
 
 
+def test_research_quote_freshness_accepts_midday_provider_snapshot_for_research():
+    result = quote_service.assess_tencent_research_quote_freshness(
+        {
+            "source": "tencent",
+            "provider_updated_at": "2026-07-10T12:05:59+08:00",
+            "quote_time_semantics": "provider_snapshot_updated_at",
+            "exchange_trade_time_verified": False,
+        },
+        benchmark_trade_date="2026-07-10",
+        now=datetime(2026, 7, 10, 12, 44, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result["data_complete"] is True
+    assert result["status"] == "midday_snapshot"
+    assert result["session"] == "lunch_break"
+    assert result["exchange_trade_time_verified"] is False
+
+
+def test_research_quote_freshness_rejects_incomplete_or_future_midday_snapshot():
+    now = datetime(2026, 7, 10, 12, 44, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    incomplete = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "provider_updated_at": "2026-07-10T11:24:59+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+    future = quote_service.assess_tencent_research_quote_freshness(
+        {"source": "tencent", "provider_updated_at": "2026-07-10T12:46:01+08:00"},
+        benchmark_trade_date="2026-07-10",
+        now=now,
+    )
+
+    assert incomplete["data_complete"] is False
+    assert incomplete["status"] == "stale_trade_at"
+    assert future["data_complete"] is False
+    assert future["status"] == "future_trade_at"
+
+
 def test_research_quote_freshness_uses_completed_day_close_threshold():
     now = datetime(2026, 7, 10, 15, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
 

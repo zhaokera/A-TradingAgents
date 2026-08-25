@@ -915,6 +915,39 @@ def test_tencent_verification_accepts_ok_or_legacy_missing_parse_status(
     assert result["rejection_counts"] == {}
 
 
+def test_tencent_verification_accepts_midday_snapshot_for_research_ranking():
+    definition = _task_3_definitions(1)[0]
+    midday = datetime(
+        2026,
+        7,
+        15,
+        12,
+        44,
+        tzinfo=ZoneInfo("Asia/Shanghai"),
+    )
+
+    result = discovery_module.verify_and_rank_tencent_candidates(
+        [definition],
+        [
+            _quote(
+                definition,
+                trade_at="2026-07-15T12:05:59+08:00",
+                provider_updated_at="2026-07-15T12:05:59+08:00",
+                quote_time_semantics="provider_snapshot_updated_at",
+                exchange_trade_time_verified=False,
+            )
+        ],
+        benchmark_trade_date=BENCHMARK_TRADE_DATE,
+        now=midday,
+    )
+
+    assert result["status"] == "ok"
+    assert result["tencent_verified_count"] == 1
+    assert result["quote_map"][definition["code"]][
+        "exchange_trade_time_verified"
+    ] is False
+
+
 @pytest.mark.parametrize(
     ("parse_status", "expected_reason"),
     [

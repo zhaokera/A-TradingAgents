@@ -394,6 +394,31 @@ def assess_tencent_research_quote_freshness(
             "reason": "腾讯行情满足已完成交易日研究时效要求。",
         }
 
+    if base["session"] == "lunch_break":
+        morning_close_floor = datetime.combine(
+            benchmark_date,
+            datetime.strptime("11:25", "%H:%M").time(),
+            tzinfo=CN_MARKET_TIMEZONE,
+        )
+        if age_seconds_raw is not None and age_seconds_raw < -max_future_skew_seconds:
+            return {
+                **base,
+                "status": "future_trade_at",
+                "reason": "腾讯提供方快照更新时间超出允许的时钟偏差。",
+            }
+        if trade_dt < morning_close_floor:
+            return {
+                **base,
+                "status": "stale_trade_at",
+                "reason": "腾讯午间研究快照早于上午收盘完整性阈值。",
+            }
+        return {
+            **base,
+            "data_complete": True,
+            "status": "midday_snapshot",
+            "reason": "腾讯午间快照覆盖上午交易，仅用于研究复核。",
+        }
+
     if base["session"] not in {"morning", "afternoon"}:
         return {
             **base,
