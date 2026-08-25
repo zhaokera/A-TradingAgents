@@ -49,6 +49,7 @@ MAINTAINED_ROOT_TESTS = {
     "test_company_profile_enrichment_service.py",
     "test_daily_decision_service.py",
     "test_decision_review_service.py",
+    "test_decision_research_service.py",
     "test_decision_proposal_service.py",
     "test_decision_router.py",
     "test_decision_scheduler.py",

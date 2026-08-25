@@ -20,7 +20,7 @@ from app.services.decision_workflow_errors import DecisionWorkflowError
 from app.services.investment_policy import calculate_candidate_position_sizing
 
 
-RESEARCH_SCHEMA_VERSION = "research-v1"
+RESEARCH_SCHEMA_VERSION = "research-v2"
 HARD_POLICY_VERSION = "codex-hard-risk-v1"
 BUCKETS = ("buy_now", "condition_order", "wait", "avoid")
 
@@ -475,6 +475,10 @@ class DecisionResearchService:
             "user_id": user_id,
             "source_baseline_id": baseline_id,
             "source_baseline_material_hash": baseline.get("material_hash"),
+            "candidate_run_id": baseline.get("candidate_run_id"),
+            "candidate_research": deepcopy(
+                baseline.get("candidate_research") or {}
+            ),
             "as_of": baseline.get("as_of"),
             "created_at": created_at,
             "market_session": deepcopy(baseline.get("market_session") or {}),
@@ -491,6 +495,7 @@ class DecisionResearchService:
             "hard_constraints": _dedupe_records(packet_hard),
             "soft_warnings": _dedupe_records(packet_soft),
             "candidates": candidates,
+            "rolling_pool": deepcopy(baseline.get("rolling_pool") or {}),
             "portfolio_constraints": deepcopy(
                 baseline.get("portfolio_constraints") or {}
             ),

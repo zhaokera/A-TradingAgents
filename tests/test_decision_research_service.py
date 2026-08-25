@@ -293,6 +293,49 @@ async def test_research_packet_evidence_ids_are_stable_and_unique():
 
 
 @pytest.mark.asyncio
+async def test_research_packet_preserves_rolling_pool_audit():
+    baseline = _baseline()
+    baseline["candidate_run_id"] = "run-top-100"
+    baseline["candidate_research"] = {
+        "job_id": "job-top-100",
+        "status": "completed",
+    }
+    baseline["rolling_pool"] = {
+        "capacity": 100,
+        "total_count": 68,
+        "formal_research_capacity": 15,
+        "formal_research_count": 15,
+        "current_count": 66,
+        "aging_count": 2,
+        "expired_count": 0,
+        "invalidated_count": 0,
+        "candidates": [
+            {
+                "code": "600406",
+                "lifecycle_state": "current",
+                "research_tier": "deep",
+                "selection_reason": "dynamic_formal_research_selected",
+            },
+            {
+                "code": "600562",
+                "lifecycle_state": "aging",
+                "research_tier": "structured",
+                "selection_reason": "outside_dynamic_formal_research_tier",
+            },
+        ],
+    }
+
+    packet = await _service(baseline).today("owner-1", refresh=False)
+
+    assert packet["candidate_run_id"] == "run-top-100"
+    assert packet["candidate_research"] == {
+        "job_id": "job-top-100",
+        "status": "completed",
+    }
+    assert packet["rolling_pool"] == baseline["rolling_pool"]
+
+
+@pytest.mark.asyncio
 async def test_research_packet_cannot_be_loaded_by_another_user():
     service = _service(_baseline())
     packet = await service.today("owner-1", refresh=False)
