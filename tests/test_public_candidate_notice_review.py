@@ -1,9 +1,12 @@
 from copy import deepcopy
+import threading
+import time
 
 import pytest
 
 from app.services.public_candidate_notice_review import (
     MAX_NOTICES_PER_CODE,
+    NOTICE_REVIEW_WORKERS,
     NOTICE_HISTORY_SOURCE,
     NOTICE_REVIEW_SOURCE,
     review_public_candidate_notice_history,
@@ -98,7 +101,7 @@ def test_notice_review_uses_seven_days_filters_and_classifies_requested_codes():
         loader=loader,
     )
 
-    assert calls == [
+    assert sorted(calls) == [
         "20260714",
         "20260715",
         "20260716",
@@ -275,7 +278,15 @@ def test_notice_review_fails_closed_without_returning_partial_results():
         loader=loader,
     )
 
-    assert calls[-1] == "20260718"
+    assert sorted(calls) == [
+        "20260714",
+        "20260715",
+        "20260716",
+        "20260717",
+        "20260718",
+        "20260719",
+        "20260720",
+    ]
     assert result == {
         "status": "notice_source_unavailable",
         "source": NOTICE_REVIEW_SOURCE,
@@ -285,6 +296,34 @@ def test_notice_review_fails_closed_without_returning_partial_results():
         "error_type": "TimeoutError",
         "results": [],
     }
+
+
+def test_notice_review_loads_days_with_bounded_parallelism():
+    calls = []
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+
+    def loader(date_text):
+        nonlocal active, peak_active
+        with lock:
+            calls.append(date_text)
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return []
+
+    result = review_public_candidate_notices(
+        ["000100"],
+        as_of_date="2026-07-20",
+        loader=loader,
+    )
+
+    assert result["status"] == "ok"
+    assert len(calls) == 7
+    assert 1 < peak_active <= NOTICE_REVIEW_WORKERS
 
 
 def test_notice_review_rejects_invalid_provider_rows_for_requested_code():

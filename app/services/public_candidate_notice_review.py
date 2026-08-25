@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -15,6 +16,7 @@ MAX_NOTICE_REVIEW_CANDIDATES = 100
 NOTICE_LOOKBACK_CALENDAR_DAYS = 7
 MAX_NOTICE_LOOKBACK_CALENDAR_DAYS = 90
 MAX_NOTICES_PER_CODE = 20
+NOTICE_REVIEW_WORKERS = 4
 PUBLIC_NOTICE_REVIEW_STATUSES = frozenset(
     {"notices_found", "no_recent_notices"}
 )
@@ -372,16 +374,33 @@ def review_public_candidate_notices(
         code: [] for code in normalized_codes
     }
 
-    for offset in range(NOTICE_LOOKBACK_CALENDAR_DAYS):
-        query_date = start_date + timedelta(days=offset)
+    query_dates = [
+        start_date + timedelta(days=offset)
+        for offset in range(NOTICE_LOOKBACK_CALENDAR_DAYS)
+    ]
+
+    def load_day(query_date: date) -> Tuple[date, Any, Optional[str]]:
         try:
-            raw_rows = effective_loader(query_date.strftime("%Y%m%d"))
+            return (
+                query_date,
+                effective_loader(query_date.strftime("%Y%m%d")),
+                None,
+            )
         except Exception as exc:
+            return query_date, None, type(exc).__name__
+
+    with ThreadPoolExecutor(
+        max_workers=min(NOTICE_REVIEW_WORKERS, len(query_dates))
+    ) as executor:
+        loaded_days = list(executor.map(load_day, query_dates))
+
+    for query_date, raw_rows, load_error in loaded_days:
+        if load_error is not None:
             return _source_failure(
                 start_date=start_date,
                 end_date=end_date,
                 failed_date=query_date,
-                error_type=type(exc).__name__,
+                error_type=load_error,
             )
         rows = _rows_from_loader_payload(raw_rows)
         if rows is None:
