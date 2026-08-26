@@ -60,6 +60,7 @@ VALID_PHASES = frozenset(
 BUCKETS = ("avoid", "wait", "buy_now", "condition_order")
 FORMAL_RESEARCH_CAPACITY = 15
 ROLLING_POOL_CAPACITY = 100
+ROLLING_POOL_LIFECYCLE_TRADING_DAYS = 10
 
 AVOID_REASON_CODES = (
     "plan_invalidated",
@@ -1329,6 +1330,31 @@ class DailyDecisionService:
         profile_errors.sort(key=quality_key)
         profile_conflicts.sort(key=quality_key)
 
+        source_rolling_pool = candidate_run.get("rolling_pool")
+        source_rolling_pool = (
+            source_rolling_pool
+            if isinstance(source_rolling_pool, Mapping)
+            else {}
+        )
+
+        def source_rolling_count(field: str, default: int = 0) -> int:
+            value = source_rolling_pool.get(field)
+            if isinstance(value, bool):
+                return default
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return default
+            return parsed if parsed >= 0 else default
+
+        active_expired_count = sum(
+            item.get("rolling_pool_state") == "expired"
+            for item in rolling_candidates
+        )
+        active_invalidated_count = sum(
+            item.get("rolling_pool_state") == "invalidated"
+            for item in rolling_candidates
+        )
         local_now = _as_shanghai(now)
         stable_session = deepcopy(dict(session))
         stable_session.pop("classified_at", None)
@@ -1359,7 +1385,13 @@ class DailyDecisionService:
                 ),
             },
             "rolling_pool": {
-                "capacity": ROLLING_POOL_CAPACITY,
+                "capacity": source_rolling_count(
+                    "capacity", ROLLING_POOL_CAPACITY
+                ),
+                "lifecycle_trading_days": source_rolling_count(
+                    "lifecycle_trading_days",
+                    ROLLING_POOL_LIFECYCLE_TRADING_DAYS,
+                ),
                 "total_count": len(rolling_candidates),
                 "formal_research_capacity": FORMAL_RESEARCH_CAPACITY,
                 "formal_research_count": len(raw_candidates),
@@ -1371,13 +1403,22 @@ class DailyDecisionService:
                     item.get("rolling_pool_state") == "aging"
                     for item in rolling_candidates
                 ),
-                "expired_count": sum(
-                    item.get("rolling_pool_state") == "expired"
+                "deep_count": sum(
+                    item.get("research_tier") == "deep"
                     for item in rolling_candidates
                 ),
-                "invalidated_count": sum(
-                    item.get("rolling_pool_state") == "invalidated"
+                "structured_count": sum(
+                    item.get("research_tier") == "structured"
                     for item in rolling_candidates
+                ),
+                "retired_count": source_rolling_count("retired_count"),
+                "expired_count": max(
+                    active_expired_count,
+                    source_rolling_count("expired_count"),
+                ),
+                "invalidated_count": max(
+                    active_invalidated_count,
+                    source_rolling_count("invalidated_count"),
                 ),
                 "candidates": rolling_candidate_audit,
             },

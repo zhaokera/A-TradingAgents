@@ -517,6 +517,63 @@ async def test_decision_exposes_full_rolling_pool_but_deep_researches_top_fiftee
 
 
 @pytest.mark.asyncio
+async def test_decision_rolling_pool_preserves_retired_lifecycle_counts():
+    candidates = [
+        _candidate(
+            "600001",
+            rolling_pool_state="current",
+            research_tier="deep",
+        ),
+        _candidate(
+            "600002",
+            rolling_pool_state="aging",
+            research_tier="structured",
+        ),
+    ]
+    run = _run(candidates)
+    run["rolling_pool"] = {
+        "capacity": 100,
+        "lifecycle_trading_days": 10,
+        "total_count": 2,
+        "current_count": 1,
+        "aging_count": 1,
+        "deep_count": 1,
+        "structured_count": 1,
+        "retired_count": 2,
+        "expired_count": 0,
+        "invalidated_count": 2,
+    }
+    service = DailyDecisionService(
+        briefing_service=FakeBriefingService(),
+        candidate_service=FakeCandidateService(run),
+        market_session_policy=FakeSessionPolicy("live_am"),
+        profile_resolver=FakeProfileResolver(),
+        diversification_service=FakeDiversificationService(),
+        tracking_service=FakeTrackingService(),
+        db=FakeDatabase(),
+        duplicate_key_errors=(FakeDuplicateKeyError,),
+    )
+
+    packet = await service._compose_packet("user-1", refresh=True, now=NOW)
+
+    assert packet["rolling_pool"] == {
+        "capacity": 100,
+        "lifecycle_trading_days": 10,
+        "total_count": 2,
+        "formal_research_capacity": 15,
+        "formal_research_count": 2,
+        "current_count": 1,
+        "aging_count": 1,
+        "deep_count": 1,
+        "structured_count": 1,
+        "retired_count": 2,
+        "expired_count": 0,
+        "invalidated_count": 2,
+        "candidates": packet["rolling_pool"]["candidates"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_aging_candidate_remains_visible_and_can_be_dynamically_revalidated():
     candidates = [
         _candidate(
