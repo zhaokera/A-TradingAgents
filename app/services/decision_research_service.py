@@ -56,6 +56,7 @@ HARD_REASON_CODES = frozenset(
         "holding_valuation_missing",
         "holding_taxonomy_missing",
         "candidate_taxonomy_missing",
+        "formal_research_required",
         "concentration_limit",
         "correlation_limit",
         "loss_budget_exhausted",
@@ -66,6 +67,7 @@ HARD_REASON_CODES = frozenset(
 )
 ACTION_SCOPED_HARD_CODES = {
     "calendar_unknown": ("buy_now",),
+    "pullback_reversal_confirmation_required": ("buy_now",),
     "condition_order_capability_unverified": ("condition_order",),
     "condition_order_order_price_missing": ("condition_order",),
 }
@@ -445,6 +447,12 @@ class DecisionResearchService:
                         "quote": deepcopy(item.get("quote") or {}),
                         "plans": deepcopy(item.get("plans") or {}),
                         "profile": deepcopy(dict(profile)),
+                        "profile_contract": deepcopy(
+                            item.get("profile_contract") or {}
+                        ),
+                        "candidate_reason_summary": str(
+                            item.get("candidate_reason_summary") or ""
+                        ),
                         "allocation": deepcopy(item.get("allocation") or {}),
                         "portfolio_impact": deepcopy(
                             item.get("portfolio_impact") or {}

@@ -76,6 +76,8 @@ WAIT_REASON_CODES = (
     "account_blocked",
     "calendar_unknown",
     "profile_incomplete",
+    "formal_research_required",
+    "pullback_reversal_confirmation_required",
     "one_lot_unaffordable",
     "holding_valuation_missing",
     "holding_taxonomy_missing",
@@ -574,6 +576,75 @@ def _profile_complete(profile: Mapping[str, Any]) -> bool:
     )
 
 
+def _candidate_profile_contract(
+    candidate: Mapping[str, Any],
+    resolved_profile: Mapping[str, Any],
+) -> Dict[str, Any]:
+    candidate_profile = candidate.get("candidate_stock_profile")
+    candidate_profile = (
+        candidate_profile if isinstance(candidate_profile, Mapping) else {}
+    )
+    candidate_evidence = candidate.get("candidate_profile_evidence")
+    candidate_evidence = (
+        candidate_evidence if isinstance(candidate_evidence, Mapping) else {}
+    )
+    candidate_complete = bool(
+        candidate_evidence.get("decision_critical_complete") is True
+    )
+    resolved_complete = _profile_complete(resolved_profile)
+    research_tier = str(candidate.get("research_tier") or "structured")
+    return {
+        "discovery_research_tier": research_tier,
+        "formal_research_selected": True,
+        "candidate_status": str(
+            candidate_profile.get("status")
+            or candidate_evidence.get("status")
+            or "missing"
+        ),
+        "candidate_confidence": str(
+            candidate_evidence.get("confidence")
+            or candidate_profile.get("confidence")
+            or "low"
+        ),
+        "candidate_decision_critical_complete": candidate_complete,
+        "resolved_status": str(
+            resolved_profile.get("status")
+            or ("verified" if resolved_complete else "incomplete")
+        ),
+        "resolved_confidence": str(
+            resolved_profile.get("confidence") or "low"
+        ),
+        "resolved_decision_critical_complete": resolved_complete,
+        "eligible_for_buy_now": bool(
+            research_tier == "deep"
+            and candidate_complete
+            and resolved_complete
+        ),
+    }
+
+
+def _pullback_confirmation_is_current(
+    plan: Mapping[str, Any], quote: Mapping[str, Any]
+) -> bool:
+    if str(plan.get("entry_strategy") or "") != "pullback":
+        return True
+    confirmation = plan.get("entry_confirmation")
+    confirmation = (
+        confirmation if isinstance(confirmation, Mapping) else {}
+    )
+    quote_key = str(
+        quote.get("provider_updated_at") or quote.get("trade_at") or ""
+    ).strip()
+    return bool(
+        plan.get("price_condition_met") is True
+        and confirmation.get("status") == "confirmed"
+        and confirmation.get("independent_event_confirmed") is True
+        and quote_key
+        and quote_key
+        == str(confirmation.get("confirmation_observation_key") or "").strip()
+    )
+
+
 def _stable_profile(profile: Mapping[str, Any]) -> Dict[str, Any]:
     result = deepcopy(dict(profile))
     revenue = result.get("revenue_composition")
@@ -985,6 +1056,12 @@ class DailyDecisionService:
                     **raw,
                     **objective,
                     "code": code,
+                    "candidate_stock_profile": deepcopy(
+                        raw.get("stock_profile") or {}
+                    ),
+                    "candidate_profile_evidence": deepcopy(
+                        raw.get("profile_evidence") or {}
+                    ),
                     "provider_sector": profile.get("provider_sector"),
                     "industry": profile.get("industry"),
                     "stock_profile": profile,
@@ -1102,6 +1179,10 @@ class DailyDecisionService:
             code = _normalise_code(candidate.get("code"))
             profile = candidate.get("stock_profile")
             profile = profile if isinstance(profile, Mapping) else {}
+            profile_contract = _candidate_profile_contract(
+                candidate,
+                profile,
+            )
             quality = profile.get("data_quality")
             quality = quality if isinstance(quality, Mapping) else {}
             profile_errors.extend(quality.get("provider_errors") or [])
@@ -1145,6 +1226,29 @@ class DailyDecisionService:
                 current_scan_available=(
                     candidate_run.get("current_scan_available") is not False
                 ),
+            )
+            if (
+                profile_contract["candidate_decision_critical_complete"]
+                is not True
+                or profile_contract["resolved_decision_critical_complete"]
+                is not True
+            ):
+                wait_reasons.append("profile_incomplete")
+            if profile_contract["discovery_research_tier"] != "deep":
+                wait_reasons.append("formal_research_required")
+            if (
+                str(plan.get("entry_strategy") or "") == "pullback"
+                and plan.get("price_condition_met") is True
+                and quote_status.get("actionable") is True
+                and has_live_price
+                and not _pullback_confirmation_is_current(plan, quote)
+            ):
+                wait_reasons.append(
+                    "pullback_reversal_confirmation_required"
+                )
+            wait_reasons = _dedupe_ordered(
+                wait_reasons,
+                WAIT_REASON_CODES,
             )
             if avoid_reasons:
                 bucket = "avoid"
@@ -1233,6 +1337,10 @@ class DailyDecisionService:
                     "position": deepcopy(plans.get("position") or {}),
                 },
                 "profile": deepcopy(dict(profile)),
+                "profile_contract": profile_contract,
+                "candidate_reason_summary": str(
+                    candidate.get("reason_summary") or ""
+                ),
                 "allocation": {
                     key: deepcopy(allocation.get(key))
                     for key in (

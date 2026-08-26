@@ -30,6 +30,7 @@ STALE_FAILURE_CODES = frozenset(
 )
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 MONEY_QUANTIZER = Decimal("0.01")
+PULLBACK_RECLAIM_MULTIPLIER = Decimal("1.005")
 
 
 def _decimal(value: Any) -> Optional[Decimal]:
@@ -162,6 +163,29 @@ def _condition_order_capability(packet: Mapping[str, Any]) -> bool:
         condition.get("verified") is True
         and condition.get("independent_trigger_price_supported") is True
         and condition.get("separate_order_limit_price_supported") is True
+    )
+
+
+def _current_pullback_confirmation(candidate: Mapping[str, Any]) -> bool:
+    plans = candidate.get("plans")
+    plans = plans if isinstance(plans, Mapping) else {}
+    short = plans.get("short")
+    short = short if isinstance(short, Mapping) else {}
+    confirmation = short.get("entry_confirmation")
+    confirmation = (
+        confirmation if isinstance(confirmation, Mapping) else {}
+    )
+    quote = candidate.get("quote")
+    quote = quote if isinstance(quote, Mapping) else {}
+    quote_key = str(
+        quote.get("provider_updated_at") or quote.get("trade_at") or ""
+    ).strip()
+    return bool(
+        confirmation.get("status") == "confirmed"
+        and confirmation.get("independent_event_confirmed") is True
+        and quote_key
+        and quote_key
+        == str(confirmation.get("confirmation_observation_key") or "").strip()
     )
 
 
@@ -391,6 +415,33 @@ class DecisionValidationService:
 
             if action not in ACTIONABLE_ACTIONS:
                 continue
+
+            profile_contract = candidate.get("profile_contract")
+            profile_contract = (
+                profile_contract
+                if isinstance(profile_contract, Mapping)
+                else {}
+            )
+            if (
+                profile_contract.get(
+                    "candidate_decision_critical_complete"
+                )
+                is not True
+                or profile_contract.get(
+                    "resolved_decision_critical_complete"
+                )
+                is not True
+            ):
+                failures.append(
+                    _failure("candidate_profile_incomplete", symbol=symbol)
+                )
+            if (
+                profile_contract.get("discovery_research_tier") != "deep"
+                or profile_contract.get("formal_research_selected") is not True
+            ):
+                failures.append(
+                    _failure("formal_research_required", symbol=symbol)
+                )
 
             capabilities = packet.get("execution_capabilities")
             capabilities = (
@@ -753,12 +804,29 @@ class DecisionValidationService:
                     earliest_valid_until = quote_valid_until
                 current_price = _decimal(quote.get("price"))
                 strategy = selection.get("entry_strategy")
+                pullback_confirmed = bool(
+                    strategy == "pullback"
+                    and _current_pullback_confirmation(candidate)
+                )
+                if fresh and strategy == "pullback" and not pullback_confirmed:
+                    failures.append(
+                        _failure(
+                            "pullback_reversal_confirmation_required",
+                            symbol=symbol,
+                        )
+                    )
                 condition_met = bool(
                     current_price is not None
                     and current_price > stop
                     and (
                         (
-                            strategy in {"pullback", "reference"}
+                            strategy == "pullback"
+                            and pullback_confirmed
+                            and current_price
+                            <= trigger * PULLBACK_RECLAIM_MULTIPLIER
+                        )
+                        or (
+                            strategy == "reference"
                             and current_price <= trigger
                         )
                         or (strategy == "breakout" and current_price >= trigger)

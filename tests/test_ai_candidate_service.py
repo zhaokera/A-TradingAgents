@@ -475,6 +475,34 @@ def test_warning_risk_does_not_block_price_ready_candidate():
     assert candidate["can_add_to_favorites"] is True
 
 
+def test_pullback_price_in_entry_zone_waits_for_reversal_confirmation():
+    candidate = normalize_ai_candidate(
+        {
+            "code": "600360",
+            "name": "华微电子",
+            "quote": {"price": 9.9},
+            "guarded_price_plan": {
+                "status": "ok",
+                "entry_strategy": "pullback",
+                "suggested_buy_price": 10.0,
+                "stop_loss_price": 9.2,
+                "target_price": 11.8,
+            },
+            "risk_flags": [],
+        },
+        context={},
+        favorite_codes=set(),
+    )
+
+    assert candidate is not None
+    assert candidate["price_plan"]["price_condition_met"] is True
+    assert candidate["price_plan"]["entry_status"] == (
+        "waiting_pullback_confirmation"
+    )
+    assert candidate["actionability"] == "watch_trigger"
+    assert candidate["execution_actionable"] is False
+
+
 def test_invalidated_candidate_is_not_addable():
     candidate = normalize_ai_candidate(
         {
@@ -819,8 +847,10 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
     assert result is not None
     candidate = result["candidates"][0]
     assert candidate["reference_price"] == 9.9
-    assert candidate["price_plan"]["entry_status"] == "price_ready"
-    assert candidate["actionability"] == "ready_now"
+    assert candidate["price_plan"]["entry_status"] == (
+        "waiting_pullback_confirmation"
+    )
+    assert candidate["actionability"] == "watch_trigger"
     assert candidate["quote_source"] == "tencent"
     assert {
         key: value
@@ -864,6 +894,125 @@ async def test_latest_refreshes_tencent_quote_and_candidate_lifecycle():
     ] == 0.997
     assert "performance" not in candidate
     collection.update_one.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pullback_requires_a_later_rising_event_before_price_ready():
+    class AlwaysFreshSessionPolicy:
+        async def classify(self, *, now=None):
+            return {
+                "phase": "live_am",
+                "classified_at": now.isoformat(),
+            }
+
+        async def quote_status(self, quote, *, now=None, session=None):
+            return {
+                "actionable": True,
+                "display_usable": True,
+                "tracking_usable": True,
+                "status": "fresh",
+            }
+
+    quotes = SimpleNamespace(
+        get_quotes=AsyncMock(
+            side_effect=[
+                {
+                    "600360": {
+                        "price": 10.28,
+                        "source": "tencent",
+                        "trade_at": "2026-08-26T09:38:00+08:00",
+                        "volume": 1_000,
+                        "amount": 10_280,
+                    }
+                },
+                {
+                    "600360": {
+                        "price": 10.32,
+                        "source": "tencent",
+                        "trade_at": "2026-08-26T09:39:00+08:00",
+                        "volume": 1_200,
+                        "amount": 12_384,
+                    }
+                },
+            ]
+        )
+    )
+    favorites = SimpleNamespace(
+        get_favorite_codes=AsyncMock(return_value=set()),
+        update_ai_candidate_tracking=AsyncMock(return_value=True),
+    )
+    service = AICandidateService(
+        research_runner=_research_payload,
+        favorites=favorites,
+        quotes=quotes,
+        market_session=AlwaysFreshSessionPolicy(),
+        market_status_loader=AsyncMock(return_value=_live_market_status()),
+    )
+    service._candidate_governance = AsyncMock(
+        return_value={"excluded_codes": [], "market_permissions": {}}
+    )
+    service._apply_objective_profiles = AsyncMock()
+    service._apply_live_market_gate = AsyncMock()
+    service._apply_macro_policy = AsyncMock()
+    service._apply_account_policy = AsyncMock()
+    document = {
+        "_id": ObjectId(),
+        "user_id": "admin-id",
+        "generated_at": datetime(2026, 8, 26, tzinfo=timezone.utc),
+        "candidates": [
+            {
+                "code": "600360",
+                "name": "华微电子",
+                "reference_price": 10.4,
+                "quote": {
+                    "price": 10.4,
+                    "source": "tencent",
+                    "trade_at": "2026-08-26T09:37:00+08:00",
+                    "volume": 800,
+                    "amount": 8_320,
+                },
+                "price_plan": {
+                    "entry_strategy": "pullback",
+                    "entry_price": 10.31,
+                    "stop_price": 9.95,
+                    "target_price": 11.27,
+                    "status": "ok",
+                },
+                "risk_flags": [],
+            }
+        ],
+    }
+
+    falling = await service._refresh_document(
+        deepcopy(document),
+        user_id="admin-id",
+        persist=False,
+        notify=False,
+    )
+    rising = await service._refresh_document(
+        deepcopy(falling),
+        user_id="admin-id",
+        persist=False,
+        notify=False,
+    )
+
+    falling_candidate = falling["candidates"][0]
+    assert falling_candidate["price_plan"]["entry_status"] == (
+        "waiting_pullback_confirmation"
+    )
+    assert falling_candidate["actionability"] == "watch_trigger"
+    assert falling_candidate["price_plan"]["entry_confirmation"]["status"] == (
+        "waiting_reversal"
+    )
+
+    rising_candidate = rising["candidates"][0]
+    confirmation = rising_candidate["price_plan"]["entry_confirmation"]
+    assert confirmation["status"] == "confirmed"
+    assert confirmation["independent_event_confirmed"] is True
+    assert confirmation["previous_price"] == 10.28
+    assert confirmation["confirmation_price"] == 10.32
+    assert rising_candidate["price_plan"]["entry_status"] == "price_ready"
+    assert rising_candidate["actionability"] == "ready_now"
 
 
 @pytest.mark.asyncio
@@ -1563,6 +1712,13 @@ def test_shadow_trade_never_enters_and_exits_on_the_same_observation():
             "entry_price": 17.06,
             "stop_price": 16.52,
             "target_price": 23.75,
+            "entry_confirmation": {
+                "status": "confirmed",
+                "independent_event_confirmed": True,
+                "confirmation_observation_key": (
+                    "2026-08-06T09:20:05+08:00"
+                ),
+            },
         },
         "portfolio_allocation": {"quantity": 100},
     }
@@ -1594,6 +1750,52 @@ def test_shadow_trade_never_enters_and_exits_on_the_same_observation():
     shadow = candidate["performance"]["shadow_trade"]
     assert shadow["status"] == "closed_stop"
     assert shadow["closed_observation_key"] == "2026-08-06T09:21:05+08:00"
+
+
+def test_shadow_pullback_waits_for_confirmed_current_reversal_event():
+    candidate = {
+        "initial_reference_price": 18.0,
+        "price_plan": {
+            "entry_strategy": "pullback",
+            "entry_price": 17.06,
+            "stop_price": 16.52,
+            "target_price": 23.75,
+            "entry_confirmation": {
+                "status": "waiting_reversal",
+                "independent_event_confirmed": False,
+            },
+        },
+        "portfolio_allocation": {"quantity": 100},
+    }
+
+    AICandidateService._update_performance(
+        candidate,
+        current_price=17.0,
+        checked_at="2026-08-06T01:20:05+00:00",
+        observation_key="2026-08-06T09:20:05+08:00",
+    )
+
+    assert candidate["performance"]["shadow_trade"]["status"] == (
+        "waiting_entry"
+    )
+
+    candidate["price_plan"]["entry_confirmation"] = {
+        "status": "confirmed",
+        "independent_event_confirmed": True,
+        "confirmation_observation_key": "2026-08-06T09:21:05+08:00",
+    }
+    AICandidateService._update_performance(
+        candidate,
+        current_price=17.02,
+        checked_at="2026-08-06T01:21:05+00:00",
+        observation_key="2026-08-06T09:21:05+08:00",
+    )
+
+    shadow = candidate["performance"]["shadow_trade"]
+    assert shadow["status"] == "active"
+    assert shadow["entry_observation_key"] == (
+        "2026-08-06T09:21:05+08:00"
+    )
 
 
 @pytest.mark.asyncio

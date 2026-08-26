@@ -21,6 +21,8 @@ def _profile(code: str, *, complete: bool = True) -> dict:
     return {
         "code": code,
         "name": f"Stock {code}",
+        "status": "verified" if complete else "incomplete",
+        "confidence": "high" if complete else "low",
         "provider_sector": "信息技术" if complete else None,
         "industry": "计算机设备" if complete else None,
         "main_business": "服务器与算力基础设施" if complete else None,
@@ -67,6 +69,7 @@ def _profile(code: str, *, complete: bool = True) -> dict:
 
 
 def _candidate(code: str = "000977", **updates) -> dict:
+    source_profile = _profile(code)
     candidate = {
         "code": code,
         "name": "浪潮信息",
@@ -83,6 +86,8 @@ def _candidate(code: str = "000977", **updates) -> dict:
             "source": "tencent",
             "trade_at": "2026-07-22T10:00:00+08:00",
             "quote_checked_at": "2026-07-22T10:00:01+08:00",
+            "event_change_detected": True,
+            "event_observed_at": "2026-07-22T10:00:01+08:00",
         },
         "price_plan": {
             "entry_strategy": "pullback",
@@ -91,6 +96,15 @@ def _candidate(code: str = "000977", **updates) -> dict:
             "target_price": 67.0,
             "price_condition_met": True,
             "entry_status": "price_ready",
+            "entry_confirmation": {
+                "status": "confirmed",
+                "strategy": "pullback",
+                "independent_event_confirmed": True,
+                "confirmation_observation_key": (
+                    "2026-07-22T10:00:00+08:00"
+                ),
+                "confirmed_at": "2026-07-22T10:00:01+08:00",
+            },
             "status": "ok",
         },
         "plans": {
@@ -100,6 +114,17 @@ def _candidate(code: str = "000977", **updates) -> dict:
         },
         "position_sizing": {"status": "sized", "suggested_quantity": 100},
         "risk_flags": [],
+        "reason_summary": "回调结构候选，等待观察区间企稳后再评估。",
+        "research_tier": "deep",
+        "stock_profile": deepcopy(source_profile),
+        "profile_evidence": {
+            "status": "verified",
+            "confidence": "high",
+            "complete": True,
+            "decision_critical_complete": True,
+            "missing_fields": [],
+            "warning_code": None,
+        },
     }
     candidate.update(updates)
     return candidate
@@ -722,6 +747,89 @@ async def test_incomplete_real_profile_derives_wait_reason():
     ).today("user-1", now=NOW)
 
     assert packet["wait"][0]["reason_codes"][0] == "profile_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_candidate_profile_cannot_be_silently_promoted_by_decision_resolver():
+    candidate = _candidate(
+        research_tier="structured",
+        stock_profile={
+            "code": "000977",
+            "status": "deferred_structured_layer",
+            "confidence": "deferred",
+            "industry": None,
+            "main_business": None,
+            "source": None,
+            "evidence": [],
+        },
+        profile_evidence={
+            "status": "deferred_structured_layer",
+            "confidence": "deferred",
+            "complete": False,
+            "decision_critical_complete": False,
+            "missing_fields": ["industry", "main_business"],
+            "warning_code": "stock_profile_evidence_incomplete",
+        },
+    )
+
+    packet = await _service(
+        run=_run([candidate]),
+        profiles={"000977": _profile("000977", complete=True)},
+    ).today("user-1", now=NOW)
+
+    item = packet["wait"][0]
+    assert item["reason_codes"][:2] == [
+        "profile_incomplete",
+        "formal_research_required",
+    ]
+    assert item["candidate_reason_summary"] == candidate["reason_summary"]
+    assert item["profile_contract"] == {
+        "discovery_research_tier": "structured",
+            "formal_research_selected": True,
+            "candidate_status": "deferred_structured_layer",
+            "candidate_confidence": "deferred",
+            "candidate_decision_critical_complete": False,
+            "resolved_status": "verified",
+            "resolved_confidence": "high",
+            "resolved_decision_critical_complete": True,
+            "eligible_for_buy_now": False,
+        }
+    assert not packet["buy_now"]
+
+
+@pytest.mark.asyncio
+async def test_pullback_price_in_zone_without_reversal_confirmation_waits():
+    candidate = _candidate()
+    candidate["price_plan"].pop("entry_confirmation")
+    candidate["price_plan"]["entry_status"] = "waiting_pullback_confirmation"
+
+    packet = await _service(run=_run([candidate])).today(
+        "user-1", now=NOW
+    )
+
+    item = packet["wait"][0]
+    assert item["reason_codes"] == [
+        "pullback_reversal_confirmation_required"
+    ]
+    assert item["candidate_reason_summary"] == candidate["reason_summary"]
+    assert not packet["buy_now"]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_pullback_requires_the_current_independent_quote_event():
+    candidate = _candidate()
+    candidate["price_plan"]["entry_confirmation"][
+        "confirmation_observation_key"
+    ] = "2026-07-22T09:59:00+08:00"
+
+    packet = await _service(run=_run([candidate])).today(
+        "user-1", now=NOW
+    )
+
+    assert packet["wait"][0]["reason_codes"] == [
+        "pullback_reversal_confirmation_required"
+    ]
+    assert not packet["buy_now"]
 
 
 @pytest.mark.asyncio

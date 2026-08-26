@@ -196,6 +196,11 @@ def _decision_item_summary(item: Any) -> Dict[str, Any]:
         value.get("planned_loss") if isinstance(value.get("planned_loss"), dict) else {}
     )
     profile = value.get("profile") if isinstance(value.get("profile"), dict) else {}
+    profile_contract = (
+        value.get("profile_contract")
+        if isinstance(value.get("profile_contract"), dict)
+        else {}
+    )
     return {
         "code": identity.get("code"),
         "name": identity.get("name"),
@@ -229,8 +234,26 @@ def _decision_item_summary(item: Any) -> Dict[str, Any]:
         "position_pct": allocation.get("position_pct", 0.0),
         "planned_loss_amount": planned_loss.get("amount", 0.0),
         "planned_loss_pct_of_assets": planned_loss.get("pct_of_assets", 0.0),
-        "profile_status": profile.get("status"),
-        "profile_confidence": profile.get("confidence"),
+        "profile_status": (
+            profile_contract.get("candidate_status") or profile.get("status")
+        ),
+        "profile_confidence": (
+            profile_contract.get("candidate_confidence")
+            or profile.get("confidence")
+        ),
+        "profile_decision_critical_complete": profile_contract.get(
+            "candidate_decision_critical_complete"
+        ),
+        "resolved_profile_status": (
+            profile_contract.get("resolved_status") or profile.get("status")
+        ),
+        "resolved_profile_confidence": (
+            profile_contract.get("resolved_confidence")
+            or profile.get("confidence")
+        ),
+        "profile_eligible_for_buy_now": profile_contract.get(
+            "eligible_for_buy_now"
+        ),
         "plan_id": value.get("plan_id"),
     }
 

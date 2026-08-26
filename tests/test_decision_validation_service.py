@@ -38,11 +38,27 @@ def _candidate(symbol="600406", **updates):
                 "entry_price": 21.20,
                 "stop_price": 20.90,
                 "target_price": 23.80,
+                "entry_confirmation": {
+                    "status": "confirmed",
+                    "independent_event_confirmed": True,
+                    "confirmation_observation_key": (
+                        "2026-07-24T14:30:00+08:00"
+                    ),
+                },
             }
         },
         "profile": {
             "provider_sector": "工业",
             "industry": "电网设备",
+        },
+        "profile_contract": {
+            "discovery_research_tier": "deep",
+            "formal_research_selected": True,
+            "candidate_status": "verified",
+            "candidate_decision_critical_complete": True,
+            "resolved_status": "verified",
+            "resolved_decision_critical_complete": True,
+            "eligible_for_buy_now": True,
         },
         "allocation": {},
         "portfolio_impact": {
@@ -482,6 +498,59 @@ async def test_breakout_condition_order_requires_verified_separate_trigger_capab
         in _failure_codes(result)
     )
     assert "condition_order_plan_already_invalidated" in _failure_codes(result)
+
+
+@pytest.mark.asyncio
+async def test_buy_now_rejects_candidate_profile_not_completed_in_source_run():
+    candidate = _candidate(
+        profile_contract={
+            "discovery_research_tier": "structured",
+            "formal_research_selected": True,
+            "candidate_status": "deferred_structured_layer",
+            "candidate_decision_critical_complete": False,
+            "resolved_status": "verified",
+            "resolved_decision_critical_complete": True,
+            "eligible_for_buy_now": False,
+        }
+    )
+
+    result = await DecisionValidationService().validate_document(
+        "owner-1",
+        _proposal(
+            selections=[
+                _selection(action="buy_now", order_limit_price=None)
+            ]
+        ),
+        _packet(candidates=[candidate], market={"combined_regime": "green"}),
+        now=NOW,
+    )
+
+    assert "candidate_profile_incomplete" in _failure_codes(result)
+
+
+@pytest.mark.asyncio
+async def test_pullback_buy_now_requires_current_reversal_confirmation_event():
+    candidate = _candidate()
+    candidate["plans"]["short"]["entry_confirmation"] = {
+        "status": "waiting_reversal",
+        "independent_event_confirmed": False,
+        "confirmation_observation_key": None,
+    }
+
+    result = await DecisionValidationService().validate_document(
+        "owner-1",
+        _proposal(
+            selections=[
+                _selection(action="buy_now", order_limit_price=None)
+            ]
+        ),
+        _packet(candidates=[candidate], market={"combined_regime": "green"}),
+        now=NOW,
+    )
+
+    assert (
+        "pullback_reversal_confirmation_required" in _failure_codes(result)
+    )
 
 
 @pytest.mark.asyncio

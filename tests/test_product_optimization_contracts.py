@@ -229,12 +229,30 @@ def test_shadow_trade_waits_for_entry_then_uses_allocated_quantity():
         checked_at="2026-07-21T03:00:00+00:00",
         observation_key="2",
     )
+    assert candidate["performance"]["shadow_trade"]["status"] == (
+        "waiting_entry"
+    )
+
+    candidate["price_plan"]["entry_confirmation"] = {
+        "status": "confirmed",
+        "independent_event_confirmed": True,
+        "confirmation_observation_key": "3",
+    }
+    AICandidateService._update_performance(
+        candidate,
+        current_price=10.01,
+        session_low=9.98,
+        session_high=10.2,
+        benchmark_price=4012,
+        checked_at="2026-07-21T03:01:00+00:00",
+        observation_key="3",
+    )
     shadow = candidate["performance"]["shadow_trade"]
     assert shadow["status"] == "active"
     assert shadow["entry_price"] == 10.0
     assert shadow["quantity"] == 100
     assert shadow["tracking_version"] == "shadow_trade_v2"
-    assert shadow["entry_observation_key"] == "2"
+    assert shadow["entry_observation_key"] == "3"
 
 
 @pytest.mark.asyncio

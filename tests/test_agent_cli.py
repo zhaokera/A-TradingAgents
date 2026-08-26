@@ -330,6 +330,10 @@ def test_decision_today_summary_is_compact_and_machine_readable(
         "planned_loss_pct_of_assets": 1.3,
         "profile_status": "complete",
         "profile_confidence": "high",
+        "profile_decision_critical_complete": None,
+        "resolved_profile_status": "complete",
+        "resolved_profile_confidence": "high",
+        "profile_eligible_for_buy_now": None,
         "plan_id": "plan-1",
     }
     assert "plans" not in data["condition_order"][0]
@@ -348,6 +352,38 @@ def test_decision_today_actionable_omits_wait_and_avoid(fake_client: FakeClient)
     assert set(data).isdisjoint({"wait", "avoid"})
     assert data["condition_order"][0]["code"] == "600406"
     assert data["rolling_pool"]["capacity"] == 100
+
+
+def test_decision_summary_keeps_source_profile_status_auditable(
+    fake_client: FakeClient,
+) -> None:
+    payload = _sample_decision()
+    item = payload["condition_order"][0]
+    item["profile"] = {"status": "verified", "confidence": "high"}
+    item["profile_contract"] = {
+        "candidate_status": "deferred_structured_layer",
+        "candidate_confidence": "low",
+        "candidate_decision_critical_complete": False,
+        "resolved_status": "verified",
+        "resolved_confidence": "high",
+        "resolved_decision_critical_complete": True,
+        "eligible_for_buy_now": False,
+    }
+    fake_client.responses["/api/decision/today"] = payload
+
+    result = runner.invoke(
+        agent_cli.app,
+        ["decision", "today", "--view", "summary"],
+    )
+
+    assert result.exit_code == 0
+    candidate = json.loads(result.stdout)["data"]["condition_order"][0]
+    assert candidate["profile_status"] == "deferred_structured_layer"
+    assert candidate["profile_confidence"] == "low"
+    assert candidate["profile_decision_critical_complete"] is False
+    assert candidate["resolved_profile_status"] == "verified"
+    assert candidate["resolved_profile_confidence"] == "high"
+    assert candidate["profile_eligible_for_buy_now"] is False
 
 
 def test_decision_explain_returns_one_symbol_with_bucket(fake_client: FakeClient) -> None:

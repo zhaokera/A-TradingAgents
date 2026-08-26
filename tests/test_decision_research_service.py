@@ -264,6 +264,43 @@ async def test_account_blocked_remains_a_hard_constraint():
 
 
 @pytest.mark.asyncio
+async def test_research_packet_preserves_profile_provenance_and_wait_semantics():
+    baseline = _baseline(
+        bucket="wait",
+        reason_codes=[
+            "formal_research_required",
+            "pullback_reversal_confirmation_required",
+        ],
+    )
+    item = baseline["wait"][0]
+    item["profile_contract"] = {
+        "discovery_research_tier": "structured",
+        "formal_research_selected": True,
+        "candidate_status": "deferred_structured_layer",
+        "candidate_decision_critical_complete": False,
+        "resolved_status": "verified",
+        "resolved_decision_critical_complete": True,
+        "eligible_for_buy_now": False,
+    }
+    item["candidate_reason_summary"] = (
+        "回调结构候选，等待观察区间企稳后再评估。"
+    )
+
+    packet = await _service(baseline).today("owner-1", refresh=False)
+    candidate = packet["candidates"][0]
+
+    assert candidate["profile_contract"] == item["profile_contract"]
+    assert candidate["candidate_reason_summary"] == (
+        "回调结构候选，等待观察区间企稳后再评估。"
+    )
+    assert [row["code"] for row in candidate["hard_constraints"]] == [
+        "formal_research_required",
+        "pullback_reversal_confirmation_required",
+    ]
+    assert candidate["hard_constraints"][1]["applies_to"] == ["buy_now"]
+
+
+@pytest.mark.asyncio
 async def test_unknown_reason_is_not_silently_overrideable():
     packet = await _service(
         _baseline(bucket="avoid", reason_codes=["new_unknown_gate"])

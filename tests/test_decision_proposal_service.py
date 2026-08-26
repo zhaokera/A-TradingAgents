@@ -93,8 +93,22 @@ def _packet():
                     }
                 },
                 "profile": {
+                    "status": "complete",
+                    "confidence": "high",
                     "provider_sector": "工业",
                     "industry": "电网设备",
+                    "main_business": "电网自动化与数字化",
+                },
+                "profile_contract": {
+                    "discovery_research_tier": "deep",
+                    "formal_research_selected": True,
+                    "candidate_status": "complete",
+                    "candidate_confidence": "high",
+                    "candidate_decision_critical_complete": True,
+                    "resolved_status": "complete",
+                    "resolved_confidence": "high",
+                    "resolved_decision_critical_complete": True,
+                    "eligible_for_buy_now": True,
                 },
                 "portfolio_impact": {
                     "exposure": {

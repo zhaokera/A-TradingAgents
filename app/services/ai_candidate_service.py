@@ -116,6 +116,7 @@ _ENTRY_STRATEGY_LABELS = {
 
 _ENTRY_STATUS_LABELS = {
     "waiting_pullback": "等待回落",
+    "waiting_pullback_confirmation": "等待回落企稳",
     "waiting_breakout": "等待突破",
     "price_ready": "价格条件已满足",
     "price_ready_risk_blocked": "价格到位，风险阻断",
@@ -123,6 +124,8 @@ _ENTRY_STATUS_LABELS = {
     "quote_unavailable": "行情待刷新",
     "plan_unavailable": "暂无可靠入手价",
 }
+
+PULLBACK_RECLAIM_MAX_PCT = 0.005
 
 
 def _as_utc_datetime(value: Any) -> Optional[datetime]:
@@ -327,6 +330,12 @@ def _quote_event_changed(
         if before is not None and after is not None and before != after:
             return True
     return False
+
+
+def _quote_observation_key(quote: Mapping[str, Any]) -> Optional[str]:
+    value = quote.get("provider_updated_at") or quote.get("trade_at")
+    text = str(value or "").strip()
+    return text or None
 
 
 def _normalized_code_set(value: Any) -> set[str]:
@@ -552,7 +561,11 @@ def _derive_actionability(
     entry_status = str(price_plan.get("entry_status") or "plan_unavailable")
     if entry_status == "price_ready":
         return "ready_now"
-    if entry_status in {"waiting_pullback", "waiting_breakout"}:
+    if entry_status in {
+        "waiting_pullback",
+        "waiting_pullback_confirmation",
+        "waiting_breakout",
+    }:
         return "watch_trigger"
     if entry_status == "price_ready_risk_blocked":
         return "blocked"
@@ -726,6 +739,11 @@ def _build_candidate_price_plan(
     blocking_risk_flags = [flag for flag in risk_flags if _is_blocking_risk_flag(flag)]
     risk_blocked = bool(blocking_risk_flags)
     price_condition_met = False
+    entry_confirmation = deepcopy(
+        dict(plan.get("entry_confirmation"))
+        if isinstance(plan.get("entry_confirmation"), Mapping)
+        else {}
+    )
 
     if not plan_available:
         entry_status = "plan_unavailable"
@@ -741,9 +759,15 @@ def _build_candidate_price_plan(
             price_condition_met = bool(reference_price >= entry_price)
             waiting_status = "waiting_breakout"
         if price_condition_met:
-            entry_status = (
-                "price_ready_risk_blocked" if risk_blocked else "price_ready"
-            )
+            if risk_blocked:
+                entry_status = "price_ready_risk_blocked"
+            elif (
+                entry_strategy == "pullback"
+                and entry_confirmation.get("status") != "confirmed"
+            ):
+                entry_status = "waiting_pullback_confirmation"
+            else:
+                entry_status = "price_ready"
         else:
             entry_status = waiting_status
 
@@ -755,6 +779,11 @@ def _build_candidate_price_plan(
         guidance = (
             f"参考回落价 {entry_text}；当前 {current_text}，高出 {distance:.2f}%，"
             "等待回落，不追价。"
+        )
+    elif entry_status == "waiting_pullback_confirmation":
+        guidance = (
+            f"价格已进入回落参考区 {entry_text}；等待后续独立行情事件"
+            "确认企稳并重新走强。"
         )
     elif entry_status == "waiting_breakout":
         guidance = (
@@ -804,6 +833,7 @@ def _build_candidate_price_plan(
         "entry_status": entry_status,
         "entry_status_label": _ENTRY_STATUS_LABELS[entry_status],
         "entry_guidance": guidance,
+        "entry_confirmation": entry_confirmation,
         "status": plan_status,
     }
 
@@ -900,6 +930,132 @@ def _enrich_saved_candidate(value: Any) -> Any:
     _apply_candidate_state(candidate)
     candidate["rank_score"] = _candidate_rank_score(candidate)
     return candidate
+
+
+def _update_pullback_entry_confirmation(
+    candidate: Dict[str, Any],
+    *,
+    previous_quote: Mapping[str, Any],
+    current_quote: Mapping[str, Any],
+    event_change_detected: bool,
+    quote_actionable: bool,
+    checked_at: str,
+) -> None:
+    plan = candidate.get("price_plan")
+    if not isinstance(plan, dict) or plan.get("entry_strategy") != "pullback":
+        return
+
+    entry = _finite_number(plan.get("entry_price"))
+    stop = _finite_number(plan.get("stop_price"))
+    current_price = _finite_number(current_quote.get("price"))
+    previous_price = _finite_number(previous_quote.get("price"))
+    if entry is None or current_price is None or current_price <= 0:
+        return
+    if stop is not None and current_price <= stop:
+        return
+
+    confirmation = deepcopy(
+        dict(plan.get("entry_confirmation"))
+        if isinstance(plan.get("entry_confirmation"), Mapping)
+        else {}
+    )
+    current_key = _quote_observation_key(current_quote)
+    previous_key = _quote_observation_key(previous_quote)
+    independent_event = bool(
+        event_change_detected
+        and current_key
+        and previous_key
+        and current_key != previous_key
+    )
+    volume_increased = bool(
+        (_finite_number(current_quote.get("volume")) or 0)
+        > (_finite_number(previous_quote.get("volume")) or 0)
+    )
+    amount_increased = bool(
+        (_finite_number(current_quote.get("amount")) or 0)
+        > (_finite_number(previous_quote.get("amount")) or 0)
+    )
+    same_confirmed_event = bool(
+        confirmation.get("status") == "confirmed"
+        and current_key
+        == str(confirmation.get("confirmation_observation_key") or "")
+    )
+
+    if same_confirmed_event:
+        plan["price_condition_met"] = True
+        plan["entry_status"] = "price_ready"
+    elif current_price <= entry:
+        if confirmation.get("status") != "waiting_reversal":
+            confirmation = {
+                "status": "waiting_reversal",
+                "strategy": "pullback",
+                "entry_zone_first_observed_at": checked_at,
+                "entry_zone_observation_key": current_key,
+                "entry_zone_price": current_price,
+            }
+        confirmation.update(
+            independent_event_confirmed=False,
+            last_observation_key=current_key,
+            last_observed_at=checked_at,
+            last_price=current_price,
+            lowest_price=min(
+                current_price,
+                _finite_number(confirmation.get("lowest_price"))
+                or current_price,
+            ),
+        )
+        plan["price_condition_met"] = True
+        plan["entry_status"] = "waiting_pullback_confirmation"
+    elif (
+        confirmation.get("status") == "waiting_reversal"
+        and current_price <= entry * (1 + PULLBACK_RECLAIM_MAX_PCT)
+        and previous_price is not None
+        and previous_price <= entry
+        and current_price > previous_price
+        and independent_event
+        and quote_actionable
+        and volume_increased
+        and amount_increased
+    ):
+        confirmation.update(
+            status="confirmed",
+            independent_event_confirmed=True,
+            confirmed_at=checked_at,
+            confirmation_observation_key=current_key,
+            confirmation_price=current_price,
+            previous_price=previous_price,
+            price_reversal_confirmed=True,
+            cumulative_volume_increased=True,
+            cumulative_amount_increased=True,
+        )
+        plan["price_condition_met"] = True
+        plan["entry_status"] = "price_ready"
+    elif confirmation.get("status") == "waiting_reversal" and (
+        current_price <= entry * (1 + PULLBACK_RECLAIM_MAX_PCT)
+    ):
+        confirmation.update(
+            independent_event_confirmed=False,
+            last_observation_key=current_key,
+            last_observed_at=checked_at,
+            last_price=current_price,
+        )
+        plan["price_condition_met"] = True
+        plan["entry_status"] = "waiting_pullback_confirmation"
+    else:
+        confirmation = {}
+
+    plan["entry_confirmation"] = confirmation
+    plan["entry_status_label"] = _ENTRY_STATUS_LABELS[plan["entry_status"]]
+    if plan["entry_status"] == "price_ready":
+        plan["entry_guidance"] = (
+            "回落后已由下一条独立腾讯行情事件确认重新走强；"
+            "仍需通过账户和组合风险门槛。"
+        )
+    elif plan["entry_status"] == "waiting_pullback_confirmation":
+        plan["entry_guidance"] = (
+            "价格已进入回落参考区；等待后续独立行情事件确认企稳并重新走强。"
+        )
+    candidate["plans"] = _build_horizon_plans(plan)
 
 
 def normalize_ai_candidate(
@@ -1471,6 +1627,17 @@ class AICandidateService:
         shadow.setdefault("status", status)
         entry = _finite_number(plan.get("entry_price"))
         strategy = str(plan.get("entry_strategy") or "pullback")
+        confirmation = plan.get("entry_confirmation")
+        confirmation = (
+            confirmation if isinstance(confirmation, Mapping) else {}
+        )
+        pullback_confirmed = bool(
+            strategy == "pullback"
+            and confirmation.get("status") == "confirmed"
+            and confirmation.get("independent_event_confirmed") is True
+            and str(confirmation.get("confirmation_observation_key") or "")
+            == observation_key
+        )
         allocation = candidate.get("portfolio_allocation")
         allocation = allocation if isinstance(allocation, Mapping) else {}
         quantity = int(allocation.get("quantity") or 0)
@@ -1484,7 +1651,12 @@ class AICandidateService:
             and (target is None or current_price < target)
             and (
                 (strategy == "breakout" and current_price >= entry)
-                or (strategy != "breakout" and current_price <= entry)
+                or (strategy == "reference" and current_price <= entry)
+                or (
+                    strategy == "pullback"
+                    and pullback_confirmed
+                    and current_price <= entry * (1 + PULLBACK_RECLAIM_MAX_PCT)
+                )
             )
         )
         if status == "waiting_entry" and entry_triggered and entry is not None:
@@ -2291,19 +2463,22 @@ class AICandidateService:
             if isinstance(refreshed, dict):
                 candidate.clear()
                 candidate.update(refreshed)
+            _update_pullback_entry_confirmation(
+                candidate,
+                previous_quote=previous_quote,
+                current_quote=current_quote,
+                event_change_detected=event_change_detected,
+                quote_actionable=quote_policy.get("actionable") is True,
+                checked_at=checked_at,
+            )
             candidate["plan_expired"] = plan_expired
             if event_change_detected and tracking_usable:
                 self._update_performance(
                     candidate,
                     current_price=current_price,
                     checked_at=checked_at,
-                    observation_key=str(
-                        (
-                            quote.get("trade_at")
-                            if isinstance(quote, Mapping)
-                            else None
-                        )
-                        or checked_at
+                    observation_key=(
+                        _quote_observation_key(current_quote) or checked_at
                     ),
                     session_high=_finite_number(
                         quote.get("high") if isinstance(quote, Mapping) else None
