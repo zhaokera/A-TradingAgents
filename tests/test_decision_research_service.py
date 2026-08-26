@@ -285,6 +285,14 @@ async def test_research_packet_preserves_profile_provenance_and_wait_semantics()
     item["candidate_reason_summary"] = (
         "回调结构候选，等待观察区间企稳后再评估。"
     )
+    item["candidate_source_profile"] = {
+        "status": "deferred_structured_layer",
+        "confidence": "deferred",
+    }
+    item["resolved_profile"] = {
+        "status": "verified",
+        "confidence": "high",
+    }
 
     packet = await _service(baseline).today("owner-1", refresh=False)
     candidate = packet["candidates"][0]
@@ -293,6 +301,10 @@ async def test_research_packet_preserves_profile_provenance_and_wait_semantics()
     assert candidate["candidate_reason_summary"] == (
         "回调结构候选，等待观察区间企稳后再评估。"
     )
+    assert candidate["candidate_source_profile"] == (
+        item["candidate_source_profile"]
+    )
+    assert candidate["resolved_profile"] == item["resolved_profile"]
     assert [row["code"] for row in candidate["hard_constraints"]] == [
         "formal_research_required",
         "pullback_reversal_confirmation_required",

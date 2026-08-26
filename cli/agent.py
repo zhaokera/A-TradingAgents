@@ -201,6 +201,28 @@ def _decision_item_summary(item: Any) -> Dict[str, Any]:
         if isinstance(value.get("profile_contract"), dict)
         else {}
     )
+    source_profile = (
+        value.get("candidate_source_profile")
+        if isinstance(value.get("candidate_source_profile"), dict)
+        else profile
+    )
+    resolved_profile = (
+        value.get("resolved_profile")
+        if isinstance(value.get("resolved_profile"), dict)
+        else profile
+    )
+    compact_profile_fields = (
+        "status",
+        "confidence",
+        "industry",
+        "main_business",
+    )
+    compact_source_profile = {
+        key: source_profile.get(key) for key in compact_profile_fields
+    }
+    compact_resolved_profile = {
+        key: resolved_profile.get(key) for key in compact_profile_fields
+    }
     return {
         "code": identity.get("code"),
         "name": identity.get("name"),
@@ -254,6 +276,10 @@ def _decision_item_summary(item: Any) -> Dict[str, Any]:
         "profile_eligible_for_buy_now": profile_contract.get(
             "eligible_for_buy_now"
         ),
+        "profile_contract": profile_contract,
+        "candidate_source_profile": compact_source_profile,
+        "resolved_profile": compact_resolved_profile,
+        "reason_summary": str(value.get("candidate_reason_summary") or ""),
         "plan_id": value.get("plan_id"),
     }
 

@@ -1667,6 +1667,59 @@ def test_serialize_run_backfills_entry_state_for_existing_candidates():
     assert price_plan["distance_to_entry_pct"] == -1.8
 
 
+def test_serialize_run_exposes_structured_profile_provenance():
+    serialized = AICandidateService._serialize_run(
+        {
+            "_id": ObjectId(),
+            "candidates": [
+                {
+                    "code": "600360",
+                    "name": "华微电子",
+                    "research_tier": "structured",
+                    "reason_summary": (
+                        "回调结构候选，等待观察区间企稳后再评估。"
+                    ),
+                    "stock_profile": {
+                        "code": "600360",
+                        "status": "deferred_structured_layer",
+                        "confidence": "deferred",
+                        "industry": None,
+                        "main_business": None,
+                    },
+                    "profile_evidence": {
+                        "status": "deferred_structured_layer",
+                        "confidence": "deferred",
+                        "decision_critical_complete": False,
+                    },
+                }
+            ],
+        }
+    )
+
+    candidate = serialized["candidates"][0]
+    assert candidate["candidate_source_profile"]["status"] == (
+        "deferred_structured_layer"
+    )
+    assert candidate["resolved_profile"]["status"] == (
+        "not_resolved_structured_layer"
+    )
+    assert candidate["profile_contract"] == {
+        "scope": "candidate_latest",
+        "discovery_research_tier": "structured",
+        "formal_research_selected": False,
+        "candidate_status": "deferred_structured_layer",
+        "candidate_confidence": "deferred",
+        "candidate_decision_critical_complete": False,
+        "resolved_status": "not_resolved_structured_layer",
+        "resolved_confidence": "deferred",
+        "resolved_decision_critical_complete": False,
+        "eligible_for_buy_now": False,
+    }
+    assert candidate["candidate_reason_summary"] == (
+        "回调结构候选，等待观察区间企稳后再评估。"
+    )
+
+
 def test_portfolio_gate_overrides_price_ready_state():
     candidate = {
         "price_plan": {"entry_status": "price_ready"},

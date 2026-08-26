@@ -447,6 +447,12 @@ class DecisionResearchService:
                         "quote": deepcopy(item.get("quote") or {}),
                         "plans": deepcopy(item.get("plans") or {}),
                         "profile": deepcopy(dict(profile)),
+                        "candidate_source_profile": deepcopy(
+                            item.get("candidate_source_profile") or {}
+                        ),
+                        "resolved_profile": deepcopy(
+                            item.get("resolved_profile") or profile
+                        ),
                         "profile_contract": deepcopy(
                             item.get("profile_contract") or {}
                         ),

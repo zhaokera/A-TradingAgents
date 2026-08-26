@@ -334,6 +334,20 @@ def test_decision_today_summary_is_compact_and_machine_readable(
         "resolved_profile_status": "complete",
         "resolved_profile_confidence": "high",
         "profile_eligible_for_buy_now": None,
+        "profile_contract": {},
+        "candidate_source_profile": {
+            "status": "complete",
+            "confidence": "high",
+            "industry": None,
+            "main_business": None,
+        },
+        "resolved_profile": {
+            "status": "complete",
+            "confidence": "high",
+            "industry": None,
+            "main_business": None,
+        },
+        "reason_summary": "",
         "plan_id": "plan-1",
     }
     assert "plans" not in data["condition_order"][0]
@@ -369,6 +383,21 @@ def test_decision_summary_keeps_source_profile_status_auditable(
         "resolved_decision_critical_complete": True,
         "eligible_for_buy_now": False,
     }
+    item["candidate_source_profile"] = {
+        "status": "deferred_structured_layer",
+        "confidence": "low",
+        "industry": None,
+        "main_business": None,
+    }
+    item["resolved_profile"] = {
+        "status": "verified",
+        "confidence": "high",
+        "industry": "电网设备",
+        "main_business": "电网自动化与数字化",
+    }
+    item["candidate_reason_summary"] = (
+        "回调结构候选，等待观察区间企稳后再评估。"
+    )
     fake_client.responses["/api/decision/today"] = payload
 
     result = runner.invoke(
@@ -384,6 +413,12 @@ def test_decision_summary_keeps_source_profile_status_auditable(
     assert candidate["resolved_profile_status"] == "verified"
     assert candidate["resolved_profile_confidence"] == "high"
     assert candidate["profile_eligible_for_buy_now"] is False
+    assert candidate["profile_contract"] == item["profile_contract"]
+    assert candidate["candidate_source_profile"] == (
+        item["candidate_source_profile"]
+    )
+    assert candidate["resolved_profile"] == item["resolved_profile"]
+    assert candidate["reason_summary"] == item["candidate_reason_summary"]
 
 
 def test_decision_explain_returns_one_symbol_with_bucket(fake_client: FakeClient) -> None:

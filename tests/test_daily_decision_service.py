@@ -783,6 +783,8 @@ async def test_candidate_profile_cannot_be_silently_promoted_by_decision_resolve
         "formal_research_required",
     ]
     assert item["candidate_reason_summary"] == candidate["reason_summary"]
+    assert item["candidate_source_profile"] == candidate["stock_profile"]
+    assert item["resolved_profile"]["status"] == "verified"
     assert item["profile_contract"] == {
         "discovery_research_tier": "structured",
             "formal_research_selected": True,

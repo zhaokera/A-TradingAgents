@@ -1337,6 +1337,10 @@ class DailyDecisionService:
                     "position": deepcopy(plans.get("position") or {}),
                 },
                 "profile": deepcopy(dict(profile)),
+                "candidate_source_profile": deepcopy(
+                    candidate.get("candidate_stock_profile") or {}
+                ),
+                "resolved_profile": deepcopy(dict(profile)),
                 "profile_contract": profile_contract,
                 "candidate_reason_summary": str(
                     candidate.get("reason_summary") or ""

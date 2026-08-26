@@ -932,6 +932,77 @@ def _enrich_saved_candidate(value: Any) -> Any:
     return candidate
 
 
+def _attach_candidate_profile_audit(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    candidate = value
+    source_profile = candidate.get("stock_profile")
+    source_profile = (
+        deepcopy(dict(source_profile))
+        if isinstance(source_profile, Mapping)
+        else {}
+    )
+    source_evidence = candidate.get("profile_evidence")
+    source_evidence = (
+        source_evidence if isinstance(source_evidence, Mapping) else {}
+    )
+    research_tier = str(candidate.get("research_tier") or "structured")
+    source_status = str(
+        source_profile.get("status")
+        or source_evidence.get("status")
+        or "missing"
+    )
+    source_confidence = str(
+        source_evidence.get("confidence")
+        or source_profile.get("confidence")
+        or "missing"
+    )
+    source_complete = bool(
+        source_evidence.get("decision_critical_complete") is True
+    )
+    if research_tier == "deep":
+        resolved_profile = deepcopy(source_profile)
+        resolved_status = str(resolved_profile.get("status") or "missing")
+        resolved_confidence = str(
+            resolved_profile.get("confidence") or "missing"
+        )
+        resolved_complete = source_complete
+        formal_selected = True
+    else:
+        resolved_profile = {
+            "code": str(candidate.get("code") or ""),
+            "status": "not_resolved_structured_layer",
+            "confidence": "deferred",
+            "reason_code": "formal_research_required",
+        }
+        resolved_status = "not_resolved_structured_layer"
+        resolved_confidence = "deferred"
+        resolved_complete = False
+        formal_selected = False
+    candidate["candidate_source_profile"] = source_profile
+    candidate["resolved_profile"] = resolved_profile
+    candidate["profile_contract"] = {
+        "scope": "candidate_latest",
+        "discovery_research_tier": research_tier,
+        "formal_research_selected": formal_selected,
+        "candidate_status": source_status,
+        "candidate_confidence": source_confidence,
+        "candidate_decision_critical_complete": source_complete,
+        "resolved_status": resolved_status,
+        "resolved_confidence": resolved_confidence,
+        "resolved_decision_critical_complete": resolved_complete,
+        "eligible_for_buy_now": bool(
+            research_tier == "deep"
+            and source_complete
+            and resolved_complete
+        ),
+    }
+    candidate["candidate_reason_summary"] = str(
+        candidate.get("reason_summary") or ""
+    )
+    return candidate
+
+
 def _update_pullback_entry_confirmation(
     candidate: Dict[str, Any],
     *,
@@ -1475,7 +1546,10 @@ class AICandidateService:
         candidates = result.get("candidates")
         if isinstance(candidates, list):
             result["candidates"] = [
-                _enrich_saved_candidate(candidate) for candidate in candidates
+                _attach_candidate_profile_audit(
+                    _enrich_saved_candidate(candidate)
+                )
+                for candidate in candidates
             ]
         for field in ("generated_at", "plan_expires_at", "expires_at", "updated_at"):
             value = result.get(field)
