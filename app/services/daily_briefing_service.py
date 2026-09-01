@@ -121,6 +121,14 @@ class DailyBriefingService:
             if isinstance(item, Mapping)
             and item.get("execution_actionable") is True
         ]
+        daily_structured_analysis = deepcopy(
+            candidate_run.get("daily_structured_analysis")
+            if isinstance(candidate_run, Mapping)
+            and isinstance(
+                candidate_run.get("daily_structured_analysis"), Mapping
+            )
+            else {}
+        )
         rolling_pool = deepcopy(
             candidate_run.get("rolling_pool")
             if isinstance(candidate_run, Mapping)
@@ -213,6 +221,7 @@ class DailyBriefingService:
                 ),
                 "candidate_count": len(candidates),
                 "rolling_pool": rolling_pool,
+                "daily_structured_analysis": daily_structured_analysis,
                 "executable_count": len(executable),
                 "executable_candidates": executable,
                 "allocated_research_count": len(allocated_research),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import logging
@@ -10,7 +11,9 @@ import math
 import re
 import subprocess
 import sys
+import threading
 import time
+import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
@@ -47,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 MAX_PUBLIC_ROLLING_POOL_CANDIDATES = 100
 MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES = 15
+MAX_PUBLIC_SINGLE_BATCH_CANDIDATES = 160
 # Backward-compatible import for callers that use this as a manual batch bound.
 MAX_PUBLIC_DEEP_CHECK_CANDIDATES = MAX_PUBLIC_ROLLING_POOL_CANDIDATES
 MAX_PUBLIC_TECHNICAL_CLOSEST_REJECTIONS = 5
@@ -54,6 +58,10 @@ PUBLIC_MIN_NET_REWARD_RISK = 1.5
 TECHNICAL_DEEP_CHECK_TIMEOUT_SECONDS = 35.0
 TECHNICAL_FUNNEL_TIMEOUT_SECONDS = 50.0
 TECHNICAL_SCREEN_WORKERS = 12
+STRUCTURED_BATCH_SIZE = 80
+STRUCTURED_BATCH_WORKERS = 2
+STRUCTURED_BATCH_MAX_ATTEMPTS = 2
+DAILY_STRUCTURED_ANALYSIS_MINIMUM = 100
 MIN_TECHNICAL_HISTORY_COVERAGE_RATIO = 0.9
 WORKER_STDERR_LOG_LIMIT = 512
 A_SHARE_STOCK_CODE_PATTERN = re.compile(
@@ -1038,7 +1046,7 @@ def run_public_candidate_technical_funnel(
     selected_definitions, selected_quotes, validation_error = _validate_inputs(
         definitions,
         quote_map,
-        max_candidates=MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES,
+        max_candidates=MAX_PUBLIC_SINGLE_BATCH_CANDIDATES,
     )
     if validation_error:
         return _invalid_input_result(validation_error)
@@ -1216,6 +1224,441 @@ def run_public_candidate_technical_funnel(
             if isinstance(payload.get("pipeline_metrics"), Mapping)
             else {}
         ),
+    }
+
+
+def run_public_candidate_structured_batches(
+    definitions: Any,
+    quote_map: Any,
+    *,
+    benchmark_trade_date: Any,
+    command_remaining_seconds: Any,
+    batch_size: int = STRUCTURED_BATCH_SIZE,
+    max_batch_attempts: int = STRUCTURED_BATCH_MAX_ATTEMPTS,
+    batch_runner: Optional[Callable[..., Dict[str, Any]]] = None,
+    resume_checkpoint: Optional[Mapping[str, Any]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Run the structured funnel in bounded, independently retryable batches."""
+
+    selected_definitions, selected_quotes, validation_error = _validate_inputs(
+        definitions,
+        quote_map,
+        max_candidates=MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES,
+    )
+    if validation_error:
+        return _invalid_input_result(validation_error)
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size < 1
+        or batch_size > MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES
+    ):
+        return _invalid_input_result("batch_size_invalid")
+    if (
+        isinstance(max_batch_attempts, bool)
+        or not isinstance(max_batch_attempts, int)
+        or max_batch_attempts < 1
+        or max_batch_attempts > 3
+    ):
+        return _invalid_input_result("max_batch_attempts_invalid")
+    remaining = _parse_remaining_seconds(command_remaining_seconds)
+    if remaining is None or remaining <= 0:
+        return {**_timeout_result(), "mode": "structured_batches"}
+
+    selected_definitions = selected_definitions or []
+    selected_quotes = selected_quotes or {}
+    batches = [
+        selected_definitions[index : index + batch_size]
+        for index in range(0, len(selected_definitions), batch_size)
+    ]
+    effective_runner = batch_runner or run_public_candidate_technical_funnel
+    pipeline_started = time.perf_counter()
+    raw_resumed_batches = (
+        resume_checkpoint.get("batches")
+        if isinstance(resume_checkpoint, Mapping)
+        else {}
+    )
+    raw_resumed_batches = (
+        raw_resumed_batches if isinstance(raw_resumed_batches, Mapping) else {}
+    )
+    checkpoint: Dict[str, Any] = {"version": 1, "batches": {}}
+    checkpoint_lock = threading.Lock()
+
+    def encode_result(result: Mapping[str, Any]) -> str:
+        raw = json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return base64.b64encode(zlib.compress(raw, level=6)).decode("ascii")
+
+    def decode_saved_result(saved: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        result = saved.get("result")
+        if isinstance(result, Mapping):
+            return deepcopy(dict(result))
+        encoded = saved.get("result_zlib_base64")
+        if not isinstance(encoded, str) or not encoded:
+            return None
+        try:
+            decoded = zlib.decompress(base64.b64decode(encoded)).decode("utf-8")
+            payload = json.loads(decoded)
+        except (ValueError, TypeError, zlib.error, json.JSONDecodeError):
+            return None
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def publish_checkpoint() -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(deepcopy(checkpoint))
+        except Exception:
+            logger.exception("Structured candidate checkpoint callback failed")
+
+    def pipeline_complete(candidate: Any) -> bool:
+        if not isinstance(candidate, Mapping):
+            return False
+        review = candidate.get("structured_review")
+        review = review if isinstance(review, Mapping) else {}
+        technical = review.get("technical")
+        technical = technical if isinstance(technical, Mapping) else {}
+        corporate_action = review.get("corporate_action")
+        corporate_action = (
+            corporate_action if isinstance(corporate_action, Mapping) else {}
+        )
+        return bool(
+            isinstance(review.get("earnings"), Mapping)
+            and isinstance(review.get("notice"), Mapping)
+            and technical.get("status") == "passed"
+            and str(review.get("notice", {}).get("status") or "")
+            not in {"", "unavailable"}
+            and str(corporate_action.get("status") or "")
+            not in {"", "unavailable", "corporate_action_unavailable"}
+        )
+
+    def run_batch(index_and_batch: tuple[int, List[Dict[str, Any]]]):
+        index, batch = index_and_batch
+        batch_codes = [item["code"] for item in batch]
+        saved = raw_resumed_batches.get(str(index))
+        saved_result = decode_saved_result(saved) if isinstance(saved, Mapping) else None
+        if (
+            isinstance(saved, Mapping)
+            and saved.get("status") == "completed"
+            and saved.get("input_codes") == batch_codes
+            and isinstance(saved_result, Mapping)
+            and saved_result.get("status") == "ok"
+        ):
+            with checkpoint_lock:
+                checkpoint["batches"][str(index)] = deepcopy(dict(saved))
+            return (
+                index,
+                batch_codes,
+                deepcopy(dict(saved_result)),
+                [{"attempt": 0, "status": "ok", "resumed": True}],
+            )
+        attempts: List[Dict[str, Any]] = []
+        result: Dict[str, Any] = {}
+        for attempt in range(1, max_batch_attempts + 1):
+            elapsed = time.perf_counter() - pipeline_started
+            batch_remaining = max(0.0, remaining - elapsed)
+            if batch_remaining <= 0:
+                result = {**_timeout_result(), "mode": "structured_batch"}
+            else:
+                result = effective_runner(
+                    batch,
+                    {code: selected_quotes[code] for code in batch_codes},
+                    benchmark_trade_date=benchmark_trade_date,
+                    command_remaining_seconds=batch_remaining,
+                )
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "status": str(result.get("status") or "invalid_result"),
+                    "error_type": result.get("error_type"),
+                }
+            )
+            if result.get("status") == "ok":
+                with checkpoint_lock:
+                    checkpoint["batches"][str(index)] = {
+                        "input_codes": batch_codes,
+                        "status": "completed",
+                        "result_zlib_base64": encode_result(result),
+                    }
+                    publish_checkpoint()
+                break
+        return index, batch_codes, result, attempts
+
+    if not batches:
+        return run_public_candidate_technical_funnel(
+            [],
+            {},
+            benchmark_trade_date=benchmark_trade_date,
+            command_remaining_seconds=remaining,
+        )
+
+    raw_batch_results = []
+    for wave_start in range(0, len(batches), STRUCTURED_BATCH_WORKERS):
+        wave = list(
+            enumerate(
+                batches[wave_start : wave_start + STRUCTURED_BATCH_WORKERS],
+                start=wave_start,
+            )
+        )
+        with ThreadPoolExecutor(max_workers=len(wave)) as executor:
+            raw_batch_results.extend(executor.map(run_batch, wave))
+        completed_candidate_count = sum(
+            sum(pipeline_complete(candidate) for candidate in result.get("candidates") or [])
+            for _index, _codes, result, _attempts in raw_batch_results
+            if result.get("status") == "ok"
+        )
+        if completed_candidate_count >= DAILY_STRUCTURED_ANALYSIS_MINIMUM:
+            break
+    raw_batch_results.sort(key=lambda item: item[0])
+
+    batch_items: List[Dict[str, Any]] = []
+    failed = []
+    successful_results: List[Mapping[str, Any]] = []
+    retry_count = 0
+    resumed_batch_count = 0
+    for index, batch_codes, result, attempts in raw_batch_results:
+        retry_count += max(0, len(attempts) - 1)
+        resumed_batch_count += any(item.get("resumed") is True for item in attempts)
+        audit = {
+            "batch_index": index,
+            "input_count": len(batch_codes),
+            "first_code": batch_codes[0] if batch_codes else None,
+            "last_code": batch_codes[-1] if batch_codes else None,
+            "status": str(result.get("status") or "invalid_result"),
+            "attempts": attempts,
+        }
+        batch_items.append(audit)
+        if result.get("status") != "ok":
+            failed.append(audit)
+        else:
+            successful_results.append(result)
+    batch_audit = {
+        "batch_size": batch_size,
+        "batch_worker_count": min(STRUCTURED_BATCH_WORKERS, len(batches)),
+        "planned_batch_count": len(batches),
+        "attempted_batch_count": len(raw_batch_results),
+        "skipped_batch_count": len(batches) - len(raw_batch_results),
+        "completed_batch_count": len(successful_results),
+        "failed_batch_count": len(failed),
+        "retry_count": retry_count,
+        "resumed_batch_count": resumed_batch_count,
+        "batches": batch_items,
+    }
+    if failed:
+        return {
+            "status": "technical_deep_check_failed",
+            "error_type": "StructuredBatchIncomplete",
+            "candidates": [],
+            "batch_audit": batch_audit,
+        }
+
+    screened_codes = [
+        code
+        for _index, codes, _result, _attempts in raw_batch_results
+        for code in codes
+    ]
+    screened_code_set = set(screened_codes)
+    screened_definitions = [
+        item for item in selected_definitions if item["code"] in screened_code_set
+    ]
+    definitions_by_code = {item["code"]: item for item in screened_definitions}
+    candidate_by_code: Dict[str, Dict[str, Any]] = {}
+    earnings_by_code: Dict[str, Dict[str, Any]] = {}
+    notice_by_code: Dict[str, Dict[str, Any]] = {}
+    status_counts: Counter[str] = Counter()
+    closest_rejections: List[Dict[str, Any]] = []
+    passed_count = 0
+    metrics: Counter[str] = Counter()
+    metric_seconds: Counter[str] = Counter()
+    earnings_template: Mapping[str, Any] = {}
+    notice_template: Mapping[str, Any] = {}
+    for result in successful_results:
+        technical = result.get("technical_screen")
+        technical = technical if isinstance(technical, Mapping) else {}
+        passed_count += int(technical.get("passed_count") or 0)
+        status_counts.update(technical.get("status_counts") or {})
+        closest_rejections.extend(
+            deepcopy(list(technical.get("closest_rejections") or []))
+        )
+        for candidate in result.get("candidates") or []:
+            if isinstance(candidate, Mapping) and candidate.get("code") in definitions_by_code:
+                candidate_by_code[str(candidate["code"])] = deepcopy(dict(candidate))
+        earnings = result.get("earnings_screen")
+        if isinstance(earnings, Mapping):
+            earnings_template = earnings_template or earnings
+            for item in earnings.get("results") or []:
+                if isinstance(item, Mapping):
+                    earnings_by_code[str(item.get("code") or "")] = deepcopy(dict(item))
+        notice = result.get("notice_review")
+        if isinstance(notice, Mapping) and notice.get("status") == "ok":
+            notice_template = notice_template or notice
+            for item in notice.get("results") or []:
+                if isinstance(item, Mapping):
+                    notice_by_code[str(item.get("code") or "")] = deepcopy(dict(item))
+        pipeline = result.get("pipeline_metrics")
+        if isinstance(pipeline, Mapping):
+            for key, value in pipeline.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                if key.endswith("_seconds"):
+                    metric_seconds[key] += float(value)
+                else:
+                    metrics[key] += int(value)
+
+    ordered_passing_codes = [
+        item["code"] for item in selected_definitions if item["code"] in candidate_by_code
+    ]
+    structurally_complete_codes = [
+        code for code in ordered_passing_codes if pipeline_complete(candidate_by_code[code])
+    ]
+    incomplete_codes = [
+        code for code in ordered_passing_codes if code not in set(structurally_complete_codes)
+    ]
+    selected_codes = [*structurally_complete_codes, *incomplete_codes][
+        :MAX_PUBLIC_ROLLING_POOL_CANDIDATES
+    ]
+    candidates = [candidate_by_code[code] for code in selected_codes]
+    deep_codes = []
+    for code in selected_codes:
+        structured_review = candidate_by_code[code].get("structured_review")
+        structured_review = (
+            structured_review if isinstance(structured_review, Mapping) else {}
+        )
+        if structured_review.get("hard_risk_status") != "blocked":
+            deep_codes.append(code)
+        if len(deep_codes) >= MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES:
+            break
+    deep_code_set = set(deep_codes)
+    for candidate in candidates:
+        candidate["research_tier"] = (
+            "deep" if candidate.get("code") in deep_code_set else "structured"
+        )
+
+    if any(code not in earnings_by_code for code in selected_codes):
+        return {
+            "status": "technical_deep_check_failed",
+            "error_type": "StructuredEarningsEvidenceIncomplete",
+            "candidates": [],
+            "batch_audit": batch_audit,
+        }
+    final_earnings_results = [earnings_by_code[code] for code in selected_codes]
+    earnings_blocked = [
+        item["code"] for item in final_earnings_results if item.get("blocks_new_position") is True
+    ]
+    earnings_selected = [
+        item["code"] for item in final_earnings_results if item.get("blocks_new_position") is not True
+    ]
+    earnings_screen = {
+        **{
+            key: earnings_template.get(key)
+            for key in ("status", "source", "actual_source", "report_period", "actual_report_period")
+        },
+        "screened_count": len(selected_codes),
+        "blocked_count": len(earnings_blocked),
+        "selected_count": len(earnings_selected),
+        "blocked_codes": earnings_blocked,
+        "selected_codes": earnings_selected,
+        "status_counts": dict(Counter(item.get("status") for item in final_earnings_results)),
+        "actual_status_counts": dict(
+            Counter(
+                (
+                    item.get("latest_actual", {}).get("status")
+                    if isinstance(item.get("latest_actual"), Mapping)
+                    else None
+                )
+                for item in final_earnings_results
+            )
+        ),
+        "results": final_earnings_results,
+    }
+    if notice_template and all(code in notice_by_code for code in selected_codes):
+        final_notice_results = [notice_by_code[code] for code in selected_codes]
+        notice_review = {
+            **{
+                key: notice_template.get(key)
+                for key in ("status", "source", "start_date", "end_date", "lookback_calendar_days")
+            },
+            "reviewed_count": len(final_notice_results),
+            "codes_with_notices_count": sum(item.get("status") == "notices_found" for item in final_notice_results),
+            "manual_review_code_count": sum(item.get("manual_review_required") is True for item in final_notice_results),
+            "total_notice_count": sum(int(item.get("total_notice_count") or 0) for item in final_notice_results),
+            "returned_notice_count": sum(int(item.get("returned_notice_count") or 0) for item in final_notice_results),
+            "attention_tag_code_counts": dict(
+                Counter(tag for item in final_notice_results for tag in item.get("attention_tags") or [])
+            ),
+            "results": final_notice_results,
+        }
+    else:
+        return {
+            "status": "technical_deep_check_failed",
+            "error_type": "StructuredNoticeEvidenceIncomplete",
+            "candidates": [],
+            "batch_audit": batch_audit,
+        }
+
+    closest_rejections = sorted(
+        (
+            deepcopy(dict(item))
+            for item in closest_rejections
+            if isinstance(item, Mapping)
+            and item.get("code") in definitions_by_code
+        ),
+        key=lambda item: (
+            objective_tier_rank(
+                definitions_by_code[str(item["code"])].get("objective_tier")
+            ),
+            -float(item.get("net_reward_risk") or 0.0),
+            -float(item.get("tencent_score") or 0.0),
+            _finite_number(
+                definitions_by_code[str(item["code"])].get(
+                    "tencent_one_lot_amount"
+                )
+            )
+            or math.inf,
+            str(item["code"]),
+        ),
+    )[:MAX_PUBLIC_TECHNICAL_CLOSEST_REJECTIONS]
+    structured_completed_count = sum(pipeline_complete(item) for item in candidates)
+    minimum_met = structured_completed_count >= DAILY_STRUCTURED_ANALYSIS_MINIMUM
+    return {
+        "status": "ok" if minimum_met else "daily_structured_analysis_minimum_not_met",
+        "candidates": candidates,
+        "technical_screen": {
+            "status": "ok",
+            "screened_count": len(screened_definitions),
+            "screened_codes": screened_codes,
+            "passed_count": passed_count,
+            "selected_count": len(selected_codes),
+            "selected_codes": selected_codes,
+            "deep_research_selected_count": len(deep_codes),
+            "deep_research_selected_codes": deep_codes,
+            "status_counts": dict(sorted(status_counts.items())),
+            "closest_rejection_count": len(closest_rejections),
+            "closest_rejections": closest_rejections,
+        },
+        "earnings_screen": earnings_screen,
+        "notice_review": notice_review,
+        "daily_analysis": {
+            "daily_minimum": DAILY_STRUCTURED_ANALYSIS_MINIMUM,
+            "planned_count": min(DAILY_STRUCTURED_ANALYSIS_MINIMUM, len(candidates)),
+            "structured_completed_count": structured_completed_count,
+            "minimum_met": minimum_met,
+            "supplemental_batches_used": max(0, len(raw_batch_results) - 1),
+            "input_exhausted": len(raw_batch_results) == len(batches),
+        },
+        "batch_audit": batch_audit,
+        "pipeline_metrics": {
+            **dict(metrics),
+            **{key: round(value, 6) for key, value in metric_seconds.items()},
+            "structured_batch_count": len(raw_batch_results),
+            "structured_batch_retry_count": retry_count,
+            "total_seconds": round(time.perf_counter() - pipeline_started, 6),
+        },
     }
 
 
@@ -1714,6 +2157,11 @@ def _run_technical_funnel_worker_payload(
         code = candidate["code"]
         earnings = deepcopy(earnings_results.get(code) or {})
         notice = deepcopy(notice_results.get(code) or {})
+        if earnings:
+            earnings.setdefault("source", EARNINGS_FORECAST_SOURCE)
+            earnings.setdefault("actual_source", EARNINGS_ACTUAL_SOURCE)
+        if notice:
+            notice.setdefault("source", NOTICE_REVIEW_SOURCE)
         earnings_blocked = code in set(earnings_screen["blocked_codes"])
         notice_blocked = code in notice_blocked_codes
         hard_risk_reasons = []
@@ -1727,9 +2175,17 @@ def _run_technical_funnel_worker_payload(
         candidate["research_tier"] = "deep" if code in deep_codes else "structured"
         candidate["rolling_pool_state"] = "current"
         candidate["structured_review"] = {
-            "technical": {"status": "passed"},
+            "technical": {
+                "status": "passed",
+                "source": "tencent_daily_bars",
+            },
             "earnings": earnings,
             "notice": notice,
+            "corporate_action": deepcopy(
+                candidate.get("corporate_action")
+                if isinstance(candidate.get("corporate_action"), Mapping)
+                else {}
+            ),
             "hard_risk_status": "blocked" if blocked else "clear",
             "hard_risk_clear": not blocked,
             "hard_risk_reasons": hard_risk_reasons,

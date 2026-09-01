@@ -70,6 +70,8 @@ from app.services.public_candidate_deep_check import (
     MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES,
     PUBLIC_NOTICE_HARD_RISK_TAGS,
     PUBLIC_TECHNICAL_SCREEN_STATUS_KEYS,
+    STRUCTURED_BATCH_SIZE,
+    run_public_candidate_structured_batches,
     run_public_candidate_technical_funnel,
     validate_public_earnings_screen_metadata,
     validate_public_technical_screen_metadata,
@@ -6182,12 +6184,35 @@ def build_public_research_opportunities_payload(
             if isinstance(deep_check_result, Mapping)
             else None
         )
-        if deep_status == "ok":
+        if deep_status in {
+            "ok",
+            "daily_structured_analysis_minimum_not_met",
+        }:
             raw_technical_screen = deep_check_result.get("technical_screen")
+            screened_codes = (
+                raw_technical_screen.get("screened_codes")
+                if isinstance(raw_technical_screen, Mapping)
+                else None
+            )
+            screened_code_set = (
+                set(screened_codes)
+                if isinstance(screened_codes, list)
+                and all(isinstance(code, str) for code in screened_codes)
+                else None
+            )
+            validation_definitions = (
+                [
+                    item
+                    for item in definitions
+                    if item.get("code") in screened_code_set
+                ]
+                if screened_code_set is not None
+                else definitions
+            )
             technical_screen = (
                 _validated_public_technical_screen(
                     raw_technical_screen,
-                    definitions,
+                    validation_definitions,
                 )
                 if isinstance(raw_technical_screen, Mapping)
                 else None
@@ -6230,7 +6255,11 @@ def build_public_research_opportunities_payload(
                 "not_called_no_earnings_survivors"
                 if earnings_screen is not None
                 and earnings_screen["selected_count"] == 0
-                else "ok"
+                else (
+                    "daily_structured_analysis_minimum_not_met"
+                    if deep_status == "daily_structured_analysis_minimum_not_met"
+                    else "ok"
+                )
             )
             research_candidates = _normalize_public_research_candidates(
                 deep_candidates,
@@ -6345,6 +6374,16 @@ def build_public_research_opportunities_payload(
                 if isinstance(pipeline_metrics, Mapping)
                 else {}
             )
+            raw_daily_analysis = deep_check_result.get("daily_analysis")
+            if isinstance(raw_daily_analysis, Mapping):
+                candidate_discovery["daily_structured_analysis"] = deepcopy(
+                    dict(raw_daily_analysis)
+                )
+            raw_batch_audit = deep_check_result.get("batch_audit")
+            if isinstance(raw_batch_audit, Mapping):
+                candidate_discovery["structured_batch_audit"] = deepcopy(
+                    dict(raw_batch_audit)
+                )
         elif deep_status == "technical_deep_check_timeout":
             if deep_check_result.get("mode") == "technical_funnel":
                 raise CLIError(
@@ -6413,6 +6452,24 @@ def build_public_research_opportunities_payload(
         ),
         "status": technical_deep_stage_status,
     }
+    if "structured_batch_audit" in candidate_discovery:
+        candidate_discovery["stage_sources"]["structured_batches"] = {
+            "provider": "bounded_structured_batch_pipeline",
+            "status": (
+                "ok"
+                if deep_status == "ok"
+                else "daily_structured_analysis_minimum_not_met"
+            ),
+            "completed_batch_count": candidate_discovery[
+                "structured_batch_audit"
+            ].get("completed_batch_count"),
+            "failed_batch_count": candidate_discovery[
+                "structured_batch_audit"
+            ].get("failed_batch_count"),
+            "retry_count": candidate_discovery[
+                "structured_batch_audit"
+            ].get("retry_count"),
+        }
 
     normalized_external_risk_level = _validate_external_risk_level(
         external_risk_level
@@ -7802,6 +7859,10 @@ def _orchestrate_public_full_market_research_payload(
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
     board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
+    research_progress_callback: Optional[
+        Callable[[Dict[str, Any]], None]
+    ] = None,
+    resume_checkpoint: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one deadline-bounded public discovery workflow for opportunities."""
     if context.index_status != "ok" or not _valid_opportunity_benchmark_trade_date(
@@ -7911,14 +7972,52 @@ def _orchestrate_public_full_market_research_payload(
         definitions = _normalize_public_discovery_definitions(definitions)
         _require_opportunity_time(context, stage="candidate_discovery")
         _require_opportunity_time(context, stage="technical_deep_inspection")
-        deep_check_result = run_public_candidate_technical_funnel(
-            definitions,
-            selected_quote_map,
-            benchmark_trade_date=benchmark_trade_date,
-            command_remaining_seconds=context.stage_timeout(
-                "technical_deep_inspection"
-            ),
+        remaining_seconds = context.stage_timeout("technical_deep_inspection")
+        deep_check_result = (
+            run_public_candidate_structured_batches(
+                definitions,
+                selected_quote_map,
+                benchmark_trade_date=benchmark_trade_date,
+                command_remaining_seconds=remaining_seconds,
+                progress_callback=research_progress_callback,
+                resume_checkpoint=resume_checkpoint,
+            )
+            if len(definitions) > STRUCTURED_BATCH_SIZE
+            else run_public_candidate_technical_funnel(
+                definitions,
+                selected_quote_map,
+                benchmark_trade_date=benchmark_trade_date,
+                command_remaining_seconds=remaining_seconds,
+            )
         )
+        if isinstance(deep_check_result, dict):
+            daily_analysis = deep_check_result.get("daily_analysis")
+            if isinstance(daily_analysis, dict):
+                eligible_count = int(candidate_discovery.get("eligible_count") or 0)
+                public_preselected_count = len(definitions)
+                input_exhausted = public_preselected_count >= eligible_count
+                daily_analysis["input_exhausted"] = input_exhausted
+                daily_analysis["researchable_input_count"] = eligible_count
+                daily_analysis["ranked_input_count"] = public_preselected_count
+                candidate_discovery["daily_structured_analysis"] = deepcopy(
+                    daily_analysis
+                )
+                candidate_discovery["structured_batch_audit"] = deepcopy(
+                    deep_check_result.get("batch_audit") or {}
+                )
+                if (
+                    daily_analysis.get("minimum_met") is not True
+                    and not input_exhausted
+                ):
+                    deep_check_result = {
+                        "status": "technical_deep_check_failed",
+                        "error_type": "SupplementalUniverseTruncated",
+                        "candidates": [],
+                        "daily_analysis": deepcopy(daily_analysis),
+                        "batch_audit": deepcopy(
+                            deep_check_result.get("batch_audit") or {}
+                        ),
+                    }
         _require_opportunity_time(context, stage="technical_deep_inspection")
 
     _require_opportunity_time(context, stage="orchestration")
@@ -7982,6 +8081,10 @@ def _build_public_full_market_research_payload(
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
     board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
+    research_progress_callback: Optional[
+        Callable[[Dict[str, Any]], None]
+    ] = None,
+    resume_checkpoint: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     discovery_state: Dict[str, Any] = {}
     try:
@@ -7993,6 +8096,8 @@ def _build_public_full_market_research_payload(
             excluded_code_reasons=excluded_code_reasons,
             board_exclusion_reasons=board_exclusion_reasons,
             star_market_exclusion_reason=star_market_exclusion_reason,
+            research_progress_callback=research_progress_callback,
+            resume_checkpoint=resume_checkpoint,
         )
     except CLIError as exc:
         if exc.code == "TechnicalHistoryFetchError":
@@ -8029,6 +8134,10 @@ def run_public_full_market_research(
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
     board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
+    research_progress_callback: Optional[
+        Callable[[Dict[str, Any]], None]
+    ] = None,
+    resume_checkpoint: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run the account-independent full-market research workflow.
 
@@ -8043,6 +8152,8 @@ def run_public_full_market_research(
         excluded_code_reasons=excluded_code_reasons,
         board_exclusion_reasons=board_exclusion_reasons,
         star_market_exclusion_reason=star_market_exclusion_reason,
+        research_progress_callback=research_progress_callback,
+        resume_checkpoint=resume_checkpoint,
         database_status={
             "status": "not_required",
             "reason_code": "public_research_mode",

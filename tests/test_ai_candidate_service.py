@@ -591,8 +591,13 @@ async def test_run_persists_user_owned_candidate_batch():
     assert stored["expires_at"] > stored["generated_at"]
     assert stored["candidate_discovery"] == stored["discovery"]
     assert result["candidate_discovery"] == result["discovery"]
-    favorites.sync_auto_ai_candidates.assert_awaited_once()
-    assert result["auto_favorites"]["selected_codes"] == ["600001"]
+    favorites.sync_auto_ai_candidates.assert_not_awaited()
+    assert result["auto_favorites"] == {
+        "status": "skipped",
+        "reason_code": "daily_structured_analysis_minimum_not_met",
+        "condition_orders_created": 0,
+        "existing_auto_favorites_preserved": True,
+    }
 
 
 @pytest.mark.asyncio

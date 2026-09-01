@@ -7187,7 +7187,9 @@ def test_public_workflow_reuses_snapshot_and_batches_quotes_and_deep_check_once(
     assert deep_calls[0]["benchmark_trade_date"] == "2026-07-17"
     assert [item["code"] for item in deep_calls[0]["definitions"]] == ["600000"]
     assert set(deep_calls[0]["quote_map"]) == {"600000"}
-    assert deep_calls[0]["remaining"] == 50.0
+    assert deep_calls[0]["remaining"] == pytest.approx(
+        context.remaining_seconds(), abs=0.1
+    )
     assert market_contexts == [context]
 
 

@@ -23,13 +23,13 @@ from app.services.tencent_quote_service import fetch_tencent_quotes_sync
 logger = logging.getLogger(__name__)
 
 
-OPPORTUNITY_COMMAND_TIMEOUT_SECONDS = 90.0
+OPPORTUNITY_COMMAND_TIMEOUT_SECONDS = 240.0
 OPPORTUNITY_STAGE_TIMEOUT_SECONDS = {
     "mongo": 5.0,
     "tencent_market_context": 10.0,
     "sina_public_snapshot": 25.0,
     "tencent_candidate_review": 10.0,
-    "technical_deep_inspection": 50.0,
+    "technical_deep_inspection": 200.0,
     "orchestration": 5.0,
 }
 A_SHARE_MAJOR_INDEX_SYMBOLS = (

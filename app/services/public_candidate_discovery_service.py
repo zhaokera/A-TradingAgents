@@ -25,7 +25,11 @@ from app.services.tencent_quote_service import (
 )
 
 
-MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES = 160
+# The public snapshot is ranked first; this bound only controls how many
+# permission-eligible rows may enter batched technical screening. It must leave
+# enough headroom to supplement the daily 100-stock completion target when the
+# first ranked tranche has technical rejections.
+MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES = 400
 _MAX_CANDIDATES = MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES
 _MAX_TENCENT_CANDIDATES = MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES
 _TENCENT_QUALITY_CORE_NUMERATOR = 5

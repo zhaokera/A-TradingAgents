@@ -73,6 +73,7 @@ AVOID_REASON_CODES = (
 )
 WAIT_REASON_CODES = (
     "current_candidate_scan_unavailable",
+    "daily_structured_analysis_minimum_not_met",
     "account_blocked",
     "calendar_unknown",
     "profile_incomplete",
@@ -1158,16 +1159,35 @@ class DailyDecisionService:
         current_scan_available = (
             candidate_run.get("current_scan_available") is not False
         )
+        daily_structured_analysis = candidate_run.get(
+            "daily_structured_analysis"
+        )
+        daily_structured_analysis = (
+            deepcopy(dict(daily_structured_analysis))
+            if isinstance(daily_structured_analysis, Mapping)
+            else {}
+        )
+        daily_contract_present = bool(daily_structured_analysis)
+        daily_minimum_met = (
+            daily_structured_analysis.get("minimum_met") is True
+            if daily_contract_present
+            else current_scan_available
+        )
         execution_usable = (
             phase in LIVE_PHASES
             and live_gate_trading
             and current_scan_available
+            and daily_minimum_met
         )
         market["execution_usable"] = execution_usable
         if execution_usable:
             market["execution_status"] = "live_market_gate_usable"
         elif phase in LIVE_PHASES and not current_scan_available:
             market["execution_status"] = "current_candidate_scan_unavailable"
+        elif phase in LIVE_PHASES and not daily_minimum_met:
+            market["execution_status"] = (
+                "daily_structured_analysis_minimum_not_met"
+            )
         else:
             market["execution_status"] = (
                 "research_snapshot_not_execution_decision"
@@ -1227,6 +1247,10 @@ class DailyDecisionService:
                     candidate_run.get("current_scan_available") is not False
                 ),
             )
+            if current_scan_available and not daily_minimum_met:
+                wait_reasons.append(
+                    "daily_structured_analysis_minimum_not_met"
+                )
             if (
                 profile_contract["candidate_decision_critical_complete"]
                 is not True
@@ -1534,6 +1558,7 @@ class DailyDecisionService:
                 ),
                 "candidates": rolling_candidate_audit,
             },
+            "daily_structured_analysis": daily_structured_analysis,
             "effective_policy": effective_policy,
             "authority": "software_baseline",
             "is_final_decision": False,
@@ -1545,6 +1570,7 @@ class DailyDecisionService:
                 "permission_prefilter_excluded_count": len(
                     permission_prefilter_excluded
                 ),
+                "daily_structured_analysis_minimum_met": daily_minimum_met,
             },
             **bucket_items,
             "permission_prefilter_excluded": permission_prefilter_excluded,
@@ -1553,6 +1579,7 @@ class DailyDecisionService:
                 "current_candidate_scan_available": (
                     candidate_run.get("current_scan_available") is not False
                 ),
+                "daily_structured_analysis_minimum_met": daily_minimum_met,
                 "candidate_serving_mode": candidate_run.get("serving_mode"),
                 "profile_errors": profile_errors,
                 "profile_conflicts": profile_conflicts,

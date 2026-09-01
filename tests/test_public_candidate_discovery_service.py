@@ -720,7 +720,7 @@ def test_amount_percentiles_exclude_rejected_rows_and_precede_bucket_quotas():
     assert "600050" not in definitions
 
 
-def test_public_ranking_uses_120_40_quota_and_caps_explicit_limit_at_160():
+def test_public_ranking_expands_ranked_input_for_daily_structured_batches():
     strength_rows = [
         _row(
             f"600{index:03d}",
@@ -744,8 +744,8 @@ def test_public_ranking_uses_120_40_quota_and_caps_explicit_limit_at_160():
         limit=200,
     )
 
-    assert len(result["definitions"]) == 160
-    assert result["selected_bucket_counts"] == {"pullback": 40, "strength": 120}
+    assert len(result["definitions"]) == 200
+    assert result["selected_bucket_counts"] == {"pullback": 70, "strength": 130}
     assert result["eligible_bucket_counts"] == {"pullback": 70, "strength": 130}
 
 
@@ -1798,7 +1798,7 @@ def test_discovery_accepts_the_real_task_1_success_dto_without_manual_patching()
     assert snapshot["status"] == "ok"
     assert snapshot["benchmark_trade_date"] == BENCHMARK_TRADE_DATE
     assert len(calls) == 1
-    assert len(calls[0]) == 160
+    assert len(calls[0]) == 400
     assert result["stage"] == "tencent_verification"
 
 

@@ -481,6 +481,35 @@ async def test_daily_decision_explicitly_identifies_software_baseline_authority(
 
 
 @pytest.mark.asyncio
+async def test_daily_decision_closes_execution_when_daily_analysis_minimum_is_not_met():
+    run = _run()
+    run["daily_structured_analysis"] = {
+        "trade_date": "2026-07-22",
+        "daily_minimum": 100,
+        "completed_count": 99,
+        "incomplete_count": 1,
+        "minimum_met": False,
+        "incomplete_reasons": {"notice_evidence_unavailable": 1},
+    }
+
+    packet = await _service(run=run).today("user-1", now=NOW)
+
+    assert packet["daily_structured_analysis"] == run[
+        "daily_structured_analysis"
+    ]
+    assert packet["market"]["execution_usable"] is False
+    assert packet["market"]["execution_status"] == (
+        "daily_structured_analysis_minimum_not_met"
+    )
+    assert packet["summary"]["daily_structured_analysis_minimum_met"] is False
+    assert not packet["buy_now"]
+    assert not packet["condition_order"]
+    assert packet["wait"][0]["reason_codes"] == [
+        "daily_structured_analysis_minimum_not_met"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_packet_separates_current_briefing_time_from_candidate_generation_time():
     packet = await _service().today("user-1", now=NOW)
 

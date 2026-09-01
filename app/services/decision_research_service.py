@@ -510,6 +510,9 @@ class DecisionResearchService:
             "soft_warnings": _dedupe_records(packet_soft),
             "candidates": candidates,
             "rolling_pool": deepcopy(baseline.get("rolling_pool") or {}),
+            "daily_structured_analysis": deepcopy(
+                baseline.get("daily_structured_analysis") or {}
+            ),
             "portfolio_constraints": deepcopy(
                 baseline.get("portfolio_constraints") or {}
             ),

@@ -49,6 +49,10 @@ from app.services.tencent_quote_service import (
     TencentQuoteService,
     get_tencent_quote_service,
 )
+from app.services.daily_structured_analysis import (
+    apply_daily_analysis_execution_gate,
+    build_daily_structured_analysis,
+)
 
 
 AI_CANDIDATE_SOURCE = "ai_screening"
@@ -290,6 +294,8 @@ _FAILURE_DISCOVERY_AUDIT_FIELDS = (
     "quality_counts",
     "provider_errors",
     "stage_sources",
+    "daily_structured_analysis",
+    "structured_batch_audit",
 )
 
 
@@ -1188,6 +1194,11 @@ def normalize_ai_candidate(
         ),
         "quote": {
             "price": reference_price,
+            "freshness": (
+                quote.get("freshness", {}).get("status")
+                if isinstance(quote.get("freshness"), Mapping)
+                else quote.get("freshness")
+            ),
             "source": str(
                 quote.get("source")
                 or quote.get("data_source")
@@ -1207,6 +1218,16 @@ def normalize_ai_candidate(
             "event_confirmation_required": True,
             "event_change_detected": False,
             "event_observed_at": None,
+            **(
+                {"status": quote.get("status")}
+                if quote.get("status") is not None
+                else {}
+            ),
+            **(
+                {"trade_date": quote.get("trade_date")}
+                if quote.get("trade_date") is not None
+                else {}
+            ),
         },
         "price_plan": price_plan,
         "plans": _build_horizon_plans(price_plan),
@@ -1225,6 +1246,18 @@ def normalize_ai_candidate(
             if isinstance(candidate.get("structured_review"), Mapping)
             else {}
         ),
+        "corporate_action": deepcopy(
+            candidate.get("corporate_action")
+            if isinstance(candidate.get("corporate_action"), Mapping)
+            else {}
+        ),
+        "objective_profile": {
+            "status": "complete"
+            if objective.get("objective_tier") in {"core", "related", "non_core"}
+            else "incomplete",
+            "objective_tier": objective.get("objective_tier"),
+            "source": "investment_objective_taxonomy",
+        },
     }
     _apply_candidate_state(normalized)
     normalized["rank_score"] = _candidate_rank_score(normalized)
@@ -1414,6 +1447,24 @@ def normalize_ai_candidate_run(
             "total_coverage_ratio": discovery.get("total_coverage_ratio"),
             "permission_prefilter_excluded_count": discovery.get(
                 "permission_prefilter_excluded_count", 0
+            ),
+            **(
+                {
+                    "daily_structured_analysis": deepcopy(
+                        discovery.get("daily_structured_analysis") or {}
+                    )
+                }
+                if "daily_structured_analysis" in discovery
+                else {}
+            ),
+            **(
+                {
+                    "structured_batch_audit": deepcopy(
+                        discovery.get("structured_batch_audit") or {}
+                    )
+                }
+                if "structured_batch_audit" in discovery
+                else {}
             ),
             "permission_prefilter_excluded": deepcopy(
                 discovery.get("permission_prefilter_excluded") or []
@@ -1821,6 +1872,9 @@ class AICandidateService:
     async def _run_research(
         self,
         governance: Mapping[str, Any],
+        *,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        resume_checkpoint: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {}
         try:
@@ -1847,6 +1901,10 @@ class AICandidateService:
                 kwargs["star_market_exclusion_reason"] = (
                     star_reason
                 )
+        if accepts_kwargs or "research_progress_callback" in parameters:
+            kwargs["research_progress_callback"] = progress_callback
+        if accepts_kwargs or "resume_checkpoint" in parameters:
+            kwargs["resume_checkpoint"] = resume_checkpoint
         result = await run_in_threadpool(self._research_runner, **kwargs)
         return dict(result) if isinstance(result, Mapping) else {}
 
@@ -2490,6 +2548,16 @@ class AICandidateService:
                 "quote_checked_at": checked_at,
                 "volume": _finite_number(quote.get("volume")),
                 "amount": _finite_number(quote.get("amount")),
+                **(
+                    {"status": quote.get("status")}
+                    if quote.get("status") is not None
+                    else {}
+                ),
+                **(
+                    {"trade_date": quote.get("trade_date")}
+                    if quote.get("trade_date") is not None
+                    else {}
+                ),
             }
             event_change_detected = _quote_event_changed(
                 previous_quote,
@@ -2632,6 +2700,23 @@ class AICandidateService:
         document["quote_refreshed_at"] = checked_at
         await self._apply_account_policy(document, user_id=user_id)
         self._update_run_counts(document)
+        discovery = document.get("candidate_discovery")
+        discovery = discovery if isinstance(discovery, Mapping) else {}
+        trade_date = str(
+            discovery.get("benchmark_trade_date")
+            or discovery.get("trade_date")
+            or ""
+        )
+        document["daily_structured_analysis"] = build_daily_structured_analysis(
+            [
+                item
+                for item in document.get("candidates", [])
+                if isinstance(item, Mapping)
+            ],
+            discovery=discovery,
+            trade_date=trade_date,
+        )
+        apply_daily_analysis_execution_gate(document)
         update_tracking = getattr(
             self._favorites, "update_ai_candidate_tracking", None
         )
@@ -2668,6 +2753,9 @@ class AICandidateService:
                         "portfolio_plan": deepcopy(document.get("portfolio_plan")),
                         "market": deepcopy(document.get("market")),
                         "execution": deepcopy(document.get("execution")),
+                        "daily_structured_analysis": deepcopy(
+                            document.get("daily_structured_analysis") or {}
+                        ),
                         "governance": deepcopy(document.get("governance")),
                         "governance_excluded_candidates": deepcopy(
                             document.get("governance_excluded_candidates")
@@ -2680,7 +2768,16 @@ class AICandidateService:
             )
         return document
 
-    async def run(self, user_id: str, *, max_candidates: int = 100) -> Dict[str, Any]:
+    async def run(
+        self,
+        user_id: str,
+        *,
+        max_candidates: int = 100,
+        research_progress_callback: Optional[
+            Callable[[Dict[str, Any]], None]
+        ] = None,
+        resume_checkpoint: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         favorite_codes = await self._favorites.get_favorite_codes(user_id)
         governance = await self._candidate_governance(str(user_id))
         db = await self._get_db()
@@ -2697,7 +2794,11 @@ class AICandidateService:
                     previous_run = loaded_previous
             except (AttributeError, TypeError):
                 previous_run = {}
-        payload = await self._run_research(governance)
+        payload = await self._run_research(
+            governance,
+            progress_callback=research_progress_callback,
+            resume_checkpoint=resume_checkpoint,
+        )
         normalized = normalize_ai_candidate_run(
             payload,
             max_candidates=AI_CANDIDATE_ROLLING_POOL_CAPACITY,
@@ -2732,13 +2833,47 @@ class AICandidateService:
             :AI_CANDIDATE_ROLLING_POOL_CAPACITY
         ]
         self._update_run_counts(document)
+        trade_date = str(
+            document.get("candidate_discovery", {}).get("benchmark_trade_date")
+            or document.get("candidate_discovery", {}).get("trade_date")
+            or ""
+        )
+        document["daily_structured_analysis"] = build_daily_structured_analysis(
+            [
+                item
+                for item in document.get("candidates", [])
+                if isinstance(item, Mapping)
+            ],
+            discovery=document.get("candidate_discovery", {}),
+            trade_date=trade_date,
+        )
+        document["candidate_discovery"]["daily_structured_analysis"] = deepcopy(
+            document["daily_structured_analysis"]
+        )
+        document["discovery"] = deepcopy(document["candidate_discovery"])
+        apply_daily_analysis_execution_gate(document)
         await db["ai_candidate_runs"].insert_one(deepcopy(document))
         sync_auto_candidates = getattr(
             self._favorites,
             "sync_auto_ai_candidates",
             None,
         )
-        if callable(sync_auto_candidates):
+        if (
+            callable(sync_auto_candidates)
+            and document["daily_structured_analysis"].get("minimum_met")
+            is not True
+        ):
+            document["auto_favorites"] = {
+                "status": "skipped",
+                "reason_code": "daily_structured_analysis_minimum_not_met",
+                "condition_orders_created": 0,
+                "existing_auto_favorites_preserved": True,
+            }
+            await db["ai_candidate_runs"].update_one(
+                {"_id": document["_id"], "user_id": str(user_id)},
+                {"$set": {"auto_favorites": deepcopy(document["auto_favorites"])}},
+            )
+        elif callable(sync_auto_candidates):
             try:
                 auto_favorites = await sync_auto_candidates(
                     str(user_id),
@@ -2819,9 +2954,51 @@ class AICandidateService:
             },
         )
         attempts: List[Dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+        find_one = getattr(jobs, "find_one", None)
+        existing_job = (
+            await find_one({"_id": job_id, "user_id": str(user_id)})
+            if callable(find_one)
+            else None
+        )
+        latest_checkpoint: Dict[str, Any] = deepcopy(
+            existing_job.get("research_checkpoint")
+            if isinstance(existing_job, Mapping)
+            and isinstance(existing_job.get("research_checkpoint"), Mapping)
+            else {}
+        )
+
+        def persist_checkpoint(checkpoint: Dict[str, Any]) -> None:
+            nonlocal latest_checkpoint
+            latest_checkpoint = deepcopy(checkpoint)
+            completed_batches = len(checkpoint.get("batches") or {})
+            future = asyncio.run_coroutine_threadsafe(
+                jobs.update_one(
+                    {"_id": job_id, "user_id": str(user_id)},
+                    {
+                        "$set": {
+                            "research_checkpoint": deepcopy(checkpoint),
+                            "progress": {
+                                "stage": "structured_analysis_batches",
+                                "percent": min(85, 20 + completed_batches * 12),
+                                "completed_batch_count": completed_batches,
+                            },
+                            "checkpoint_updated_at": datetime.now(timezone.utc),
+                        }
+                    },
+                ),
+                loop,
+            )
+            future.result(timeout=10)
+
         for attempt in range(1, AI_CANDIDATE_RESEARCH_MAX_ATTEMPTS + 1):
             try:
-                result = await self.run(user_id, max_candidates=max_candidates)
+                result = await self.run(
+                    user_id,
+                    max_candidates=max_candidates,
+                    research_progress_callback=persist_checkpoint,
+                    resume_checkpoint=latest_checkpoint,
+                )
                 await jobs.update_one(
                     {"_id": job_id, "user_id": str(user_id)},
                     {

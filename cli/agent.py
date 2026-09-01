@@ -310,6 +310,7 @@ def _decision_projection(data: Dict[str, Any], *, view: str) -> Dict[str, Any]:
         "execution_capabilities": data.get("execution_capabilities"),
         "market": data.get("market"),
         "rolling_pool": data.get("rolling_pool"),
+        "daily_structured_analysis": data.get("daily_structured_analysis"),
         "summary": data.get("summary"),
         "rule_version": data.get("rule_version"),
         "material_hash": data.get("material_hash"),

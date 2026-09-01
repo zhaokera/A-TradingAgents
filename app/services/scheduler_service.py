@@ -6,6 +6,7 @@
 """
 
 import asyncio
+from copy import deepcopy
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -539,6 +540,14 @@ class SchedulerService:
                 error = dict(error) if isinstance(error, dict) else None
                 progress = job.get("progress")
                 progress = progress if isinstance(progress, dict) else {}
+                result = job.get("result")
+                result = result if isinstance(result, dict) else {}
+                daily_analysis = result.get("daily_structured_analysis")
+                daily_analysis = (
+                    dict(daily_analysis)
+                    if isinstance(daily_analysis, dict)
+                    else {}
+                )
                 matched.append(
                     {
                         "job_id": str(job.get("_id")),
@@ -553,6 +562,12 @@ class SchedulerService:
                             job.get("completed_at").isoformat()
                             if isinstance(job.get("completed_at"), datetime)
                             else None
+                        ),
+                        "daily_structured_analysis": daily_analysis,
+                        "research_checkpoint": deepcopy(
+                            job.get("research_checkpoint")
+                            if isinstance(job.get("research_checkpoint"), dict)
+                            else {}
                         ),
                     }
                 )

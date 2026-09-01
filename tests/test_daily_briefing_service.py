@@ -60,6 +60,14 @@ async def test_briefing_exposes_full_rolling_pool_summary(monkeypatch):
                     "deep_count": 15,
                     "structured_count": 5,
                 },
+                "daily_structured_analysis": {
+                    "trade_date": "2026-08-25",
+                    "daily_minimum": 100,
+                    "completed_count": 100,
+                    "incomplete_count": 0,
+                    "formal_deep_count": 15,
+                    "minimum_met": True,
+                },
             }
         ),
     )
@@ -87,4 +95,11 @@ async def test_briefing_exposes_full_rolling_pool_summary(monkeypatch):
     assert rolling_pool["aging_count"] == 2
     assert len(rolling_pool["candidates"]) == 20
     assert rolling_pool["candidates"][15]["research_tier"] == "structured"
-
+    assert result["candidate_run"]["daily_structured_analysis"] == {
+        "trade_date": "2026-08-25",
+        "daily_minimum": 100,
+        "completed_count": 100,
+        "incomplete_count": 0,
+        "formal_deep_count": 15,
+        "minimum_met": True,
+    }

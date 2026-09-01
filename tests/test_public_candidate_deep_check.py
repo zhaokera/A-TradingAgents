@@ -719,6 +719,216 @@ def test_technical_funnel_caps_rolling_pool_at_100_and_deep_research_at_15():
     assert result["pipeline_metrics"]["total_seconds"] < 1.0
 
 
+def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
+    definitions = [
+        {
+            **_definition(f"{600000 + index:06d}"),
+            "tencent_score": 1 - index / 1000,
+        }
+        for index in range(240)
+    ]
+    quote_map = {
+        definition["code"]: _quote(definition["code"])
+        for definition in definitions
+    }
+    calls = []
+
+    def fake_batch(batch, batch_quotes, **_kwargs):
+        calls.append([item["code"] for item in batch])
+        passing = batch[:40]
+        return {
+            "status": "ok",
+            "candidates": [
+                {
+                    "code": item["code"],
+                    "research_tier": "structured",
+                    "structured_review": {
+                        "technical": {"status": "passed"},
+                        "earnings": {"status": "clear"},
+                        "notice": {"status": "no_recent_notices"},
+                        "corporate_action": {"status": "no_upcoming_corporate_action"},
+                    },
+                }
+                for item in passing
+            ],
+            "technical_screen": {
+                "status": "ok",
+                "screened_count": len(batch),
+                "passed_count": len(passing),
+                "selected_count": len(passing),
+                "selected_codes": [item["code"] for item in passing],
+                "deep_research_selected_count": 15,
+                "deep_research_selected_codes": [
+                    item["code"] for item in passing[:15]
+                ],
+                "status_counts": {"ok": len(passing), "trend_recovery_required": len(batch) - len(passing)},
+                "closest_rejection_count": 0,
+                "closest_rejections": [],
+            },
+            "earnings_screen": _earnings_screen([item["code"] for item in passing]),
+            "notice_review": _notice_review([item["code"] for item in passing]),
+            "pipeline_metrics": {"technical_cache_hit_count": 10},
+        }
+
+    result = deep_check.run_public_candidate_structured_batches(
+        definitions,
+        quote_map,
+        benchmark_trade_date="2026-09-01",
+        command_remaining_seconds=120,
+        batch_size=80,
+        batch_runner=fake_batch,
+    )
+
+    assert result["status"] == "ok"
+    assert len(calls) == 3
+    assert len(result["candidates"]) == 100
+    assert result["technical_screen"]["screened_count"] == 240
+    assert result["technical_screen"]["passed_count"] == 120
+    assert result["technical_screen"]["selected_count"] == 100
+    assert result["technical_screen"]["deep_research_selected_count"] == 15
+    assert result["daily_analysis"] == {
+        "daily_minimum": 100,
+        "planned_count": 100,
+        "structured_completed_count": 100,
+        "minimum_met": True,
+        "supplemental_batches_used": 2,
+        "input_exhausted": True,
+    }
+    assert result["batch_audit"]["completed_batch_count"] == 3
+    assert result["batch_audit"]["failed_batch_count"] == 0
+
+
+def test_structured_batches_retry_only_failed_batch_and_fail_closed_if_below_minimum():
+    definitions = [_definition(f"{600000 + index:06d}") for index in range(120)]
+    quote_map = {item["code"]: _quote(item["code"]) for item in definitions}
+    attempts = {}
+
+    def fake_batch(batch, _batch_quotes, **_kwargs):
+        batch_id = batch[0]["code"]
+        attempts[batch_id] = attempts.get(batch_id, 0) + 1
+        if batch_id == definitions[40]["code"] and attempts[batch_id] == 1:
+            return {"status": "technical_deep_check_timeout", "candidates": []}
+        passing = batch[:30]
+        return {
+            "status": "ok",
+            "candidates": [
+                {
+                    "code": item["code"],
+                    "structured_review": {
+                        "technical": {"status": "passed"},
+                        "earnings": {"status": "clear"},
+                        "notice": {"status": "no_recent_notices"},
+                        "corporate_action": {"status": "no_upcoming_corporate_action"},
+                    },
+                }
+                for item in passing
+            ],
+            "technical_screen": {
+                "status": "ok",
+                "screened_count": len(batch),
+                "passed_count": len(passing),
+                "selected_count": len(passing),
+                "selected_codes": [item["code"] for item in passing],
+                "deep_research_selected_count": min(15, len(passing)),
+                "deep_research_selected_codes": [item["code"] for item in passing[:15]],
+                "status_counts": {"ok": len(passing)},
+                "closest_rejection_count": 0,
+                "closest_rejections": [],
+            },
+            "earnings_screen": _earnings_screen([item["code"] for item in passing]),
+            "notice_review": _notice_review([item["code"] for item in passing]),
+            "pipeline_metrics": {},
+        }
+
+    result = deep_check.run_public_candidate_structured_batches(
+        definitions,
+        quote_map,
+        benchmark_trade_date="2026-09-01",
+        command_remaining_seconds=120,
+        batch_size=40,
+        max_batch_attempts=2,
+        batch_runner=fake_batch,
+    )
+
+    assert attempts[definitions[40]["code"]] == 2
+    assert result["status"] == "daily_structured_analysis_minimum_not_met"
+    assert result["daily_analysis"]["structured_completed_count"] == 90
+    assert result["daily_analysis"]["minimum_met"] is False
+    assert result["batch_audit"]["retry_count"] == 1
+    assert result["batch_audit"]["failed_batch_count"] == 0
+
+
+def test_structured_batches_resume_completed_checkpoint_without_refetching():
+    definitions = [_definition(f"{600000 + index:06d}") for index in range(120)]
+    quote_map = {item["code"]: _quote(item["code"]) for item in definitions}
+    calls = []
+    checkpoints = []
+
+    def fake_result(batch):
+        codes = [item["code"] for item in batch]
+        return {
+            "status": "ok",
+            "candidates": [
+                {
+                    "code": code,
+                    "structured_review": {
+                        "technical": {"status": "passed"},
+                        "earnings": {"status": "clear"},
+                        "notice": {"status": "no_recent_notices"},
+                        "corporate_action": {"status": "no_upcoming_corporate_action"},
+                    },
+                }
+                for code in codes
+            ],
+            "technical_screen": {
+                "status": "ok",
+                "screened_count": len(codes),
+                "passed_count": len(codes),
+                "selected_count": len(codes),
+                "selected_codes": codes,
+                "deep_research_selected_count": min(15, len(codes)),
+                "deep_research_selected_codes": codes[:15],
+                "status_counts": {"ok": len(codes)},
+                "closest_rejection_count": 0,
+                "closest_rejections": [],
+            },
+            "earnings_screen": _earnings_screen(codes),
+            "notice_review": _notice_review(codes),
+            "pipeline_metrics": {},
+        }
+
+    first_batch = definitions[:40]
+    resume_checkpoint = {
+        "version": 1,
+        "batches": {
+            "0": {
+                "input_codes": [item["code"] for item in first_batch],
+                "status": "completed",
+                "result": fake_result(first_batch),
+            }
+        },
+    }
+
+    result = deep_check.run_public_candidate_structured_batches(
+        definitions,
+        quote_map,
+        benchmark_trade_date="2026-09-01",
+        command_remaining_seconds=120,
+        batch_size=40,
+        batch_runner=lambda batch, _quotes, **_kwargs: (
+            calls.append(batch[0]["code"]) or fake_result(batch)
+        ),
+        resume_checkpoint=resume_checkpoint,
+        progress_callback=lambda checkpoint: checkpoints.append(checkpoint),
+    )
+
+    assert calls == [definitions[40]["code"], definitions[80]["code"]]
+    assert result["status"] == "ok"
+    assert result["batch_audit"]["resumed_batch_count"] == 1
+    assert checkpoints
+    assert set(checkpoints[-1]["batches"]) == {"0", "1", "2"}
+
+
 def test_technical_funnel_reviews_notices_once_for_whole_pool_and_blocks_hard_risk():
     definitions = [
         {
