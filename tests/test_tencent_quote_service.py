@@ -616,8 +616,8 @@ def test_fetch_tencent_quotes_batched_fails_closed_without_partial_rows(monkeypa
     }
 
 
-def test_fetch_tencent_quotes_batched_caps_the_public_screen_pool_at_160(monkeypatch):
-    codes = [f"{600000 + index:06d}" for index in range(170)]
+def test_fetch_tencent_quotes_batched_supports_the_400_stock_public_screen_pool(monkeypatch):
+    codes = [f"{600000 + index:06d}" for index in range(400)]
     calls = []
 
     def fake_fetch(batch, *, timeout):
@@ -634,8 +634,8 @@ def test_fetch_tencent_quotes_batched_caps_the_public_screen_pool_at_160(monkeyp
 
     result = quote_service.fetch_tencent_quotes_batched_sync(codes)
 
-    assert result["requested_codes"] == codes[:160]
-    assert len(calls) == 4
+    assert result["requested_codes"] == codes
+    assert len(calls) == 10
     assert all(len(batch) == 40 for batch in calls)
 
 

@@ -29,7 +29,7 @@ CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 QUOTE_MAX_AGE_SECONDS = 300
 QUOTE_MAX_FUTURE_SKEW_SECONDS = 60
 TENCENT_QUOTE_BATCH_SIZE = 40
-MAX_TENCENT_BATCHED_CODES = 160
+MAX_TENCENT_BATCHED_CODES = 400
 TENCENT_HISTORY_CACHE_COLLECTION = "candidate_technical_history_cache"
 TENCENT_HISTORY_FETCH_ATTEMPTS = 2
 TENCENT_HISTORY_RETRY_SECONDS = 0.25
@@ -1057,7 +1057,7 @@ def fetch_tencent_quotes_batched_sync(
     *,
     timeout: float = 10.0,
 ) -> Dict[str, Any]:
-    """Fetch up to 160 quotes in ordered 40-code batches under one deadline."""
+    """Fetch up to 400 quotes in ordered 40-code batches under one deadline."""
     try:
         requested_codes = _collect_tencent_request_codes(
             codes,
