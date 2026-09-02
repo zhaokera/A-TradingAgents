@@ -1683,6 +1683,7 @@ def run_public_candidate_structured_batches(
         ),
     )[:MAX_PUBLIC_TECHNICAL_CLOSEST_REJECTIONS]
     structured_completed_count = sum(pipeline_complete(item) for item in candidates)
+    structured_incomplete_count = len(candidates) - structured_completed_count
     minimum_met = structured_completed_count >= DAILY_STRUCTURED_ANALYSIS_MINIMUM
     return {
         "status": "ok" if minimum_met else "daily_structured_analysis_minimum_not_met",
@@ -1706,6 +1707,7 @@ def run_public_candidate_structured_batches(
             "daily_minimum": DAILY_STRUCTURED_ANALYSIS_MINIMUM,
             "planned_count": min(DAILY_STRUCTURED_ANALYSIS_MINIMUM, len(candidates)),
             "structured_completed_count": structured_completed_count,
+            "structured_incomplete_count": structured_incomplete_count,
             "minimum_met": minimum_met,
             "supplemental_batches_used": max(0, len(raw_batch_results) - 1),
             "input_exhausted": len(raw_batch_results) == len(batches),

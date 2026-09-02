@@ -7214,6 +7214,117 @@ def test_public_workflow_reuses_snapshot_and_batches_quotes_and_deep_check_once(
     assert market_contexts == [context]
 
 
+def test_public_workflow_preserves_one_hundred_incomplete_structured_candidates(
+    monkeypatch,
+):
+    context = make_opportunity_market_context(
+        public_snapshot_fetcher=lambda **_kwargs: {
+            "status": "ok",
+            "source": "test.public",
+            "rows": [],
+        }
+    )
+    discovery = _make_public_research_discovery(candidate_count=100)
+    for definition in discovery["definitions"]:
+        code = definition["code"]
+        quote = discovery["quote_map"][code]
+        definition.update(
+            {
+                "pct_change": 1.0,
+                "tencent_pct_change": 1.0,
+                "amount_percentile": 0.8,
+                "move_quality": 0.8,
+                "public_score": 0.8,
+                "turnover_rate": 2.0,
+                "volume_ratio": 1.2,
+                "amplitude": 3.0,
+                "tencent_move_quality": 0.8,
+                "turnover_quality": 0.8,
+                "volume_ratio_quality": 0.8,
+                "amplitude_quality": 0.8,
+                "tencent_amount_percentile": 0.8,
+                "tencent_market_cap_percentile": 0.8,
+                "tencent_score": 0.8,
+            }
+        )
+        quote.update(
+            {
+                "pct_chg": 1.0,
+                "turnover_rate": 2.0,
+                "volume_ratio": 1.2,
+                "amplitude": 3.0,
+            }
+        )
+    discovery["candidate_discovery"]["eligible_count"] = 810
+    discovery["candidate_discovery"]["tencent_minimum_verified_count"] = 80
+    discovery["candidate_discovery"]["tencent_rank_population_count"] = 100
+    deep_result = _make_public_deep_check(discovery)
+    deep_result.update(
+        {
+            "status": "daily_structured_analysis_minimum_not_met",
+            "daily_analysis": {
+                "daily_minimum": 100,
+                "planned_count": 100,
+                "structured_completed_count": 0,
+                "structured_incomplete_count": 100,
+                "minimum_met": False,
+                "supplemental_batches_used": 1,
+                "input_exhausted": True,
+            },
+            "batch_audit": {"completed_batch_count": 2},
+        }
+    )
+
+    def fake_discovery(_snapshot, *, fetch_quotes, now):
+        assert now is context.now
+        fetch_quotes(list(discovery["quote_map"]))
+        return discovery
+
+    monkeypatch.setattr(
+        holdings_cli_module,
+        "discover_public_candidate_universe",
+        fake_discovery,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        holdings_cli_module,
+        "fetch_tencent_quotes_batched_sync",
+        lambda codes, *, timeout: {
+            "status": "ok",
+            "requested_codes": list(codes),
+            "rows": [],
+            "error_type": None,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        holdings_cli_module,
+        "run_public_candidate_structured_batches",
+        lambda *_args, **_kwargs: deepcopy(deep_result),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        holdings_cli_module,
+        "build_market_status_payload",
+        _fake_public_market_status,
+    )
+
+    payload = holdings_cli_module._build_public_full_market_research_payload(
+        context=context,
+        database_status={"status": "connected"},
+    )
+
+    assert payload["ok"] is True
+    assert len(payload["data"]["candidates"]) == 100
+    daily = payload["data"]["candidate_discovery"][
+        "daily_structured_analysis"
+    ]
+    assert daily["structured_completed_count"] == 0
+    assert daily["structured_incomplete_count"] == 100
+    assert daily["input_exhausted"] is True
+    assert daily["researchable_input_count"] == 100
+
+
 def test_public_workflow_deep_timeout_is_successful_zero_share_observation(
     monkeypatch,
 ):

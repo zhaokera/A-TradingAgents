@@ -8072,11 +8072,18 @@ def _orchestrate_public_full_market_research_payload(
                 )
             daily_analysis = deep_check_result.get("daily_analysis")
             if isinstance(daily_analysis, dict):
-                eligible_count = int(candidate_discovery.get("eligible_count") or 0)
                 public_preselected_count = len(definitions)
-                input_exhausted = public_preselected_count >= eligible_count
+                researchable_input_count = int(
+                    candidate_discovery.get("tencent_rank_population_count")
+                    or public_preselected_count
+                )
+                input_exhausted = (
+                    public_preselected_count >= researchable_input_count
+                )
                 daily_analysis["input_exhausted"] = input_exhausted
-                daily_analysis["researchable_input_count"] = eligible_count
+                daily_analysis["researchable_input_count"] = (
+                    researchable_input_count
+                )
                 daily_analysis["ranked_input_count"] = public_preselected_count
                 candidate_discovery["daily_structured_analysis"] = deepcopy(
                     daily_analysis
@@ -8087,6 +8094,8 @@ def _orchestrate_public_full_market_research_payload(
                 if (
                     daily_analysis.get("minimum_met") is not True
                     and not input_exhausted
+                    and len(deep_check_result.get("candidates") or [])
+                    < int(daily_analysis.get("daily_minimum") or 0)
                 ):
                     deep_check_result = {
                         "status": "technical_deep_check_failed",

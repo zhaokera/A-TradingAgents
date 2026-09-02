@@ -790,6 +790,7 @@ def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
         "daily_minimum": 100,
         "planned_count": 100,
         "structured_completed_count": 100,
+        "structured_incomplete_count": 0,
         "minimum_met": True,
         "supplemental_batches_used": 2,
         "input_exhausted": True,
@@ -872,6 +873,7 @@ def test_structured_batches_keep_notice_unavailable_candidates_as_incomplete():
 
     assert result["status"] == "daily_structured_analysis_minimum_not_met"
     assert result["daily_analysis"]["structured_completed_count"] == 80
+    assert result["daily_analysis"]["structured_incomplete_count"] == 20
     assert result["daily_analysis"]["minimum_met"] is False
     assert len(result["candidates"]) == 100
     assert result["notice_review"]["status"] == "partial_unavailable"
