@@ -1450,6 +1450,16 @@ def run_public_candidate_structured_batches(
         "batches": batch_items,
     }
     if failed:
+        if all(
+            item.get("status") == "technical_deep_check_timeout"
+            for item in failed
+        ):
+            return {
+                "status": "technical_deep_check_timeout",
+                "mode": "structured_batches",
+                "candidates": [],
+                "batch_audit": batch_audit,
+            }
         return {
             "status": "technical_deep_check_failed",
             "error_type": "StructuredBatchIncomplete",

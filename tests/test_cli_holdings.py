@@ -7296,6 +7296,37 @@ def test_public_technical_funnel_timeout_fails_closed_without_partial_candidates
     assert caught.value.exit_code == 4
 
 
+def test_public_structured_batch_timeout_fails_closed_with_batch_audit():
+    discovery = _make_public_research_discovery(candidate_count=1)
+    batch_audit = {
+        "planned_batch_count": 5,
+        "attempted_batch_count": 2,
+        "completed_batch_count": 0,
+        "failed_batch_count": 2,
+        "retry_count": 2,
+        "batches": [],
+    }
+
+    with pytest.raises(CLIError) as caught:
+        holdings_cli_module.build_public_research_opportunities_payload(
+            discovery,
+            {
+                "status": "technical_deep_check_timeout",
+                "mode": "structured_batches",
+                "candidates": [],
+                "batch_audit": batch_audit,
+            },
+            context=make_hydrated_opportunity_market_context(),
+        )
+
+    assert caught.value.code == "technical_deep_check_timeout"
+    assert caught.value.stage == "technical_deep_check"
+    assert caught.value.exit_code == 4
+    assert caught.value.details["candidate_discovery"][
+        "structured_batch_audit"
+    ] == batch_audit
+
+
 def test_public_workflow_preserves_technical_funnel_timeout_error(monkeypatch):
     context = make_opportunity_market_context(
         public_snapshot_fetcher=lambda **_kwargs: {

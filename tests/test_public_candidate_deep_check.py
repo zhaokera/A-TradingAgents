@@ -858,6 +858,36 @@ def test_structured_batches_retry_only_failed_batch_and_fail_closed_if_below_min
     assert result["batch_audit"]["failed_batch_count"] == 0
 
 
+def test_structured_batches_preserve_timeout_status_and_batch_audit():
+    definitions = [_definition(f"{600000 + index:06d}") for index in range(120)]
+    quote_map = {item["code"]: _quote(item["code"]) for item in definitions}
+
+    result = deep_check.run_public_candidate_structured_batches(
+        definitions,
+        quote_map,
+        benchmark_trade_date="2026-09-01",
+        command_remaining_seconds=120,
+        batch_size=40,
+        max_batch_attempts=2,
+        batch_runner=lambda *_args, **_kwargs: {
+            "status": "technical_deep_check_timeout",
+            "mode": "technical_funnel",
+            "candidates": [],
+        },
+    )
+
+    assert result["status"] == "technical_deep_check_timeout"
+    assert result["mode"] == "structured_batches"
+    assert result["batch_audit"]["attempted_batch_count"] == 3
+    assert result["batch_audit"]["failed_batch_count"] == 3
+    assert result["batch_audit"]["retry_count"] == 3
+    assert all(
+        attempt["status"] == "technical_deep_check_timeout"
+        for batch in result["batch_audit"]["batches"]
+        for attempt in batch["attempts"]
+    )
+
+
 def test_structured_batches_resume_completed_checkpoint_without_refetching():
     definitions = [_definition(f"{600000 + index:06d}") for index in range(120)]
     quote_map = {item["code"]: _quote(item["code"]) for item in definitions}

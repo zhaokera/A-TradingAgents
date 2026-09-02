@@ -6410,12 +6410,35 @@ def build_public_research_opportunities_payload(
                     dict(raw_batch_audit)
                 )
         elif deep_status == "technical_deep_check_timeout":
-            if deep_check_result.get("mode") == "technical_funnel":
+            timeout_mode = deep_check_result.get("mode")
+            if timeout_mode in {"technical_funnel", "structured_batches"}:
+                raw_batch_audit = deep_check_result.get("batch_audit")
+                if (
+                    timeout_mode == "structured_batches"
+                    and isinstance(raw_batch_audit, Mapping)
+                ):
+                    candidate_discovery["structured_batch_audit"] = deepcopy(
+                        dict(raw_batch_audit)
+                    )
+                    candidate_discovery["stage_sources"][
+                        "structured_batches"
+                    ] = {
+                        "provider": "bounded_structured_batch_pipeline",
+                        "status": "timeout",
+                    }
                 raise CLIError(
-                    "公开候选技术初筛超时，未返回不完整候选",
+                    (
+                        "公开候选结构化分析批次超时，未返回不完整候选"
+                        if timeout_mode == "structured_batches"
+                        else "公开候选技术初筛超时，未返回不完整候选"
+                    ),
                     code="technical_deep_check_timeout",
                     exit_code=4,
                     stage="technical_deep_check",
+                    details={
+                        "stage": "technical_deep_check",
+                        "candidate_discovery": deepcopy(candidate_discovery),
+                    },
                 )
             technical_status = "timeout"
             earnings_status = "not_called_technical_timeout"
