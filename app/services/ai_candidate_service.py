@@ -47,6 +47,7 @@ from app.services.market_session_policy_service import (
 from app.services.notifications_service import get_notifications_service
 from app.services.tencent_quote_service import (
     TencentQuoteService,
+    assess_tencent_research_quote_freshness,
     get_tencent_quote_service,
 )
 from app.services.daily_structured_analysis import (
@@ -1226,6 +1227,15 @@ def normalize_ai_candidate(
             **(
                 {"trade_date": quote.get("trade_date")}
                 if quote.get("trade_date") is not None
+                else {}
+            ),
+            **(
+                {
+                    "research_freshness": deepcopy(
+                        dict(quote.get("research_freshness") or {})
+                    )
+                }
+                if isinstance(quote.get("research_freshness"), Mapping)
                 else {}
             ),
         },
@@ -2510,6 +2520,13 @@ class AICandidateService:
             )
             benchmark["checked_at"] = checked_at
         favorite_codes = await self._favorites.get_favorite_codes(user_id)
+        discovery = document.get("candidate_discovery")
+        discovery = discovery if isinstance(discovery, Mapping) else {}
+        benchmark_trade_date = str(
+            discovery.get("benchmark_trade_date")
+            or discovery.get("trade_date")
+            or ""
+        )
         plan_expires_at = document.get("plan_expires_at")
         if isinstance(plan_expires_at, datetime):
             if plan_expires_at.tzinfo is None:
@@ -2574,6 +2591,14 @@ class AICandidateService:
                     ),
                 }
             )
+            if benchmark_trade_date:
+                current_quote["research_freshness"] = (
+                    assess_tencent_research_quote_freshness(
+                        current_quote,
+                        benchmark_trade_date=benchmark_trade_date,
+                        now=refresh_now,
+                    )
+                )
             quote_policy = await self._market_session.quote_status(
                 current_quote,
                 now=refresh_now,

@@ -5569,6 +5569,11 @@ def test_public_quote_snapshot_preserves_tencent_valuation_evidence():
             "pb_ratio": 4.7,
             "circ_mv": 8_658_000_000.0,
             "total_mv": 11_468_000_000.0,
+            "research_freshness": {
+                "data_complete": True,
+                "status": "fresh",
+                "trade_date": "2026-07-20",
+            },
         },
         {"code": "300113", "name": "顺网科技"},
     )
@@ -5579,6 +5584,11 @@ def test_public_quote_snapshot_preserves_tencent_valuation_evidence():
     assert sanitized["pb_ratio"] == 4.7
     assert sanitized["circ_mv"] == 8_658_000_000.0
     assert sanitized["total_mv"] == 11_468_000_000.0
+    assert sanitized["research_freshness"] == {
+        "data_complete": True,
+        "status": "fresh",
+        "trade_date": "2026-07-20",
+    }
 
 
 def _make_public_deep_check(

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 
 DAILY_STRUCTURED_ANALYSIS_MINIMUM = 100
+_COMPLETE_RESEARCH_QUOTE_STATUSES = {"fresh", "midday_snapshot"}
 _UNUSABLE_QUOTE_STATUSES = {
     "calendar_unknown",
     "future_provider_timestamp",
@@ -54,6 +55,10 @@ def _date_from_timestamp(value: Any) -> Optional[str]:
 
 def _quote_trade_date(candidate: Mapping[str, Any]) -> Optional[str]:
     quote = _mapping(candidate.get("quote"))
+    research_freshness = _mapping(quote.get("research_freshness"))
+    research_trade_date = research_freshness.get("trade_date")
+    if isinstance(research_trade_date, str) and research_trade_date:
+        return research_trade_date
     explicit = quote.get("trade_date")
     if isinstance(explicit, str) and explicit:
         return explicit
@@ -92,17 +97,26 @@ def _candidate_completion(
 
     raw_freshness = quote.get("freshness")
     freshness = _mapping(raw_freshness)
-    quote_status = str(
-        freshness.get("status")
-        or (raw_freshness if isinstance(raw_freshness, str) else None)
-        or quote.get("status")
-        or "ok"
-    )
+    research_freshness = _mapping(quote.get("research_freshness"))
+    if research_freshness:
+        quote_evidence_available = (
+            research_freshness.get("data_complete") is True
+            and str(research_freshness.get("status") or "")
+            in _COMPLETE_RESEARCH_QUOTE_STATUSES
+        )
+    else:
+        quote_status = str(
+            freshness.get("status")
+            or (raw_freshness if isinstance(raw_freshness, str) else None)
+            or quote.get("status")
+            or "ok"
+        )
+        quote_evidence_available = quote_status not in _UNUSABLE_QUOTE_STATUSES
     quote_date = _quote_trade_date(candidate)
     missing: List[str] = []
     if not _positive_number(quote.get("price")):
         missing.append("quote_price_invalid")
-    if quote_status in _UNUSABLE_QUOTE_STATUSES:
+    if not quote_evidence_available:
         missing.append("quote_evidence_unavailable")
     if quote_date != trade_date:
         missing.append("quote_trade_date_mismatch")

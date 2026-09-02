@@ -739,6 +739,7 @@ def verify_and_rank_tencent_candidates(
                 "amount": amount,
                 "trade_at": freshness.get("trade_at"),
                 "trade_date": freshness.get("trade_date"),
+                "research_freshness": _json_safe(freshness),
             }
         )
         quote_map[code] = safe_quote

@@ -124,6 +124,30 @@ def test_daily_structured_analysis_rejects_unusable_structured_quote_freshness()
     assert result["incomplete_reasons"] == {"quote_evidence_unavailable": 1}
 
 
+def test_daily_structured_analysis_accepts_same_day_research_quote_after_close():
+    candidate = _candidate(1)
+    candidate["quote"]["freshness"] = {
+        "status": "off_session",
+        "actionable": False,
+    }
+    candidate["quote"]["research_freshness"] = {
+        "status": "fresh",
+        "data_complete": True,
+        "trade_date": TRADE_DATE,
+    }
+
+    result = build_daily_structured_analysis(
+        [candidate],
+        discovery=_discovery(),
+        trade_date=TRADE_DATE,
+        daily_minimum=1,
+    )
+
+    assert result["minimum_met"] is True
+    assert result["completed_count"] == 1
+    assert result["incomplete_reasons"] == {}
+
+
 def test_daily_minimum_gate_closes_execution_without_discarding_research():
     document = {
         "candidates": [

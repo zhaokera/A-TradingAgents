@@ -1346,6 +1346,11 @@ def test_tencent_hard_filters_accept_all_inclusive_boundaries():
     assert result["tencent_verified_count"] == 8
     assert result["tencent_rank_population_count"] == 8
     assert result["selected_count"] == 8
+    assert all(
+        quote["research_freshness"]["data_complete"] is True
+        and quote["research_freshness"]["status"] == "fresh"
+        for quote in result["quote_map"].values()
+    )
 
 
 def test_tencent_volume_ratio_tiers_are_scored_without_rejecting_missing_values():

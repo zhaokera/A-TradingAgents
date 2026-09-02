@@ -1977,6 +1977,10 @@ def _quote_snapshot(quote: Dict[str, Any], definition: Dict[str, Any]) -> Dict[s
         "intraday_range_pct": intraday_range_pct,
         "price_plan_adjustment_required": corporate_action_marker is not None,
     }
+    if isinstance(quote.get("research_freshness"), Mapping):
+        snapshot["research_freshness"] = deepcopy(
+            dict(quote["research_freshness"])
+        )
     snapshot["freshness"] = assess_cn_quote_freshness(snapshot)
     if corporate_action_marker:
         snapshot["corporate_action_marker"] = corporate_action_marker
@@ -4499,6 +4503,20 @@ _PUBLIC_QUOTE_FRESHNESS_FIELDS = (
     "age_seconds",
     "session",
 )
+_PUBLIC_RESEARCH_QUOTE_FRESHNESS_FIELDS = (
+    "data_complete",
+    "status",
+    "reason",
+    "source",
+    "trade_at",
+    "provider_updated_at",
+    "quote_time_semantics",
+    "exchange_trade_time_verified",
+    "trade_date",
+    "benchmark_trade_date",
+    "age_seconds",
+    "session",
+)
 _PUBLIC_DISCOVERY_DEFINITION_SCALAR_FIELDS = (
     "code",
     "name",
@@ -4788,6 +4806,13 @@ def _sanitize_public_candidate_quote(value: Any) -> Dict[str, Any]:
         sanitized["freshness"] = _copy_public_scalar_fields(
             value.get("freshness"),
             _PUBLIC_QUOTE_FRESHNESS_FIELDS,
+        )
+    if isinstance(value, Mapping) and isinstance(
+        value.get("research_freshness"), Mapping
+    ):
+        sanitized["research_freshness"] = _copy_public_scalar_fields(
+            value.get("research_freshness"),
+            _PUBLIC_RESEARCH_QUOTE_FRESHNESS_FIELDS,
         )
     return sanitized
 
