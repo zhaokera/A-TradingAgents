@@ -7,7 +7,7 @@ to the holdings CLI surface while those builders are extracted incrementally.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 
 def run_candidate_research(
@@ -16,6 +16,10 @@ def run_candidate_research(
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
     board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
+    research_progress_callback: Optional[
+        Callable[[Dict[str, Any]], None]
+    ] = None,
+    resume_checkpoint: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run the shared, account-independent full-market research workflow."""
 
@@ -27,4 +31,6 @@ def run_candidate_research(
         excluded_code_reasons=excluded_code_reasons,
         board_exclusion_reasons=board_exclusion_reasons,
         star_market_exclusion_reason=star_market_exclusion_reason,
+        research_progress_callback=research_progress_callback,
+        resume_checkpoint=resume_checkpoint,
     )

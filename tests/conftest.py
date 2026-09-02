@@ -46,6 +46,7 @@ MAINTAINED_ROOT_TESTS = {
     "test_ai_candidate_service.py",
     "test_auth_cli_session.py",
     "test_candidate_discovery_service.py",
+    "test_candidate_research_pipeline.py",
     "test_company_profile_enrichment_service.py",
     "test_daily_decision_service.py",
     "test_daily_structured_analysis.py",
