@@ -297,6 +297,8 @@ _FAILURE_DISCOVERY_AUDIT_FIELDS = (
     "stage_sources",
     "daily_structured_analysis",
     "structured_batch_audit",
+    "technical_deep_check_status",
+    "technical_deep_check_error_type",
 )
 
 

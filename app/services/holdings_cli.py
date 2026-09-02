@@ -4441,6 +4441,8 @@ _PUBLIC_CANDIDATE_DISCOVERY_SCALAR_FIELDS = (
     "tencent_rank_population_count",
     "selected_count",
     "technical_checked_count",
+    "technical_deep_check_status",
+    "technical_deep_check_error_type",
     "technical_screened_count",
     "technical_passed_count",
     "technical_selected_count",
@@ -6471,6 +6473,19 @@ def build_public_research_opportunities_payload(
                 }
                 else "technical_deep_check"
             )
+            candidate_discovery["technical_deep_check_status"] = str(
+                deep_status or "technical_deep_check_failed"
+            )
+            candidate_discovery["technical_deep_check_error_type"] = error_code
+            raw_batch_audit = (
+                deep_check_result.get("batch_audit")
+                if isinstance(deep_check_result, Mapping)
+                else None
+            )
+            if isinstance(raw_batch_audit, Mapping):
+                candidate_discovery["structured_batch_audit"] = deepcopy(
+                    dict(raw_batch_audit)
+                )
             raise CLIError(
                 (
                     "公开候选业绩复核不可用"
@@ -6480,6 +6495,10 @@ def build_public_research_opportunities_payload(
                 code=error_code,
                 exit_code=4,
                 stage=error_stage,
+                details={
+                    "stage": error_stage,
+                    "candidate_discovery": deepcopy(candidate_discovery),
+                },
             )
 
     if "earnings_forecast_review" not in candidate_discovery["stage_sources"]:
@@ -8039,6 +8058,18 @@ def _orchestrate_public_full_market_research_payload(
             )
         )
         if isinstance(deep_check_result, dict):
+            candidate_discovery["technical_deep_check_status"] = str(
+                deep_check_result.get("status") or "invalid_result"
+            )
+            if deep_check_result.get("error_type") is not None:
+                candidate_discovery["technical_deep_check_error_type"] = str(
+                    deep_check_result.get("error_type")
+                )
+            batch_audit = deep_check_result.get("batch_audit")
+            if isinstance(batch_audit, Mapping):
+                candidate_discovery["structured_batch_audit"] = deepcopy(
+                    dict(batch_audit)
+                )
             daily_analysis = deep_check_result.get("daily_analysis")
             if isinstance(daily_analysis, dict):
                 eligible_count = int(candidate_discovery.get("eligible_count") or 0)
@@ -8089,11 +8120,20 @@ def _public_discovery_failure_details(
         if isinstance(discovery_result, Mapping)
         else None
     )
-    if not isinstance(raw_candidate_discovery, Mapping) and isinstance(
-        exc.details,
-        Mapping,
-    ):
-        raw_candidate_discovery = exc.details.get("candidate_discovery")
+    exception_discovery = (
+        exc.details.get("candidate_discovery")
+        if isinstance(exc.details, Mapping)
+        else None
+    )
+    if isinstance(exception_discovery, Mapping):
+        raw_candidate_discovery = {
+            **(
+                dict(raw_candidate_discovery)
+                if isinstance(raw_candidate_discovery, Mapping)
+                else {}
+            ),
+            **dict(exception_discovery),
+        }
     candidate_discovery = (
         deepcopy(dict(raw_candidate_discovery))
         if isinstance(raw_candidate_discovery, Mapping)

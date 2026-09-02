@@ -6944,7 +6944,15 @@ def test_opportunities_command_normalizes_public_deep_check_failure_details(monk
         }
     )
     discovery = _make_public_research_discovery(candidate_count=1)
-    expected_candidate_discovery = deepcopy(discovery["candidate_discovery"])
+    original_candidate_discovery = deepcopy(discovery["candidate_discovery"])
+    expected_candidate_discovery = deepcopy(original_candidate_discovery)
+    expected_candidate_discovery.update(
+        {
+            "technical_deep_check_status": "technical_deep_check_failed",
+            "technical_deep_check_error_type": "technical_deep_check_failed",
+            "provider_errors": [],
+        }
+    )
     monkeypatch.setattr(
         holdings_cli_module,
         "build_opportunity_market_context",
@@ -6987,7 +6995,7 @@ def test_opportunities_command_normalizes_public_deep_check_failure_details(monk
             },
         },
     }
-    assert discovery["candidate_discovery"] == expected_candidate_discovery
+    assert discovery["candidate_discovery"] == original_candidate_discovery
 
 
 def test_public_builder_preserves_retryable_technical_history_failure(monkeypatch):
@@ -7022,9 +7030,12 @@ def test_public_builder_preserves_retryable_technical_history_failure(monkeypatc
 
     assert caught.value.code == "TechnicalHistoryFetchError"
     assert caught.value.stage == "technical_deep_check"
-    assert caught.value.details["candidate_discovery"] == (
-        discovery["candidate_discovery"]
-    )
+    assert caught.value.details["candidate_discovery"] == {
+        **discovery["candidate_discovery"],
+        "technical_deep_check_status": "technical_deep_check_failed",
+        "technical_deep_check_error_type": "TechnicalHistoryFetchError",
+        "provider_errors": [],
+    }
 
 
 def test_complete_public_scan_with_no_candidates_is_stdout_success(monkeypatch):
@@ -7325,6 +7336,82 @@ def test_public_structured_batch_timeout_fails_closed_with_batch_audit():
     assert caught.value.details["candidate_discovery"][
         "structured_batch_audit"
     ] == batch_audit
+
+
+def test_public_structured_batch_failure_preserves_diagnostic_audit():
+    discovery = _make_public_research_discovery(candidate_count=1)
+    batch_audit = {
+        "planned_batch_count": 5,
+        "attempted_batch_count": 2,
+        "completed_batch_count": 1,
+        "failed_batch_count": 1,
+        "retry_count": 1,
+        "batches": [
+            {
+                "batch_index": 1,
+                "status": "technical_deep_check_failed",
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "status": "technical_deep_check_failed",
+                        "error_type": "WorkerProcessError",
+                    }
+                ],
+            }
+        ],
+    }
+
+    with pytest.raises(CLIError) as caught:
+        holdings_cli_module.build_public_research_opportunities_payload(
+            discovery,
+            {
+                "status": "technical_deep_check_failed",
+                "error_type": "StructuredBatchIncomplete",
+                "candidates": [],
+                "batch_audit": batch_audit,
+            },
+            context=make_hydrated_opportunity_market_context(),
+        )
+
+    assert caught.value.code == "StructuredBatchIncomplete"
+    assert caught.value.details["candidate_discovery"][
+        "technical_deep_check_error_type"
+    ] == "StructuredBatchIncomplete"
+    assert caught.value.details["candidate_discovery"][
+        "structured_batch_audit"
+    ] == batch_audit
+
+
+def test_public_failure_details_prefer_richer_exception_diagnostic():
+    raw_discovery = _make_public_research_discovery(candidate_count=1)
+    candidate_discovery = raw_discovery["candidate_discovery"]
+    richer = {
+        **candidate_discovery,
+        "technical_deep_check_error_type": "StructuredBatchIncomplete",
+        "structured_batch_audit": {"failed_batch_count": 1},
+    }
+    exc = CLIError(
+        "公开候选技术深检不可用",
+        code="StructuredBatchIncomplete",
+        exit_code=4,
+        stage="technical_deep_check",
+        details={
+            "stage": "technical_deep_check",
+            "candidate_discovery": richer,
+        },
+    )
+
+    details = holdings_cli_module._public_discovery_failure_details(
+        exc,
+        raw_discovery,
+    )
+
+    assert details["candidate_discovery"][
+        "technical_deep_check_error_type"
+    ] == "StructuredBatchIncomplete"
+    assert details["candidate_discovery"]["structured_batch_audit"] == {
+        "failed_batch_count": 1
+    }
 
 
 def test_public_workflow_preserves_technical_funnel_timeout_error(monkeypatch):
