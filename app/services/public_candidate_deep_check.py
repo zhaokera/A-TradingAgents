@@ -1511,6 +1511,38 @@ def run_public_candidate_structured_batches(
             for item in notice.get("results") or []:
                 if isinstance(item, Mapping):
                     notice_by_code[str(item.get("code") or "")] = deepcopy(dict(item))
+        elif isinstance(notice, Mapping) and notice.get("status") == "unavailable":
+            batch_error_type = str(
+                notice.get("error_type") or "NoticeEvidenceUnavailable"
+            )
+            for candidate in result.get("candidates") or []:
+                if not isinstance(candidate, Mapping):
+                    continue
+                code = str(candidate.get("code") or "")
+                if code not in definitions_by_code:
+                    continue
+                unavailable_notice = {
+                    "code": code,
+                    "name": definitions_by_code[code].get("name"),
+                    "status": "unavailable",
+                    "source": str(notice.get("source") or NOTICE_REVIEW_SOURCE),
+                    "error_type": batch_error_type,
+                    "total_notice_count": 0,
+                    "returned_notice_count": 0,
+                    "truncated": False,
+                    "attention_tags": [],
+                    "manual_review_required": True,
+                    "notices": [],
+                }
+                notice_by_code[code] = unavailable_notice
+                saved_candidate = candidate_by_code.get(code)
+                saved_review = (
+                    saved_candidate.get("structured_review")
+                    if isinstance(saved_candidate, Mapping)
+                    else None
+                )
+                if isinstance(saved_review, dict):
+                    saved_review["notice"] = deepcopy(unavailable_notice)
         pipeline = result.get("pipeline_metrics")
         if isinstance(pipeline, Mapping):
             for key, value in pipeline.items():
@@ -1587,14 +1619,30 @@ def run_public_candidate_structured_batches(
         ),
         "results": final_earnings_results,
     }
-    if notice_template and all(code in notice_by_code for code in selected_codes):
+    if all(code in notice_by_code for code in selected_codes):
         final_notice_results = [notice_by_code[code] for code in selected_codes]
+        unavailable_notice_count = sum(
+            item.get("status") == "unavailable"
+            for item in final_notice_results
+        )
+        notice_status = (
+            "unavailable"
+            if unavailable_notice_count == len(final_notice_results)
+            else "partial_unavailable"
+            if unavailable_notice_count
+            else "ok"
+        )
         notice_review = {
             **{
                 key: notice_template.get(key)
                 for key in ("status", "source", "start_date", "end_date", "lookback_calendar_days")
             },
+            "status": notice_status,
+            "source": str(
+                notice_template.get("source") or NOTICE_REVIEW_SOURCE
+            ),
             "reviewed_count": len(final_notice_results),
+            "unavailable_count": unavailable_notice_count,
             "codes_with_notices_count": sum(item.get("status") == "notices_found" for item in final_notice_results),
             "manual_review_code_count": sum(item.get("manual_review_required") is True for item in final_notice_results),
             "total_notice_count": sum(int(item.get("total_notice_count") or 0) for item in final_notice_results),

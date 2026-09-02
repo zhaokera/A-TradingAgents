@@ -798,6 +798,90 @@ def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
     assert result["batch_audit"]["failed_batch_count"] == 0
 
 
+def test_structured_batches_keep_notice_unavailable_candidates_as_incomplete():
+    definitions = [_definition(f"{600000 + index:06d}") for index in range(120)]
+    quote_map = {item["code"]: _quote(item["code"]) for item in definitions}
+    unavailable_first_code = definitions[40]["code"]
+
+    def fake_batch(batch, _batch_quotes, **_kwargs):
+        codes = [item["code"] for item in batch]
+        notice_available = codes[0] != unavailable_first_code
+        notice = (
+            _notice_review(codes)
+            if notice_available
+            else {
+                "status": "unavailable",
+                "source": "akshare.eastmoney.stock_notice_report",
+                "error_type": "ReadTimeout",
+                "results": [],
+            }
+        )
+        return {
+            "status": "ok",
+            "candidates": [
+                {
+                    "code": code,
+                    "structured_review": {
+                        "technical": {"status": "passed"},
+                        "earnings": {"status": "clear"},
+                        "notice": (
+                            {"status": "no_recent_notices"}
+                            if notice_available
+                            else {}
+                        ),
+                        "corporate_action": {
+                            "status": "no_upcoming_corporate_action"
+                        },
+                        "hard_risk_status": (
+                            "clear" if notice_available else "blocked"
+                        ),
+                        "hard_risk_reasons": (
+                            []
+                            if notice_available
+                            else ["notice_evidence_unavailable"]
+                        ),
+                    },
+                }
+                for code in codes
+            ],
+            "technical_screen": {
+                "status": "ok",
+                "screened_count": len(codes),
+                "passed_count": len(codes),
+                "selected_count": len(codes),
+                "selected_codes": codes,
+                "deep_research_selected_count": 15,
+                "deep_research_selected_codes": codes[:15],
+                "status_counts": {"ok": len(codes)},
+                "closest_rejection_count": 0,
+                "closest_rejections": [],
+            },
+            "earnings_screen": _earnings_screen(codes),
+            "notice_review": notice,
+            "pipeline_metrics": {},
+        }
+
+    result = deep_check.run_public_candidate_structured_batches(
+        definitions,
+        quote_map,
+        benchmark_trade_date="2026-09-01",
+        command_remaining_seconds=120,
+        batch_size=40,
+        batch_runner=fake_batch,
+    )
+
+    assert result["status"] == "daily_structured_analysis_minimum_not_met"
+    assert result["daily_analysis"]["structured_completed_count"] == 80
+    assert result["daily_analysis"]["minimum_met"] is False
+    assert len(result["candidates"]) == 100
+    assert result["notice_review"]["status"] == "partial_unavailable"
+    assert result["notice_review"]["unavailable_count"] == 20
+    assert sum(
+        item["structured_review"]["notice"]["status"] == "unavailable"
+        for item in result["candidates"]
+    ) == 20
+
+
 def test_structured_batches_retry_only_failed_batch_and_fail_closed_if_below_minimum():
     definitions = [_definition(f"{600000 + index:06d}") for index in range(120)]
     quote_map = {item["code"]: _quote(item["code"]) for item in definitions}
