@@ -1,8 +1,6 @@
 import asyncio
 import json
-import sys
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1262,23 +1260,25 @@ def test_normalize_tencent_daily_bars_rejects_prices_outside_high_low_range():
 
 
 def test_fetch_tencent_daily_bars_uses_tx_qfq_contract(monkeypatch):
-    captured = {}
+    requests = []
 
-    class FakeFrame:
-        empty = False
+    class FakeResponse:
+        text = (
+            'kline_dayqfq={"code":0,"msg":"","data":{"sz000977":'
+            '{"qfqday":[["2026-07-08","9","10","10.2","8.9","100"],'
+            '["2026-07-09","10","11","11.2","9.8","120"]]}}}'
+        )
 
-        def to_dict(self, orient):
-            assert orient == "records"
-            return [
-                {"date": "2026-07-08", "open": 9, "close": 10, "high": 10.2, "low": 8.9},
-                {"date": "2026-07-09", "open": 10, "close": 11, "high": 11.2, "low": 9.8},
-            ]
+        def raise_for_status(self):
+            return None
 
-    def fake_history(**kwargs):
-        captured.update(kwargs)
-        return FakeFrame()
+    def fake_get(url, *, params, headers, timeout):
+        requests.append(
+            {"url": url, "params": params, "headers": headers, "timeout": timeout}
+        )
+        return FakeResponse()
 
-    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(stock_zh_a_hist_tx=fake_history))
+    monkeypatch.setattr(quote_service.requests, "get", fake_get)
 
     result = fetch_tencent_daily_bars_sync(
         "000977",
@@ -1288,28 +1288,31 @@ def test_fetch_tencent_daily_bars_uses_tx_qfq_contract(monkeypatch):
         db_factory=lambda: {},
     )
 
-    assert captured == {
-        "symbol": "sz000977",
-        "start_date": "20260701",
-        "end_date": "20260710",
-        "adjust": "qfq",
-    }
+    assert len(requests) == 1
+    assert requests[0]["url"] == quote_service.TENCENT_HISTORY_URL
+    assert requests[0]["params"]["param"] == (
+        "sz000977,day,2026-07-01,2026-07-10,320,qfq"
+    )
+    assert requests[0]["timeout"] == quote_service.TENCENT_HISTORY_REQUEST_TIMEOUT_SECONDS
     assert result["ok"] is True
     assert result["status"] == "ok"
     assert len(result["bars"]) == 2
 
 
 def test_fetch_tencent_daily_bars_returns_structured_insufficient_history(monkeypatch):
-    class FakeFrame:
-        empty = False
+    class FakeResponse:
+        text = (
+            'kline_dayqfq={"code":0,"data":{"sz000977":{"qfqday":'
+            '[["2026-07-09","10","11","11.2","9.8","100"]]}}}'
+        )
 
-        def to_dict(self, orient):
-            return [{"date": "2026-07-09", "open": 10, "close": 11, "high": 11.2, "low": 9.8}]
+        def raise_for_status(self):
+            return None
 
-    monkeypatch.setitem(
-        sys.modules,
-        "akshare",
-        SimpleNamespace(stock_zh_a_hist_tx=lambda **kwargs: FakeFrame()),
+    monkeypatch.setattr(
+        quote_service.requests,
+        "get",
+        lambda *_args, **_kwargs: FakeResponse(),
     )
 
     result = fetch_tencent_daily_bars_sync(
@@ -1341,7 +1344,7 @@ def test_fetch_tencent_daily_bars_retries_then_uses_fresh_audited_cache(monkeypa
         for index in range(60)
     ]
 
-    def failing_history(**kwargs):
+    def failing_history(*args, **kwargs):
         calls.append(kwargs)
         raise ConnectionError("upstream disconnected")
 
@@ -1360,11 +1363,7 @@ def test_fetch_tencent_daily_bars_retries_then_uses_fresh_audited_cache(monkeypa
             assert name == quote_service.TENCENT_HISTORY_CACHE_COLLECTION
             return Collection()
 
-    monkeypatch.setitem(
-        sys.modules,
-        "akshare",
-        SimpleNamespace(stock_zh_a_hist_tx=failing_history),
-    )
+    monkeypatch.setattr(quote_service.requests, "get", failing_history)
 
     result = fetch_tencent_daily_bars_sync(
         "000977",
@@ -1421,13 +1420,11 @@ def test_fetch_tencent_daily_bars_can_prefer_fresh_audited_cache(monkeypatch):
             assert name == quote_service.TENCENT_HISTORY_CACHE_COLLECTION
             return Collection()
 
-    monkeypatch.setitem(
-        sys.modules,
-        "akshare",
-        SimpleNamespace(
-            stock_zh_a_hist_tx=lambda **_kwargs: (_ for _ in ()).throw(
-                AssertionError("fresh preferred cache must avoid the network")
-            )
+    monkeypatch.setattr(
+        quote_service.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh preferred cache must avoid the network")
         ),
     )
 
@@ -1476,13 +1473,11 @@ def test_fetch_tencent_daily_bars_rejects_stale_cache(monkeypatch):
         def __getitem__(self, name):
             return Collection()
 
-    monkeypatch.setitem(
-        sys.modules,
-        "akshare",
-        SimpleNamespace(
-            stock_zh_a_hist_tx=lambda **kwargs: (_ for _ in ()).throw(
-                ConnectionError("upstream disconnected")
-            )
+    monkeypatch.setattr(
+        quote_service.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ConnectionError("upstream disconnected")
         ),
     )
 

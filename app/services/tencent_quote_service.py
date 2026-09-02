@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -31,6 +32,10 @@ QUOTE_MAX_FUTURE_SKEW_SECONDS = 60
 TENCENT_QUOTE_BATCH_SIZE = 40
 MAX_TENCENT_BATCHED_CODES = 400
 TENCENT_HISTORY_CACHE_COLLECTION = "candidate_technical_history_cache"
+TENCENT_HISTORY_URL = (
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+)
+TENCENT_HISTORY_REQUEST_TIMEOUT_SECONDS = 6.0
 TENCENT_HISTORY_FETCH_ATTEMPTS = 2
 TENCENT_HISTORY_RETRY_SECONDS = 0.25
 TENCENT_HISTORY_CACHE_MAX_AGE_SECONDS = 72 * 60 * 60
@@ -544,7 +549,7 @@ def fetch_tencent_daily_bars_sync(
     db_factory: Optional[Callable[[], Any]] = None,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> Dict[str, Any]:
-    """Fetch qfq daily bars from AKShare's Tencent history adapter."""
+    """Fetch qfq daily bars from Tencent with a bounded network timeout."""
     checked_at = now or datetime.now(timezone.utc)
     if checked_at.tzinfo is None:
         checked_at = checked_at.replace(tzinfo=timezone.utc)
@@ -642,19 +647,38 @@ def fetch_tencent_daily_bars_sync(
     fetch_error: Optional[Exception] = None
     for attempt in range(TENCENT_HISTORY_FETCH_ATTEMPTS):
         try:
-            import akshare as ak
-
-            frame = ak.stock_zh_a_hist_tx(
-                symbol=symbol,
-                start_date=start,
-                end_date=end,
-                adjust="qfq",
+            start_iso = datetime.strptime(start, "%Y%m%d").date().isoformat()
+            end_iso = datetime.strptime(end, "%Y%m%d").date().isoformat()
+            response = requests.get(
+                TENCENT_HISTORY_URL,
+                params={
+                    "_var": "kline_dayqfq",
+                    "param": f"{symbol},day,{start_iso},{end_iso},320,qfq",
+                    "r": "0.1",
+                },
+                headers=TENCENT_HEADERS,
+                timeout=TENCENT_HISTORY_REQUEST_TIMEOUT_SECONDS,
             )
-            raw_rows = (
-                []
-                if frame is None or getattr(frame, "empty", False)
-                else frame.to_dict("records")
-            )
+            response.raise_for_status()
+            raw_text = str(response.text or "")
+            assignment_at = raw_text.find("=")
+            if assignment_at < 0:
+                raise ValueError("invalid Tencent history response")
+            envelope = json.loads(raw_text[assignment_at + 1 :])
+            symbol_payload = envelope.get("data", {}).get(symbol, {})
+            raw_rows = symbol_payload.get("qfqday") or symbol_payload.get("day") or []
+            raw_rows = [
+                {
+                    "date": row[0],
+                    "open": row[1],
+                    "close": row[2],
+                    "high": row[3],
+                    "low": row[4],
+                    "amount": row[5] if len(row) > 5 else None,
+                }
+                for row in raw_rows
+                if isinstance(row, (list, tuple)) and len(row) >= 5
+            ]
             bars = normalize_tencent_daily_bars(raw_rows)
             fetch_error = None
             break
