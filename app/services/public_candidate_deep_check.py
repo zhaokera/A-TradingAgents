@@ -43,6 +43,7 @@ from app.services.public_candidate_notice_review import (
     review_public_candidate_notices,
     validate_public_candidate_notice_review,
 )
+from app.services.candidate_research_priority import research_account_priority, research_plan_account_fit
 
 
 logger = logging.getLogger(__name__)
@@ -1206,6 +1207,7 @@ def run_public_candidate_technical_funnel(
             "source": str(raw_notice_review.get("source") or NOTICE_REVIEW_SOURCE),
             "error_type": raw_notice_review.get("error_type"),
             "results": [],
+            "provider_attempts": deepcopy(raw_notice_review.get("provider_attempts") or []),
         }
     else:
         notice_review = {
@@ -1431,6 +1433,7 @@ def run_public_candidate_structured_batches(
             "last_code": batch_codes[-1] if batch_codes else None,
             "status": str(result.get("status") or "invalid_result"),
             "attempts": attempts,
+            "notice_provider_attempts": deepcopy((result.get("notice_review") or {}).get("provider_attempts") or []),
         }
         batch_items.append(audit)
         if result.get("status") != "ok":
@@ -1556,6 +1559,10 @@ def run_public_candidate_structured_batches(
     ordered_passing_codes = [
         item["code"] for item in selected_definitions if item["code"] in candidate_by_code
     ]
+    for code in ordered_passing_codes:
+        candidate_by_code[code]["research_account_fit"] = research_plan_account_fit(
+            candidate_by_code[code], definitions_by_code[code])
+    ordered_passing_codes.sort(key=lambda code: research_account_priority(candidate_by_code[code]))
     structurally_complete_codes = [
         code for code in ordered_passing_codes if pipeline_complete(candidate_by_code[code])
     ]
@@ -1572,7 +1579,7 @@ def run_public_candidate_structured_batches(
         structured_review = (
             structured_review if isinstance(structured_review, Mapping) else {}
         )
-        if structured_review.get("hard_risk_status") != "blocked":
+        if structured_review.get("hard_risk_status") != "blocked" and not research_account_priority(candidate_by_code[code]):
             deep_codes.append(code)
         if len(deep_codes) >= MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES:
             break
@@ -1716,6 +1723,11 @@ def run_public_candidate_structured_batches(
         "pipeline_metrics": {
             **dict(metrics),
             **{key: round(value, 6) for key, value in metric_seconds.items()},
+            "rolling_pool_capacity": MAX_PUBLIC_ROLLING_POOL_CANDIDATES,
+            "deep_research_capacity": MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES,
+            "technical_worker_count": sum(sorted(
+                [int((item.get("pipeline_metrics") or {}).get("technical_worker_count") or 0)
+                 for item in successful_results], reverse=True)[:STRUCTURED_BATCH_WORKERS]),
             "structured_batch_count": len(raw_batch_results),
             "structured_batch_retry_count": retry_count,
             "total_seconds": round(time.perf_counter() - pipeline_started, 6),
@@ -2100,6 +2112,7 @@ def _run_technical_funnel_worker_payload(
                     if isinstance(raw_notice_review, Mapping)
                     else "InvalidNoticeReviewMetadata"
                 ),
+                "provider_attempts": deepcopy(raw_notice_review.get("provider_attempts") or []) if isinstance(raw_notice_review, Mapping) else [],
                 "results": [],
             }
         notice_seconds = time.perf_counter() - notice_started
@@ -2208,10 +2221,14 @@ def _run_technical_funnel_worker_payload(
             PUBLIC_NOTICE_HARD_RISK_TAGS
         )
     }
+    for candidate in normalized or []:
+        candidate["research_account_fit"] = research_plan_account_fit(
+            candidate, definitions_by_code[candidate["code"]])
+    fit_by_code = {item["code"]: item for item in normalized or []}
     deep_research_selected_codes = [
         code
         for code in earnings_selected_codes
-        if code not in notice_blocked_codes
+        if code not in notice_blocked_codes and not research_account_priority(fit_by_code.get(code, {}))
     ][:MAX_PUBLIC_DEEP_RESEARCH_CANDIDATES]
     deep_codes = set(deep_research_selected_codes)
     for candidate in normalized or []:
@@ -2306,6 +2323,10 @@ def _run_technical_funnel_worker_payload(
                 and technical_selected_codes
                 else 0
             ),
+            **({
+                "notice_request_attempt_count": sum(int(item.get("attempt_count") or 0) for item in notice_review["provider_attempts"]),
+                "notice_retry_count": sum(max(0, int(item.get("attempt_count") or 0) - 1) for item in notice_review["provider_attempts"]),
+            } if notice_review.get("provider_attempts") else {}),
             "candidate_build_calls": 1 if selected_codes else 0,
             "corporate_action_calls": corporate_action_calls,
             "technical_seconds": round(technical_seconds, 6),

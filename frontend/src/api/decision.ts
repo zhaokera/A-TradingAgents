@@ -1,4 +1,5 @@
 import { ApiClient } from './request'
+import type { CandidateResearchAccountFit } from './screening'
 
 export type DecisionAction = 'buy_now' | 'condition_order' | 'wait' | 'avoid'
 export type DecisionValidationStatus =
@@ -45,6 +46,12 @@ export interface DecisionCandidate {
   }
   software_baseline_action: DecisionAction
   software_reason_codes: string[]
+  research_account_fit?: Partial<CandidateResearchAccountFit>
+  decision_diagnostics?: {
+    data_blockers?: string[]
+    investment_conditions?: string[]
+    coverage_below_target?: boolean
+  }
   quote: {
     price?: number | null
     source?: string

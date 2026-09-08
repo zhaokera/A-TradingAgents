@@ -313,6 +313,27 @@ async def test_research_packet_preserves_profile_provenance_and_wait_semantics()
 
 
 @pytest.mark.asyncio
+async def test_research_packet_preserves_structured_blocker_and_account_audit():
+    baseline = _baseline(
+        bucket="wait", reason_codes=["candidate_structured_analysis_incomplete"]
+    )
+    item = baseline["wait"][0]
+    item["research_account_fit"] = {
+        "status": "requires_plan_review", "execution_authorized": False
+    }
+    item["decision_diagnostics"] = {
+        "data_blockers": ["candidate_structured_analysis_incomplete"],
+        "investment_conditions": [],
+    }
+    candidate = (await _service(baseline).today("owner-1", refresh=False))["candidates"][0]
+    assert candidate["research_account_fit"] == item["research_account_fit"]
+    assert candidate["decision_diagnostics"] == item["decision_diagnostics"]
+    constraint = candidate["hard_constraints"][0]
+    assert constraint["code"] == "candidate_structured_analysis_incomplete"
+    assert constraint["overrideable"] is False
+
+
+@pytest.mark.asyncio
 async def test_unknown_reason_is_not_silently_overrideable():
     packet = await _service(
         _baseline(bucket="avoid", reason_codes=["new_unknown_gate"])

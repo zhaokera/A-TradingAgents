@@ -20,6 +20,7 @@ def run_candidate_research(
         Callable[[Dict[str, Any]], None]
     ] = None,
     resume_checkpoint: Optional[Mapping[str, Any]] = None,
+    account_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run the shared, account-independent full-market research workflow."""
 
@@ -33,4 +34,5 @@ def run_candidate_research(
         star_market_exclusion_reason=star_market_exclusion_reason,
         research_progress_callback=research_progress_callback,
         resume_checkpoint=resume_checkpoint,
+        **({"account_context": account_context} if account_context else {}),
     )

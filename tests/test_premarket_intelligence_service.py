@@ -43,6 +43,10 @@ def _macro():
         "source": "yfinance_official_market_symbols",
         "checked_at": NOW.isoformat(),
         "snapshot": {
+            "asset_evidence": {
+                key: {"data_at": NOW.isoformat(), "time_semantics": "provider_timestamp"}
+                for key in ("sp500", "nasdaq", "semiconductor", "vix", "usdcnh", "oil", "gold", "copper")
+            },
             "sp500": 6400,
             "sp500_change_pct": 0.7,
             "nasdaq": 22000,

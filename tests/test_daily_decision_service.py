@@ -481,7 +481,21 @@ async def test_daily_decision_explicitly_identifies_software_baseline_authority(
 
 
 @pytest.mark.asyncio
-async def test_daily_decision_closes_execution_when_daily_analysis_minimum_is_not_met():
+@pytest.mark.parametrize("flag_code,is_data", [
+    ("notice_evidence_unavailable", True), ("notice_risk_blocked", False),
+])
+async def test_blocking_notice_diagnostics_distinguish_outage_from_risk(flag_code, is_data):
+    candidate = _candidate(risk_flags=[{"code": flag_code, "severity": "blocked"}])
+    packet = await _service(run=_run([candidate])).today("user-1", now=NOW)
+    assert not packet["buy_now"]
+    assert not packet["condition_order"]
+    diagnostics = packet["avoid"][0]["decision_diagnostics"]
+    assert (flag_code in diagnostics["data_blockers"]) is is_data
+    assert ("blocking_event" in diagnostics["investment_conditions"]) is not is_data
+
+
+@pytest.mark.asyncio
+async def test_daily_decision_separates_coverage_from_individual_completion():
     run = _run()
     run["daily_structured_analysis"] = {
         "trade_date": "2026-07-22",
@@ -490,6 +504,7 @@ async def test_daily_decision_closes_execution_when_daily_analysis_minimum_is_no
         "incomplete_count": 1,
         "minimum_met": False,
         "incomplete_reasons": {"notice_evidence_unavailable": 1},
+        "items": [{"code": "000977", "status": "completed"}],
     }
 
     packet = await _service(run=run).today("user-1", now=NOW)
@@ -497,16 +512,15 @@ async def test_daily_decision_closes_execution_when_daily_analysis_minimum_is_no
     assert packet["daily_structured_analysis"] == run[
         "daily_structured_analysis"
     ]
-    assert packet["market"]["execution_usable"] is False
-    assert packet["market"]["execution_status"] == (
-        "daily_structured_analysis_minimum_not_met"
-    )
+    assert packet["market"]["execution_status"] != "daily_structured_analysis_minimum_not_met"
     assert packet["summary"]["daily_structured_analysis_minimum_met"] is False
-    assert not packet["buy_now"]
+    assert packet["buy_now"][0]["identity"]["code"] == "000977"
     assert not packet["condition_order"]
-    assert packet["wait"][0]["reason_codes"] == [
-        "daily_structured_analysis_minimum_not_met"
-    ]
+
+    run["daily_structured_analysis"]["items"][0]["status"] = "incomplete"
+    packet = await _service(run=run).today("user-1", now=NOW)
+    assert not packet["buy_now"]
+    assert "candidate_structured_analysis_incomplete" in packet["wait"][0]["reason_codes"]
 
 
 @pytest.mark.asyncio

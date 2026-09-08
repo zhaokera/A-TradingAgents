@@ -148,7 +148,7 @@ def test_daily_structured_analysis_accepts_same_day_research_quote_after_close()
     assert result["incomplete_reasons"] == {}
 
 
-def test_daily_minimum_gate_closes_execution_without_discarding_research():
+def test_missing_individual_evidence_closes_execution_without_discarding_research():
     document = {
         "candidates": [
             {
@@ -167,9 +167,9 @@ def test_daily_minimum_gate_closes_execution_without_discarding_research():
 
     assert document["execution"] == {
         "actionable": False,
-        "status": "daily_structured_analysis_minimum_not_met",
+        "status": "candidate_structured_analysis_incomplete",
         "requires_daily_decision": True,
     }
-    assert document["portfolio_plan"]["status"] == "research_only"
+    assert document["research_coverage"]["status"] == "below_target"
     assert all(item["execution_actionable"] is False for item in document["candidates"])
     assert all(item["condition_order_ready"] is False for item in document["candidates"])

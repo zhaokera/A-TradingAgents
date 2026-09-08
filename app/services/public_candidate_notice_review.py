@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from requests.exceptions import ConnectionError as ProviderConnectionError, Timeout as ProviderTimeout
 
 
 NOTICE_REVIEW_SOURCE = "akshare.eastmoney.stock_notice_report"
@@ -379,29 +381,34 @@ def review_public_candidate_notices(
         for offset in range(NOTICE_LOOKBACK_CALENDAR_DAYS)
     ]
 
-    def load_day(query_date: date) -> Tuple[date, Any, Optional[str]]:
-        try:
-            return (
-                query_date,
-                effective_loader(query_date.strftime("%Y%m%d")),
-                None,
-            )
-        except Exception as exc:
-            return query_date, None, type(exc).__name__
+    def load_day(query_date: date) -> tuple:
+        errors = []
+        for attempt in range(1, 3):
+            audit = {"date": query_date.isoformat(), "attempt_count": attempt, "error_types": errors}
+            try:
+                return query_date, effective_loader(query_date.strftime("%Y%m%d")), None, audit
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+                if attempt == 2 or not isinstance(exc, (ProviderConnectionError, ProviderTimeout)):
+                    return query_date, None, type(exc).__name__, audit
+                # One retry under the existing outer subprocess deadline. TLS
+                # verification remains enabled, including on the second call.
+                time.sleep(0.25)
 
     with ThreadPoolExecutor(
         max_workers=min(NOTICE_REVIEW_WORKERS, len(query_dates))
     ) as executor:
         loaded_days = list(executor.map(load_day, query_dates))
 
-    for query_date, raw_rows, load_error in loaded_days:
+    provider_attempts = [item[3] for item in loaded_days]
+    for query_date, raw_rows, load_error, _audit in loaded_days:
         if load_error is not None:
-            return _source_failure(
+            return {**_source_failure(
                 start_date=start_date,
                 end_date=end_date,
                 failed_date=query_date,
                 error_type=load_error,
-            )
+            ), "provider_attempts": provider_attempts}
         rows = _rows_from_loader_payload(raw_rows)
         if rows is None:
             return _source_failure(
@@ -445,14 +452,14 @@ def review_public_candidate_notices(
                 }
             )
 
-    return _build_notice_review_result(
+    return {**_build_notice_review_result(
         normalized_codes,
         notices_by_code,
         source=NOTICE_REVIEW_SOURCE,
         start_date=start_date,
         end_date=end_date,
         lookback_calendar_days=NOTICE_LOOKBACK_CALENDAR_DAYS,
-    )
+    ), "provider_attempts": provider_attempts}
 
 
 def review_public_candidate_notice_history(
@@ -624,7 +631,7 @@ def validate_public_candidate_notice_review(
     )
     if (
         not isinstance(value, Mapping)
-        or set(value) != top_keys
+        or set(value) - {"provider_attempts"} != top_keys
         or value.get("status") != "ok"
         or source not in {NOTICE_REVIEW_SOURCE, NOTICE_HISTORY_SOURCE}
         or value.get("source") != source
@@ -642,6 +649,24 @@ def validate_public_candidate_notice_review(
         or value.get("lookback_calendar_days")
         != lookback_calendar_days
         or value.get("reviewed_count") != len(expected_codes)
+    ):
+        return None, "InvalidNoticeReviewMetadata"
+
+    provider_attempts = value.get("provider_attempts")
+    if provider_attempts is not None and (
+        not isinstance(provider_attempts, list)
+        or len(provider_attempts) != lookback_calendar_days
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"date", "attempt_count", "error_types"}
+            or item.get("date") != (start_date + timedelta(days=index)).isoformat()
+            or type(item.get("attempt_count")) is not int
+            or item["attempt_count"] not in {1, 2}
+            or not isinstance(item.get("error_types"), list)
+            or len(item["error_types"]) >= item["attempt_count"]
+            or any(not isinstance(error, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", error) for error in item["error_types"])
+            for index, item in enumerate(provider_attempts)
+        )
     ):
         return None, "InvalidNoticeReviewMetadata"
 
@@ -842,4 +867,5 @@ def validate_public_candidate_notice_review(
             sorted(attention_tag_code_counts.items())
         ),
         "results": normalized_results,
+        **({"provider_attempts": [dict(item) for item in provider_attempts]} if provider_attempts is not None else {}),
     }, None

@@ -104,6 +104,23 @@ export type AICandidateActionability =
   | 'quote_unavailable'
   | 'incomplete'
 
+export interface CandidateResearchAccountFit {
+  status: string
+  execution_authorized: false
+  basis?: string
+  one_lot_amount?: number
+  one_lot_stop_loss?: number
+  estimated_buy_fee?: number
+  maximum_new_amount?: number
+  stop_loss_budget_amount?: number
+  industry_cap_pct?: number
+  theme_cap_pct?: number
+  provider_sector_cap_pct?: number
+  single_symbol_cap_pct?: number
+  requires_stop_risk_and_portfolio_review?: boolean
+  existing_holdings_recheck_required?: boolean
+}
+
 export interface AICandidateItem {
   code: string
   name: string
@@ -134,6 +151,8 @@ export interface AICandidateItem {
   reason_summary: string
   evidence: string[]
   risk_flags: AICandidateRiskFlag[]
+  research_account_fit?: CandidateResearchAccountFit
+  daily_research_status?: string
   favorite_status: 'not_added' | 'in_favorites'
   source: 'public_full_market'
   is_reference_only: true
@@ -202,6 +221,11 @@ export interface AICandidateRun {
   candidates: AICandidateItem[]
   actionability_counts: Record<AICandidateActionability, number>
   quote_refreshed_at?: string
+  research_coverage?: {
+    status: 'target_met' | 'below_target'
+    scope: 'research_coverage_not_individual_execution_permission'
+    [key: string]: unknown
+  }
   account?: {
     total_assets: number
     available_cash: number

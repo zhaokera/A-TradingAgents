@@ -5,6 +5,7 @@ def test_candidate_research_forwards_checkpoint_and_progress_callback(monkeypatc
     captured = {}
     checkpoint = {"version": 1, "batches": {"0": {"status": "completed"}}}
     callback = lambda _value: None
+    account = {"total_assets": 10000, "available_cash": 10000}
 
     def fake_research(**kwargs):
         captured.update(kwargs)
@@ -21,8 +22,10 @@ def test_candidate_research_forwards_checkpoint_and_progress_callback(monkeypatc
         board_exclusion_reasons={"STAR": "permission_denied"},
         research_progress_callback=callback,
         resume_checkpoint=checkpoint,
+        account_context=account,
     )
 
     assert result == {"ok": True}
     assert captured["research_progress_callback"] is callback
     assert captured["resume_checkpoint"] is checkpoint
+    assert captured["account_context"] is account

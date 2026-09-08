@@ -10,6 +10,7 @@ from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from app.services.a_share_permissions import classify_a_share_board
+from app.services.candidate_research_priority import research_account_fit, research_account_priority
 
 from app.services.a_share_market_regime import MIN_BREADTH_UNIVERSE_SIZE
 from app.services.investment_policy import (
@@ -210,6 +211,7 @@ def _move_quality(bucket: str, pct_chg: float) -> float:
 
 def _ranking_key(item: Mapping[str, Any]) -> tuple:
     return (
+        research_account_priority(item),
         objective_tier_rank(item.get("objective_tier")),
         -item["public_score"],
         -item["amount"],
@@ -254,6 +256,7 @@ def rank_public_candidate_universe(
     *,
     benchmark_trade_date: str,
     limit: int = 40,
+    account_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Filter and rank Task 1 public snapshot rows without private data."""
 
@@ -364,6 +367,8 @@ def rank_public_candidate_universe(
 
     amount_percentiles = midrank_percentiles([item["amount"] for item in eligible])
     for item, amount_percentile in zip(eligible, amount_percentiles):
+        if account_context:
+            item["research_account_fit"] = research_account_fit(item["price"], item["code"], account_context)
         move_quality = _move_quality(item["bucket"], item["pct_change"])
         public_score = 0.65 * amount_percentile + 0.35 * move_quality
         item["amount_percentile"] = amount_percentile
@@ -888,6 +893,7 @@ def verify_and_rank_tencent_candidates(
 
     rank_population.sort(
         key=lambda item: (
+            research_account_priority(item),
             objective_tier_rank(item.get("objective_tier")),
             -item["tencent_score"],
             -item["tencent_amount"],
@@ -1435,6 +1441,7 @@ def discover_public_candidate_universe(
     excluded_code_reasons: Optional[Mapping[str, str]] = None,
     board_exclusion_reasons: Optional[Mapping[str, str]] = None,
     star_market_exclusion_reason: Optional[str] = None,
+    account_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run public preselection and one deadline-bounded Tencent review callback."""
 
@@ -1495,6 +1502,7 @@ def discover_public_candidate_universe(
             context["rows"],
             benchmark_trade_date=context["benchmark_trade_date"],
             limit=MAX_PUBLIC_TECHNICAL_SCREEN_CANDIDATES,
+            **({"account_context": account_context} if account_context else {}),
         )
         if (
             not isinstance(public_result, Mapping)

@@ -245,22 +245,35 @@ def build_daily_structured_analysis(
 
 def apply_daily_analysis_execution_gate(document: Dict[str, Any]) -> None:
     audit = _mapping(document.get("daily_structured_analysis"))
-    if audit.get("minimum_met") is True:
+    if not audit:
         return
+    document["research_coverage"] = {
+        "status": "target_met" if audit.get("minimum_met") is True else "below_target",
+        "scope": "research_coverage_not_individual_execution_permission",
+        "completed_count": audit.get("completed_count"),
+        "target_count": audit.get("daily_minimum"),
+    }
+    completions = {
+        str(item.get("code") or ""): item
+        for item in audit.get("items", [])
+        if isinstance(item, Mapping)
+    }
     for candidate in document.get("candidates", []):
         if not isinstance(candidate, dict):
             continue
+        completion = completions.get(str(candidate.get("code") or ""), {})
+        candidate["daily_research_status"] = completion.get("status") or "unverified"
+        if completion.get("status") == "completed":
+            continue
         candidate["execution_actionable"] = False
         candidate["condition_order_ready"] = False
-        candidate["execution_status"] = "daily_structured_analysis_minimum_not_met"
-    portfolio = document.get("portfolio_plan")
-    if not isinstance(portfolio, dict):
-        portfolio = {}
-        document["portfolio_plan"] = portfolio
-    portfolio["status"] = "research_only"
-    portfolio["reason_code"] = "daily_structured_analysis_minimum_not_met"
-    document["execution"] = {
-        "actionable": False,
-        "status": "daily_structured_analysis_minimum_not_met",
-        "requires_daily_decision": True,
-    }
+        candidate["execution_status"] = "candidate_structured_analysis_incomplete"
+    # Never grant permission here: quote, account, profile and final decision
+    # gates still own execution. Only clear an existing permission if no item
+    # has independently complete research.
+    if not any(item.get("status") == "completed" for item in completions.values()):
+        document["execution"] = {
+            "actionable": False,
+            "status": "candidate_structured_analysis_incomplete",
+            "requires_daily_decision": True,
+        }

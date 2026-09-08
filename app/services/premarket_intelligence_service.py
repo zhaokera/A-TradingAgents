@@ -6,6 +6,7 @@ import math
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 
 CROSS_ASSET_DEFINITIONS = (
@@ -190,25 +191,53 @@ class PremarketIntelligenceService:
         snapshot = macro.get("snapshot")
         snapshot = snapshot if isinstance(snapshot, Mapping) else {}
         source = str(macro.get("source") or "global_macro_risk")
-        data_at = _iso(macro.get("checked_at")) or checked_at.isoformat()
+        evidence_map = snapshot.get("asset_evidence")
+        evidence_map = evidence_map if isinstance(evidence_map, Mapping) else {}
         items: list[Dict[str, Any]] = []
         errors: list[Dict[str, Any]] = []
         for key, label, symbol, change_key in CROSS_ASSET_DEFINITIONS:
             value = _finite(snapshot.get(key))
             change_pct = _finite(snapshot.get(change_key)) if change_key else None
+            evidence = evidence_map.get(key)
+            evidence = evidence if isinstance(evidence, Mapping) else {}
+            data_at = evidence.get("data_at")
+            observed = _datetime(data_at)
+            session_date = evidence.get("session_date")
             item_errors: list[Dict[str, Any]] = []
             status = "ok"
             if value is None:
                 status = "unavailable"
-                item_errors.append(
-                    _provider_error(source, f"{key}_missing", checked_at)
-                )
+            elif observed is None:
+                status = "time_unverified"
+            elif evidence.get("time_semantics") == "daily_bar_session_date":
+                # Daily index labels are session dates, not midnight trades.
+                # On weekends/holidays the previous bar stays visible but is
+                # never relabelled as a new overnight move.
+                reference_zone = "America/New_York" if key in {"sp500", "nasdaq", "semiconductor", "vix"} else "UTC"
+                reference_date = checked_at.astimezone(ZoneInfo(reference_zone)).date()
+                overnight_date = checked_at.astimezone(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+                if observed.date() > reference_date:
+                    status = "future_data"
+                elif reference_zone == "America/New_York" and observed.date() != overnight_date:
+                    status = "prior_session"
+                elif reference_zone == "UTC" and observed.date() < overnight_date:
+                    status = "prior_session"
+            elif observed > checked_at + timedelta(seconds=5):
+                status = "future_data"
+            elif checked_at - observed > timedelta(hours=18):
+                status = "stale"
+            if macro.get("status") not in {None, "ok"} and status == "ok":
+                status = "source_unavailable"
+            if status != "ok":
+                item_errors.append(_provider_error(source, f"{key}_{status}", checked_at))
                 errors.extend(item_errors)
             impact = _cross_asset_impact(
                 key,
-                value=value,
-                change_pct=change_pct,
+                value=value if status == "ok" else None,
+                change_pct=change_pct if status == "ok" else None,
             )
+            if status != "ok":
+                impact["reason"] = "行情时间未证实或不属于本次隔夜窗口，仅保留历史背景"
             items.append(
                 {
                     "key": key,
@@ -218,6 +247,10 @@ class PremarketIntelligenceService:
                     "change_pct": change_pct,
                     "source": source,
                     "data_at": data_at,
+                    "session_date": session_date,
+                    "time_semantics": evidence.get("time_semantics") or "unknown",
+                    "exchange_trade_time_verified": evidence.get("exchange_trade_time_verified") is True,
+                    "overnight_signal_usable": status == "ok",
                     "checked_at": checked_at.isoformat(),
                     "expires_at": expires_at.isoformat(),
                     "status": status,

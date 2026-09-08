@@ -87,6 +87,15 @@ class GlobalMacroRiskService:
                 closes = closes.iloc[:, 0]
             if closes.empty:
                 continue
+            session_date = closes.index[-1].date().isoformat()
+            result.setdefault("asset_evidence", {})[key] = {
+                "source": "yfinance",
+                "symbol": symbol,
+                "data_at": session_date,
+                "session_date": session_date,
+                "time_semantics": "daily_bar_session_date",
+                "exchange_trade_time_verified": False,
+            }
             latest = float(closes.iloc[-1])
             previous = float(closes.iloc[-2]) if len(closes) >= 2 else latest
             result[key] = round(latest, 4)

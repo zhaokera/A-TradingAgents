@@ -39,6 +39,7 @@ MAINTAINED_DIRECTORIES = {
 }
 
 MAINTAINED_ROOT_TESTS = {
+    "test_research_evidence_hardening.py",
     "test_a_share_market_regime.py",
     "test_agent_cli.py",
     "test_agent_client.py",
@@ -77,6 +78,7 @@ MAINTAINED_ROOT_TESTS = {
     "test_product_optimization_contracts.py",
     "test_public_candidate_discovery_service.py",
     "test_public_candidate_deep_check.py",
+    "test_public_candidate_notice_review.py",
     "test_stocks_kline_contract.py",
     "test_public_candidate_pipeline.py",
     "test_public_candidate_pipeline_contract.py",

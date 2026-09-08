@@ -26,6 +26,7 @@ from app.services.a_share_permissions import (
     permission_for_code,
 )
 from app.services.ai_candidate_service import ai_candidate_service
+from app.services.company_profile_enrichment_service import NORMALIZATION_VERSION
 from app.services.daily_briefing_service import daily_briefing_service
 from app.services.decision_tracking_service import DecisionTrackingService
 from app.services.investment_policy import classify_investment_objective
@@ -37,7 +38,7 @@ from app.services.stock_master_data_service import StockMasterDataService
 
 
 RULE_VERSION = "decision-v1"
-TAXONOMY_VERSION = "cn-sector-v1"
+TAXONOMY_VERSION = NORMALIZATION_VERSION
 DEFAULT_FEE_POLICY_VERSION = "cn_a_v1"
 PROVIDER_VERSIONS = {
     "company_profile": "company-profile-adapters-v1",
@@ -74,6 +75,7 @@ AVOID_REASON_CODES = (
 WAIT_REASON_CODES = (
     "current_candidate_scan_unavailable",
     "daily_structured_analysis_minimum_not_met",
+    "candidate_structured_analysis_incomplete",
     "account_blocked",
     "calendar_unknown",
     "profile_incomplete",
@@ -87,6 +89,16 @@ WAIT_REASON_CODES = (
     "loss_budget_exhausted",
 )
 CONDITION_ORDER_CAPABILITY_REASON = "condition_order_capability_unverified"
+DATA_BLOCKER_CODES = frozenset({
+    "current_candidate_scan_unavailable", "candidate_structured_analysis_incomplete",
+    "hard_data_failure", "calendar_unknown", "profile_incomplete", "formal_research_required",
+    "holding_valuation_missing", "holding_taxonomy_missing", "live_quote_recheck_required",
+})
+DATA_FAILURE_FLAG_CODES = frozenset({
+    "notice_evidence_unavailable", "earnings_evidence_unavailable",
+    "corporate_action_evidence_unavailable", "technical_deep_check_timeout",
+    "stock_profile_evidence_incomplete",
+})
 CONDITION_ORDER_PRICE_REASON = "condition_order_order_price_missing"
 
 _TOP_LEVEL_VOLATILE_FIELDS = {
@@ -552,6 +564,29 @@ def _is_blocking_flag(flag: Mapping[str, Any]) -> bool:
         "technical_deep_check_timeout",
         "earnings_risk_blocked",
         "notice_risk_blocked",
+    }
+
+
+def _decision_diagnostics(candidate: Mapping[str, Any], reasons: list[str], *, coverage_met: bool) -> dict:
+    blocking_flags = [
+        flag for flag in (candidate.get("risk_flags") or [])
+        if isinstance(flag, Mapping) and _is_blocking_flag(flag)
+    ]
+    data_flags = sorted({
+        str(flag.get("code") or flag.get("key")) for flag in blocking_flags
+        if (flag.get("code") or flag.get("key")) in DATA_FAILURE_FLAG_CODES
+    })
+    has_investment_flag = any(
+        (flag.get("code") or flag.get("key")) not in DATA_FAILURE_FLAG_CODES
+        for flag in blocking_flags
+    )
+    return {
+        "data_blockers": [reason for reason in reasons if reason in DATA_BLOCKER_CODES] + data_flags,
+        "investment_conditions": [
+            reason for reason in reasons if reason not in DATA_BLOCKER_CODES
+            and not (reason == "blocking_event" and data_flags and not has_investment_flag)
+        ],
+        "coverage_below_target": not coverage_met,
     }
 
 
@@ -1177,17 +1212,17 @@ class DailyDecisionService:
             phase in LIVE_PHASES
             and live_gate_trading
             and current_scan_available
-            and daily_minimum_met
         )
+        completion_by_code = {
+            str(item.get("code") or ""): item
+            for item in daily_structured_analysis.get("items", [])
+            if isinstance(item, Mapping)
+        }
         market["execution_usable"] = execution_usable
         if execution_usable:
             market["execution_status"] = "live_market_gate_usable"
         elif phase in LIVE_PHASES and not current_scan_available:
             market["execution_status"] = "current_candidate_scan_unavailable"
-        elif phase in LIVE_PHASES and not daily_minimum_met:
-            market["execution_status"] = (
-                "daily_structured_analysis_minimum_not_met"
-            )
         else:
             market["execution_status"] = (
                 "research_snapshot_not_execution_decision"
@@ -1247,9 +1282,13 @@ class DailyDecisionService:
                     candidate_run.get("current_scan_available") is not False
                 ),
             )
-            if current_scan_available and not daily_minimum_met:
+            if daily_contract_present and (
+                completion_by_code.get(code, {}).get("status") != "completed"
+                or daily_structured_analysis.get("trade_date")
+                != now.astimezone(SHANGHAI_TIMEZONE).date().isoformat()
+            ):
                 wait_reasons.append(
-                    "daily_structured_analysis_minimum_not_met"
+                    "candidate_structured_analysis_incomplete"
                 )
             if (
                 profile_contract["candidate_decision_critical_complete"]
@@ -1330,6 +1369,8 @@ class DailyDecisionService:
                 },
                 "action": bucket,
                 "reason_codes": reasons,
+                "decision_diagnostics": _decision_diagnostics(candidate, reasons, coverage_met=daily_minimum_met),
+                "research_account_fit": deepcopy(candidate.get("research_account_fit") or {}),
                 "calibration_features": _calibration_features(
                     candidate,
                     profile,

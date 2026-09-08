@@ -1250,6 +1250,7 @@ def normalize_ai_candidate(
         "source": "public_full_market",
         "is_reference_only": True,
         "research_tier": str(candidate.get("research_tier") or "deep"),
+        "research_account_fit": deepcopy(candidate.get("research_account_fit") or {}),
         "rolling_pool_state": str(
             candidate.get("rolling_pool_state") or "current"
         ),
@@ -1887,6 +1888,7 @@ class AICandidateService:
         *,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         resume_checkpoint: Optional[Mapping[str, Any]] = None,
+        account_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {}
         try:
@@ -1917,6 +1919,8 @@ class AICandidateService:
             kwargs["research_progress_callback"] = progress_callback
         if accepts_kwargs or "resume_checkpoint" in parameters:
             kwargs["resume_checkpoint"] = resume_checkpoint
+        if account_context and (accepts_kwargs or "account_context" in parameters):
+            kwargs["account_context"] = dict(account_context)
         result = await run_in_threadpool(self._research_runner, **kwargs)
         return dict(result) if isinstance(result, Mapping) else {}
 
@@ -2825,6 +2829,7 @@ class AICandidateService:
             governance,
             progress_callback=research_progress_callback,
             resume_checkpoint=resume_checkpoint,
+            account_context=await self._account_context(str(user_id)),
         )
         normalized = normalize_ai_candidate_run(
             payload,

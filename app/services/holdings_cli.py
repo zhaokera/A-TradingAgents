@@ -5018,6 +5018,8 @@ def _sanitize_public_risk_flags(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []
     fields = (
+        "code",
+        "severity",
         "key",
         "level",
         "message",
@@ -5101,6 +5103,17 @@ def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str,
             "rolling_pool_state",
         ),
     )
+    if isinstance(value.get("research_account_fit"), Mapping):
+        sanitized["research_account_fit"] = {
+            **_copy_public_scalar_fields(value["research_account_fit"], (
+                "status", "basis", "one_lot_amount", "estimated_buy_fee",
+                "maximum_new_amount", "industry_cap_pct", "theme_cap_pct",
+                "provider_sector_cap_pct", "single_symbol_cap_pct", "stop_loss_budget_amount",
+                "one_lot_stop_loss", "requires_stop_risk_and_portfolio_review",
+                "existing_holdings_recheck_required",
+            )),
+            "execution_authorized": False,
+        }
     if isinstance(value.get("quote"), Mapping):
         sanitized["quote"] = _sanitize_public_candidate_quote(value.get("quote"))
     if isinstance(value.get("guarded_price_plan"), Mapping):
@@ -5124,11 +5137,14 @@ def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str,
         sanitized["structured_review"] = {
             "technical": _copy_public_scalar_fields(
                 structured_review.get("technical"),
-                ("status",),
+                ("status", "source", "error_type"),
             ),
             "earnings": _copy_public_scalar_fields(
                 earnings,
                 (
+                    "source",
+                    "actual_source",
+                    "error_type",
                     "code",
                     "status",
                     "blocks_new_position",
@@ -5139,6 +5155,8 @@ def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str,
             "notice": _copy_public_scalar_fields(
                 notice,
                 (
+                    "source",
+                    "error_type",
                     "code",
                     "name",
                     "status",
@@ -6394,6 +6412,12 @@ def build_public_research_opportunities_payload(
                 "provider": NOTICE_REVIEW_SOURCE,
                 "status": notice_status,
                 "error_type": notice_review.get("error_type"),
+                **({
+                    "provider_attempts": deepcopy(notice_review["provider_attempts"]),
+                } if notice_review.get("provider_attempts") else {}),
+                **({
+                    "retry_count": deep_check_result["pipeline_metrics"]["notice_retry_count"],
+                } if "notice_retry_count" in (deep_check_result.get("pipeline_metrics") or {}) else {}),
             }
             pipeline_metrics = deep_check_result.get("pipeline_metrics")
             candidate_discovery["pipeline_metrics"] = (
@@ -7930,6 +7954,7 @@ def _orchestrate_public_full_market_research_payload(
         Callable[[Dict[str, Any]], None]
     ] = None,
     resume_checkpoint: Optional[Mapping[str, Any]] = None,
+    account_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one deadline-bounded public discovery workflow for opportunities."""
     if context.index_status != "ok" or not _valid_opportunity_benchmark_trade_date(
@@ -7975,6 +8000,8 @@ def _orchestrate_public_full_market_research_payload(
         "fetch_quotes": fetch_candidate_quotes,
         "now": context.now,
     }
+    if account_context:
+        discovery_kwargs["account_context"] = account_context
     if excluded_code_reasons:
         discovery_kwargs["excluded_code_reasons"] = excluded_code_reasons
     if board_exclusion_reasons:
@@ -8182,6 +8209,7 @@ def _build_public_full_market_research_payload(
         Callable[[Dict[str, Any]], None]
     ] = None,
     resume_checkpoint: Optional[Mapping[str, Any]] = None,
+    account_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     discovery_state: Dict[str, Any] = {}
     try:
@@ -8195,6 +8223,7 @@ def _build_public_full_market_research_payload(
             star_market_exclusion_reason=star_market_exclusion_reason,
             research_progress_callback=research_progress_callback,
             resume_checkpoint=resume_checkpoint,
+            **({"account_context": account_context} if account_context else {}),
         )
     except CLIError as exc:
         if exc.code == "TechnicalHistoryFetchError":
@@ -8235,6 +8264,7 @@ def run_public_full_market_research(
         Callable[[Dict[str, Any]], None]
     ] = None,
     resume_checkpoint: Optional[Mapping[str, Any]] = None,
+    account_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run the account-independent full-market research workflow.
 
@@ -8251,6 +8281,7 @@ def run_public_full_market_research(
         star_market_exclusion_reason=star_market_exclusion_reason,
         research_progress_callback=research_progress_callback,
         resume_checkpoint=resume_checkpoint,
+        **({"account_context": account_context} if account_context else {}),
         database_status={
             "status": "not_required",
             "reason_code": "public_research_mode",

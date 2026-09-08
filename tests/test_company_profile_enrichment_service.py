@@ -618,7 +618,7 @@ def test_normalize_provider_sector_keeps_raw_taxonomy_and_version():
     assert normalize_provider_sector("计算机") == {
         "value": "信息技术",
         "raw_taxonomy_value": "计算机",
-        "normalization_version": "cn-sector-v1",
+        "normalization_version": "cn-sector-v2",
     }
     assert normalize_provider_sector("  ") is None
 

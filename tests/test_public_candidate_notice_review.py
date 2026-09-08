@@ -287,7 +287,7 @@ def test_notice_review_fails_closed_without_returning_partial_results():
         "20260719",
         "20260720",
     ]
-    assert result == {
+    assert {key: value for key, value in result.items() if key != "provider_attempts"} == {
         "status": "notice_source_unavailable",
         "source": NOTICE_REVIEW_SOURCE,
         "start_date": "2026-07-14",
@@ -376,7 +376,7 @@ def test_notice_review_rejects_empty_dataframe_with_missing_columns():
         ([], "2026-07-20", "codes_invalid"),
         (["000100", "000100"], "2026-07-20", "duplicate_code"),
         (["999999"], "2026-07-20", "invalid_code"),
-        ([f"00010{i}" for i in range(9)], "2026-07-20", "too_many_candidates"),
+        ([f"{600000 + i:06d}" for i in range(101)], "2026-07-20", "too_many_candidates"),
         (["000100"], "invalid", "as_of_date_invalid"),
     ],
 )

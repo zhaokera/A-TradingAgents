@@ -15,7 +15,7 @@ from app.core.database import get_mongo_db
 logger = logging.getLogger(__name__)
 
 SOURCE_PRIORITY = {"tushare": 0, "baostock": 1, "cninfo": 2, "akshare": 3}
-NORMALIZATION_VERSION = "cn-sector-v1"
+NORMALIZATION_VERSION = "cn-sector-v2"
 PROFILE_MAX_AGE = timedelta(days=30)
 REVENUE_MAX_AGE = timedelta(days=550)
 REFRESH_RETRY_BACKOFF = timedelta(hours=24)
@@ -53,7 +53,7 @@ SECTOR_GROUPS = {
     "工业": {"机械设备", "电力设备", "国防军工", "建筑装饰", "交通运输", "公用事业"},
     "原材料": {"基础化工", "有色金属", "钢铁", "建筑材料", "石油石化", "煤炭"},
     "房地产": {"房地产"},
-    "传媒": {"传媒"},
+    "传媒": {"传媒", "游戏", "游戏Ⅱ"},
     "社会服务": {"社会服务"},
     "综合": {"综合"},
 }
@@ -61,6 +61,7 @@ SECTOR_ALIASES = {
     "信息技术": "信息技术",
     "计算机、通信和其他电子设备制造业": "信息技术",
     "软件和信息技术服务业": "信息技术",
+    "互联网和相关服务": "信息技术",
     "金融": "金融",
     "医疗": "医疗保健",
     "医药": "医疗保健",

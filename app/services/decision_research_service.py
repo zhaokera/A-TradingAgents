@@ -63,6 +63,7 @@ HARD_REASON_CODES = frozenset(
         "invalid_portfolio_policy",
         "price_plan_or_account_unavailable",
         "candidate_code_invalid",
+        "candidate_structured_analysis_incomplete",
     }
 )
 ACTION_SCOPED_HARD_CODES = {
@@ -443,6 +444,12 @@ class DecisionResearchService:
                         "software_baseline_action": bucket,
                         "software_reason_codes": list(
                             item.get("reason_codes") or []
+                        ),
+                        "research_account_fit": deepcopy(
+                            item.get("research_account_fit") or {}
+                        ),
+                        "decision_diagnostics": deepcopy(
+                            item.get("decision_diagnostics") or {}
                         ),
                         "quote": deepcopy(item.get("quote") or {}),
                         "plans": deepcopy(item.get("plans") or {}),

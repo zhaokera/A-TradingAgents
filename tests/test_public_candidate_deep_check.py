@@ -767,7 +767,10 @@ def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
             },
             "earnings_screen": _earnings_screen([item["code"] for item in passing]),
             "notice_review": _notice_review([item["code"] for item in passing]),
-            "pipeline_metrics": {"technical_cache_hit_count": 10},
+            "pipeline_metrics": {"technical_cache_hit_count": 10,
+                                 "rolling_pool_capacity": 100,
+                                 "deep_research_capacity": 15,
+                                 "technical_worker_count": 12},
         }
 
     result = deep_check.run_public_candidate_structured_batches(
@@ -797,6 +800,9 @@ def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
     }
     assert result["batch_audit"]["completed_batch_count"] == 3
     assert result["batch_audit"]["failed_batch_count"] == 0
+    assert result["pipeline_metrics"]["rolling_pool_capacity"] == 100
+    assert result["pipeline_metrics"]["deep_research_capacity"] == 15
+    assert result["pipeline_metrics"]["technical_worker_count"] == 24
 
 
 def test_structured_batches_keep_notice_unavailable_candidates_as_incomplete():
