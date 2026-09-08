@@ -421,6 +421,20 @@ def test_decision_summary_keeps_source_profile_status_auditable(
     assert candidate["reason_summary"] == item["candidate_reason_summary"]
 
 
+@pytest.mark.parametrize("view", ["summary", "actionable"])
+def test_decision_projection_preserves_research_diagnostics(fake_client: FakeClient, view: str) -> None:
+    payload = _sample_decision()
+    item = payload["condition_order"][0]
+    item["research_account_fit"] = {"status": "requires_plan_review", "execution_authorized": False}
+    item["decision_diagnostics"] = {"data_blockers": [], "investment_conditions": [], "coverage_below_target": True}
+    fake_client.responses["/api/decision/today"] = payload
+    result = runner.invoke(agent_cli.app, ["decision", "today", "--view", view])
+    assert result.exit_code == 0
+    candidate = json.loads(result.stdout)["data"]["condition_order"][0]
+    assert candidate["research_account_fit"] == item["research_account_fit"]
+    assert candidate["decision_diagnostics"] == item["decision_diagnostics"]
+
+
 def test_decision_explain_returns_one_symbol_with_bucket(fake_client: FakeClient) -> None:
     fake_client.responses["/api/decision/today"] = _sample_decision()
 

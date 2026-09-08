@@ -228,6 +228,11 @@ def _decision_item_summary(item: Any) -> Dict[str, Any]:
         "name": identity.get("name"),
         "action": value.get("action"),
         "reason_codes": value.get("reason_codes") or [],
+        **{
+            key: value[key]
+            for key in ("research_account_fit", "decision_diagnostics")
+            if isinstance(value.get(key), dict)
+        },
         "objective_segment": identity.get("objective_segment"),
         "objective_match_score": identity.get("objective_match_score"),
         "price": quote.get("price"),
