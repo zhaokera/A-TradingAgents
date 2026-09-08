@@ -42,6 +42,9 @@ Definite one-lot infeasibility lowers research priority and prevents occupying
 an expensive deep-research slot. It does not erase a stock from technical audit
 or declare the stock fundamentally unsuitable. The structured pool remains up
 to 100; deep research remains up to 15. No quality threshold is reduced.
+Discovery-definition sanitization preserves the same bounded account audit as
+candidate output. Formal decision research also ranks definite account
+infeasibility below feasible candidates before considering entry distance.
 
 ## Provider Evidence
 

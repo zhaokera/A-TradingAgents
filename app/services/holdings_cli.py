@@ -4819,6 +4819,19 @@ def _sanitize_public_candidate_quote(value: Any) -> Dict[str, Any]:
     return sanitized
 
 
+def _sanitize_research_account_fit(value: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        **_copy_public_scalar_fields(value, (
+            "status", "basis", "one_lot_amount", "estimated_buy_fee",
+            "maximum_new_amount", "industry_cap_pct", "theme_cap_pct",
+            "provider_sector_cap_pct", "single_symbol_cap_pct", "stop_loss_budget_amount",
+            "one_lot_stop_loss", "requires_stop_risk_and_portfolio_review",
+            "existing_holdings_recheck_required",
+        )),
+        "execution_authorized": False,
+    }
+
+
 def _sanitize_public_discovery_definition(value: Any) -> Dict[str, Any]:
     sanitized = _copy_public_scalar_fields(
         value,
@@ -4833,6 +4846,8 @@ def _sanitize_public_discovery_definition(value: Any) -> Dict[str, Any]:
         )
     elif isinstance(value, Mapping) and "observation_zone" in value:
         sanitized["observation_zone"] = None
+    if isinstance(value, Mapping) and isinstance(value.get("research_account_fit"), Mapping):
+        sanitized["research_account_fit"] = _sanitize_research_account_fit(value["research_account_fit"])
     return sanitized
 
 
@@ -5104,16 +5119,7 @@ def _sanitize_public_deep_check_candidate(value: Mapping[str, Any]) -> Dict[str,
         ),
     )
     if isinstance(value.get("research_account_fit"), Mapping):
-        sanitized["research_account_fit"] = {
-            **_copy_public_scalar_fields(value["research_account_fit"], (
-                "status", "basis", "one_lot_amount", "estimated_buy_fee",
-                "maximum_new_amount", "industry_cap_pct", "theme_cap_pct",
-                "provider_sector_cap_pct", "single_symbol_cap_pct", "stop_loss_budget_amount",
-                "one_lot_stop_loss", "requires_stop_risk_and_portfolio_review",
-                "existing_holdings_recheck_required",
-            )),
-            "execution_authorized": False,
-        }
+        sanitized["research_account_fit"] = _sanitize_research_account_fit(value["research_account_fit"])
     if isinstance(value.get("quote"), Mapping):
         sanitized["quote"] = _sanitize_public_candidate_quote(value.get("quote"))
     if isinstance(value.get("guarded_price_plan"), Mapping):

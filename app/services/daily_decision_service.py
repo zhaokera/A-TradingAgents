@@ -26,6 +26,7 @@ from app.services.a_share_permissions import (
     permission_for_code,
 )
 from app.services.ai_candidate_service import ai_candidate_service
+from app.services.candidate_research_priority import research_account_priority
 from app.services.company_profile_enrichment_service import NORMALIZATION_VERSION
 from app.services.daily_briefing_service import daily_briefing_service
 from app.services.decision_tracking_service import DecisionTrackingService
@@ -182,7 +183,7 @@ def _permission_prefilter_reason(
 
 def _candidate_formal_research_order(
     candidate: Mapping[str, Any],
-) -> tuple[int, int, Decimal, Decimal, Decimal, str]:
+) -> tuple[int, int, int, Decimal, Decimal, Decimal, str]:
     state = str(candidate.get("rolling_pool_state") or "current")
     hard_blocked = _candidate_has_hard_risk(candidate)
     objective_order = {
@@ -197,6 +198,7 @@ def _candidate_formal_research_order(
     rank = _finite_decimal(candidate.get("rank")) or Decimal("Infinity")
     return (
         1 if state in {"expired", "invalidated"} or hard_blocked else 0,
+        research_account_priority(candidate),
         objective_order,
         abs(distance) if distance is not None else Decimal("Infinity"),
         -rank_score,
@@ -245,6 +247,7 @@ def _select_formal_research_candidates(
                 "objective_tier": candidate.get("objective_tier"),
                 "rank": candidate.get("rank"),
                 "rank_score": candidate.get("rank_score"),
+                "research_account_fit_status": (candidate.get("research_account_fit") or {}).get("status"),
                 "distance_to_entry_pct": (
                     (candidate.get("price_plan") or {}).get("distance_to_entry_pct")
                     if isinstance(candidate.get("price_plan"), Mapping)

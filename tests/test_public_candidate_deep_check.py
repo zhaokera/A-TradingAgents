@@ -719,7 +719,8 @@ def test_technical_funnel_caps_rolling_pool_at_100_and_deep_research_at_15():
     assert result["pipeline_metrics"]["total_seconds"] < 1.0
 
 
-def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
+@pytest.mark.parametrize("account_aware", [False, True])
+def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit(account_aware):
     definitions = [
         {
             **_definition(f"{600000 + index:06d}"),
@@ -727,6 +728,15 @@ def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
         }
         for index in range(240)
     ]
+    if account_aware:
+        from app.services.candidate_research_priority import research_account_fit
+        from app.services.holdings_cli import _normalize_public_discovery_definitions
+        for item in definitions:
+            item["research_account_fit"] = research_account_fit(
+                40 if item["code"] == "600000" else 10, item["code"],
+                {"total_assets": 10000, "available_cash": 10000},
+            )
+        definitions = _normalize_public_discovery_definitions(definitions)
     quote_map = {
         definition["code"]: _quote(definition["code"])
         for definition in definitions
@@ -789,6 +799,9 @@ def test_structured_batches_expand_until_one_hundred_and_keep_batch_audit():
     assert result["technical_screen"]["passed_count"] == 120
     assert result["technical_screen"]["selected_count"] == 100
     assert result["technical_screen"]["deep_research_selected_count"] == 15
+    if account_aware:
+        assert "600000" not in result["technical_screen"]["deep_research_selected_codes"]
+        assert all(item["research_account_fit"].get("status") for item in result["candidates"])
     assert result["daily_analysis"] == {
         "daily_minimum": 100,
         "planned_count": 100,

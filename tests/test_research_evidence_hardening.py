@@ -73,6 +73,38 @@ def test_research_account_audit_survives_public_cli_sanitizer():
     assert "private_data" not in result["research_account_fit"]
 
 
+def test_account_budget_survives_discovery_normalization_into_plan_review():
+    from app.services.holdings_cli import (
+        _normalize_public_discovery_definitions, _sanitize_public_deep_check_candidate,
+    )
+    raw = {"code": "600001", "research_account_fit": research_account_fit(40, "600001", {
+        "total_assets": 10000, "available_cash": 10000, "current_exposure_pct": 0,
+    })}
+    raw["research_account_fit"]["private_data"] = "must_not_escape"
+    definition = _normalize_public_discovery_definitions([raw])[0]
+    plan = {"guarded_price_plan": {"suggested_buy_price": 39, "stop_loss_price": 38.5}}
+    audit = research_plan_account_fit(plan, definition)
+    candidate = _sanitize_public_deep_check_candidate({"code": "600001", "research_account_fit": audit})
+    assert candidate["research_account_fit"]["status"] == "one_lot_above_research_ceiling"
+    assert candidate["research_account_fit"]["maximum_new_amount"] == 3000
+    assert candidate["research_account_fit"]["one_lot_amount"] == 3900
+    assert research_account_priority(candidate) == 1
+    assert "private_data" not in definition["research_account_fit"]
+
+
+def test_formal_research_prioritizes_account_fit_before_distance():
+    from app.services.daily_decision_service import _select_formal_research_candidates
+    candidates = [
+        {"code": "600001", "price_plan": {"distance_to_entry_pct": 0},
+         "research_account_fit": {"status": "one_lot_above_research_ceiling"}},
+        {"code": "600002", "price_plan": {"distance_to_entry_pct": 1},
+         "research_account_fit": {"status": "requires_plan_review"}},
+    ]
+    selected, audit = _select_formal_research_candidates(candidates, capacity=1)
+    assert [item["code"] for item in selected] == ["600002"]
+    assert len(audit) == 2
+
+
 def test_structured_sources_survive_cli_sanitizer():
     from app.services.holdings_cli import _sanitize_public_deep_check_candidate
     stages = {"technical": {"status": "passed", "source": "tencent_daily_bars"},
